@@ -41,63 +41,63 @@ type ConstructionEstimate struct {
 	UpdatedDate time.Time     `json:"updated_date" db:"updated_date"`
 
 	// Computed
-	LinesCount   int    `json:"lines_count,omitempty" db:"lines_count"`
-	ApprovedName string `json:"approved_name,omitempty" db:"approved_name"`
-	CreatedName  string `json:"created_name,omitempty" db:"created_name"`
+	LinesCount      int    `json:"lines_count,omitempty" db:"lines_count"`
+	ApprovedName    string `json:"approved_name,omitempty" db:"approved_name"`
+	CreatedName     string `json:"created_name,omitempty" db:"created_name"`
 	BuildingName    string `json:"building_name,omitempty" db:"building_name"`
 	SubcontractName string `json:"subcontract_name,omitempty" db:"subcontract_name"`
 }
 
 func (e ConstructionEstimate) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		ID           int64       `json:"id"`
-		TenantID     uuid.UUID   `json:"tenant_id"`
-		ProjectID    int64       `json:"project_id"`
-		BuildingID   interface{} `json:"building_id"`
-		Version      int         `json:"version"`
-		Name         string      `json:"name"`
-		State        string      `json:"state"`
-		IsCurrent    bool        `json:"is_current"`
-		OverheadPct  float64     `json:"overhead_pct"`
-		ProfitPct    float64     `json:"profit_pct"`
-		VatPct       float64     `json:"vat_pct"`
-		AmountDirect float64     `json:"amount_direct"`
-		AmountTotal    float64     `json:"amount_total"`
-		SourceType     string      `json:"source_type"`
-		SubcontractID  interface{} `json:"subcontract_id"`
-		ApprovedBy     interface{} `json:"approved_by"`
-		ApprovedDate interface{} `json:"approved_date"`
-		CreatedBy    interface{} `json:"created_by"`
-		CreatedDate  time.Time   `json:"created_date"`
-		UpdatedDate  time.Time   `json:"updated_date"`
-		LinesCount   int         `json:"lines_count,omitempty"`
-		ApprovedName string      `json:"approved_name,omitempty"`
+		ID              int64       `json:"id"`
+		TenantID        uuid.UUID   `json:"tenant_id"`
+		ProjectID       int64       `json:"project_id"`
+		BuildingID      interface{} `json:"building_id"`
+		Version         int         `json:"version"`
+		Name            string      `json:"name"`
+		State           string      `json:"state"`
+		IsCurrent       bool        `json:"is_current"`
+		OverheadPct     float64     `json:"overhead_pct"`
+		ProfitPct       float64     `json:"profit_pct"`
+		VatPct          float64     `json:"vat_pct"`
+		AmountDirect    float64     `json:"amount_direct"`
+		AmountTotal     float64     `json:"amount_total"`
+		SourceType      string      `json:"source_type"`
+		SubcontractID   interface{} `json:"subcontract_id"`
+		ApprovedBy      interface{} `json:"approved_by"`
+		ApprovedDate    interface{} `json:"approved_date"`
+		CreatedBy       interface{} `json:"created_by"`
+		CreatedDate     time.Time   `json:"created_date"`
+		UpdatedDate     time.Time   `json:"updated_date"`
+		LinesCount      int         `json:"lines_count,omitempty"`
+		ApprovedName    string      `json:"approved_name,omitempty"`
 		CreatedName     string      `json:"created_name,omitempty"`
 		BuildingName    string      `json:"building_name,omitempty"`
 		SubcontractName string      `json:"subcontract_name,omitempty"`
 	}{
-		ID:           e.ID,
-		TenantID:     e.TenantID,
-		ProjectID:    e.ProjectID,
-		BuildingID:   nullInt64Value(e.BuildingID),
-		Version:      e.Version,
-		Name:         e.Name,
-		State:        e.State,
-		IsCurrent:    e.IsCurrent,
-		OverheadPct:  e.OverheadPct,
-		ProfitPct:    e.ProfitPct,
-		VatPct:       e.VatPct,
-		AmountDirect: e.AmountDirect,
-		AmountTotal:    e.AmountTotal,
-		SourceType:     e.SourceType,
-		SubcontractID:  nullInt64Value(e.SubcontractID),
-		ApprovedBy:     nullUUIDValue(e.ApprovedBy),
-		ApprovedDate: nullTimeValue(e.ApprovedDate),
-		CreatedBy:    nullUUIDValue(e.CreatedBy),
-		CreatedDate:  e.CreatedDate,
-		UpdatedDate:  e.UpdatedDate,
-		LinesCount:   e.LinesCount,
-		ApprovedName: e.ApprovedName,
+		ID:              e.ID,
+		TenantID:        e.TenantID,
+		ProjectID:       e.ProjectID,
+		BuildingID:      nullInt64Value(e.BuildingID),
+		Version:         e.Version,
+		Name:            e.Name,
+		State:           e.State,
+		IsCurrent:       e.IsCurrent,
+		OverheadPct:     e.OverheadPct,
+		ProfitPct:       e.ProfitPct,
+		VatPct:          e.VatPct,
+		AmountDirect:    e.AmountDirect,
+		AmountTotal:     e.AmountTotal,
+		SourceType:      e.SourceType,
+		SubcontractID:   nullInt64Value(e.SubcontractID),
+		ApprovedBy:      nullUUIDValue(e.ApprovedBy),
+		ApprovedDate:    nullTimeValue(e.ApprovedDate),
+		CreatedBy:       nullUUIDValue(e.CreatedBy),
+		CreatedDate:     e.CreatedDate,
+		UpdatedDate:     e.UpdatedDate,
+		LinesCount:      e.LinesCount,
+		ApprovedName:    e.ApprovedName,
 		CreatedName:     e.CreatedName,
 		BuildingName:    e.BuildingName,
 		SubcontractName: e.SubcontractName,
@@ -220,55 +220,55 @@ type ConstructionEstimateLine struct {
 
 func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		ID            int64       `json:"id"`
-		TenantID      uuid.UUID   `json:"tenant_id"`
-		EstimateID    int64       `json:"estimate_id"`
-		WBSID         interface{} `json:"wbs_id"`
-		Name          string      `json:"name"`
-		UOM           string      `json:"uom"`
-		Quantity      float64     `json:"quantity"`
-		MaterialRate  float64     `json:"material_rate"`
-		LaborRate     float64     `json:"labor_rate"`
-		EquipmentRate float64     `json:"equipment_rate"`
-		UnitRate      float64     `json:"unit_rate"`
-		TotalAmount   float64     `json:"total_amount"`
-		ActualAmount  float64     `json:"actual_amount"`
-		Code             string      `json:"code"`
-		ItemNumber       string      `json:"item_number"`
-		ResourceType     string      `json:"resource_type"`
-		ParentItemNumber string      `json:"parent_item_number"`
-		ParentLineID     interface{} `json:"parent_line_id"`
-		NormRate         float64     `json:"norm_rate"`
-		SublineSeq       int         `json:"subline_seq"`
-		QuantityOverride bool        `json:"quantity_override"`
-		MaterialType     string      `json:"material_type"`
-		OriginalQuantity float64     `json:"original_quantity"`
-		OriginalUnitRate float64     `json:"original_unit_rate"`
-		ImportedQuantity interface{} `json:"imported_quantity"`
-		ImportedTotal    interface{} `json:"imported_total"`
-		ApprovalStatus   string      `json:"approval_status"`
-		DoneQuantity     float64     `json:"done_quantity"`
-		SortOrder        int         `json:"sort_order"`
-		IsManual      bool            `json:"is_manual"`
-		CreatedDate   time.Time       `json:"created_date"`
-		UpdatedDate   time.Time       `json:"updated_date"`
-		WBSCode       string          `json:"wbs_code,omitempty"`
-		WBSName       string          `json:"wbs_name,omitempty"`
-		Topups        []ResourceTopup `json:"topups,omitempty"`
+		ID               int64           `json:"id"`
+		TenantID         uuid.UUID       `json:"tenant_id"`
+		EstimateID       int64           `json:"estimate_id"`
+		WBSID            interface{}     `json:"wbs_id"`
+		Name             string          `json:"name"`
+		UOM              string          `json:"uom"`
+		Quantity         float64         `json:"quantity"`
+		MaterialRate     float64         `json:"material_rate"`
+		LaborRate        float64         `json:"labor_rate"`
+		EquipmentRate    float64         `json:"equipment_rate"`
+		UnitRate         float64         `json:"unit_rate"`
+		TotalAmount      float64         `json:"total_amount"`
+		ActualAmount     float64         `json:"actual_amount"`
+		Code             string          `json:"code"`
+		ItemNumber       string          `json:"item_number"`
+		ResourceType     string          `json:"resource_type"`
+		ParentItemNumber string          `json:"parent_item_number"`
+		ParentLineID     interface{}     `json:"parent_line_id"`
+		NormRate         float64         `json:"norm_rate"`
+		SublineSeq       int             `json:"subline_seq"`
+		QuantityOverride bool            `json:"quantity_override"`
+		MaterialType     string          `json:"material_type"`
+		OriginalQuantity float64         `json:"original_quantity"`
+		OriginalUnitRate float64         `json:"original_unit_rate"`
+		ImportedQuantity interface{}     `json:"imported_quantity"`
+		ImportedTotal    interface{}     `json:"imported_total"`
+		ApprovalStatus   string          `json:"approval_status"`
+		DoneQuantity     float64         `json:"done_quantity"`
+		SortOrder        int             `json:"sort_order"`
+		IsManual         bool            `json:"is_manual"`
+		CreatedDate      time.Time       `json:"created_date"`
+		UpdatedDate      time.Time       `json:"updated_date"`
+		WBSCode          string          `json:"wbs_code,omitempty"`
+		WBSName          string          `json:"wbs_name,omitempty"`
+		Topups           []ResourceTopup `json:"topups,omitempty"`
 	}{
-		ID:            l.ID,
-		TenantID:      l.TenantID,
-		EstimateID:    l.EstimateID,
-		WBSID:         nullInt64Value(l.WBSID),
-		Name:          l.Name,
-		UOM:           l.UOM,
-		Quantity:      l.Quantity,
-		MaterialRate:  l.MaterialRate,
-		LaborRate:     l.LaborRate,
-		EquipmentRate: l.EquipmentRate,
-		UnitRate:      l.UnitRate,
-		TotalAmount:   l.TotalAmount,
-		ActualAmount:  l.ActualAmount,
+		ID:               l.ID,
+		TenantID:         l.TenantID,
+		EstimateID:       l.EstimateID,
+		WBSID:            nullInt64Value(l.WBSID),
+		Name:             l.Name,
+		UOM:              l.UOM,
+		Quantity:         l.Quantity,
+		MaterialRate:     l.MaterialRate,
+		LaborRate:        l.LaborRate,
+		EquipmentRate:    l.EquipmentRate,
+		UnitRate:         l.UnitRate,
+		TotalAmount:      l.TotalAmount,
+		ActualAmount:     l.ActualAmount,
 		Code:             l.Code,
 		ItemNumber:       l.ItemNumber,
 		ResourceType:     l.ResourceType,
@@ -288,12 +288,12 @@ func (l ConstructionEstimateLine) MarshalJSON() ([]byte, error) {
 		ApprovalStatus:   l.ApprovalStatus,
 		DoneQuantity:     l.DoneQuantity,
 		SortOrder:        l.SortOrder,
-		IsManual:      l.IsManual,
-		CreatedDate:   l.CreatedDate,
-		UpdatedDate:   l.UpdatedDate,
-		WBSCode:       l.WBSCode,
-		WBSName:       l.WBSName,
-		Topups:        l.Topups,
+		IsManual:         l.IsManual,
+		CreatedDate:      l.CreatedDate,
+		UpdatedDate:      l.UpdatedDate,
+		WBSCode:          l.WBSCode,
+		WBSName:          l.WBSName,
+		Topups:           l.Topups,
 	})
 }
 
@@ -358,9 +358,9 @@ type CreateEstimateLineInput struct {
 	MaterialRate  float64 `json:"material_rate"`
 	LaborRate     float64 `json:"labor_rate"`
 	EquipmentRate float64 `json:"equipment_rate"`
-	Code             string `json:"code"`
-	ItemNumber       string `json:"item_number"`
-	ResourceType     string `json:"resource_type"`
+	Code          string  `json:"code"`
+	ItemNumber    string  `json:"item_number"`
+	ResourceType  string  `json:"resource_type"`
 	// MaterialType (migration 350) — sub-bucket for resource_type='material'.
 	// Allowed values: 'standard' | 'equipment' | 'cable' | 'metal' | 'import'.
 	// Empty string falls back to 'standard' on insert.
@@ -399,7 +399,7 @@ type CreateEstimateLineInput struct {
 }
 
 type BulkCreateEstimateLinesInput struct {
-	Lines      []CreateEstimateLineInput `json:"lines" binding:"required"`
+	Lines      []CreateEstimateLineInput `json:"lines" binding:"required,dive"`
 	Replace    bool                      `json:"replace"`
 	SourceType string                    `json:"source_type"`
 	// SourceFileName identifies the Excel file the user uploaded.
@@ -497,24 +497,24 @@ type ConstructionDailyLog struct {
 
 func (d ConstructionDailyLog) MarshalJSON() ([]byte, error) {
 	return json.Marshal(&struct {
-		ID             int64       `json:"id"`
-		TenantID       uuid.UUID   `json:"tenant_id"`
-		ProjectID      int64       `json:"project_id"`
-		BuildingID     interface{} `json:"building_id"`
-		StageID        interface{} `json:"stage_id"`
-		Date           time.Time   `json:"date"`
-		EndDate        interface{} `json:"end_date"`
-		WorkersCount   int         `json:"workers_count"`
-		ExpectedBudget float64     `json:"expected_budget"`
-		Weather        interface{} `json:"weather"`
-		Description    interface{} `json:"description"`
-		Issues         interface{} `json:"issues"`
-		ReportedBy     interface{} `json:"reported_by"`
-		CreatedDate    time.Time   `json:"created_date"`
-		UpdatedDate    time.Time   `json:"updated_date"`
-		QuantityDone   float64     `json:"quantity_done"`
-		UOM            interface{} `json:"uom"`
-		WBSID          interface{} `json:"wbs_id"`
+		ID                 int64       `json:"id"`
+		TenantID           uuid.UUID   `json:"tenant_id"`
+		ProjectID          int64       `json:"project_id"`
+		BuildingID         interface{} `json:"building_id"`
+		StageID            interface{} `json:"stage_id"`
+		Date               time.Time   `json:"date"`
+		EndDate            interface{} `json:"end_date"`
+		WorkersCount       int         `json:"workers_count"`
+		ExpectedBudget     float64     `json:"expected_budget"`
+		Weather            interface{} `json:"weather"`
+		Description        interface{} `json:"description"`
+		Issues             interface{} `json:"issues"`
+		ReportedBy         interface{} `json:"reported_by"`
+		CreatedDate        time.Time   `json:"created_date"`
+		UpdatedDate        time.Time   `json:"updated_date"`
+		QuantityDone       float64     `json:"quantity_done"`
+		UOM                interface{} `json:"uom"`
+		WBSID              interface{} `json:"wbs_id"`
 		BuildingName       string      `json:"building_name,omitempty"`
 		StageName          string      `json:"stage_name,omitempty"`
 		StageProgress      float64     `json:"stage_progress"`
@@ -604,5 +604,5 @@ type EstimateSummaryRowInput struct {
 }
 
 type BulkCreateEstimateSummaryInput struct {
-	Rows []EstimateSummaryRowInput `json:"rows" binding:"required"`
+	Rows []EstimateSummaryRowInput `json:"rows" binding:"required,dive"`
 }

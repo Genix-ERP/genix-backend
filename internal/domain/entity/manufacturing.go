@@ -11,35 +11,35 @@ import (
 // =====================================================
 
 type WorkCenter struct {
-	ID                  uuid.UUID  `json:"id" db:"id"`
-	TenantID            uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	Code                string     `json:"code" db:"code"`
-	Name                string     `json:"name" db:"name"`
-	Description         *string    `json:"description,omitempty" db:"description"`
-	WarehouseID         *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
-	Department          *string    `json:"department,omitempty" db:"department"`
-	CapacityPerHour     float64    `json:"capacity_per_hour" db:"capacity_per_hour"`
-	EfficiencyFactor    float64    `json:"efficiency_factor" db:"efficiency_factor"`
-	OEETarget           float64    `json:"oee_target" db:"oee_target"`
-	WorkingHoursPerDay  float64    `json:"working_hours_per_day" db:"working_hours_per_day"`
-	HourlyCost          float64    `json:"hourly_cost" db:"hourly_cost"`
-	SetupCost           float64    `json:"setup_cost" db:"setup_cost"`
-	OverheadCost        float64    `json:"overhead_cost" db:"overhead_cost"`
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code               string     `json:"code" db:"code"`
+	Name               string     `json:"name" db:"name"`
+	Description        *string    `json:"description,omitempty" db:"description"`
+	WarehouseID        *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
+	Department         *string    `json:"department,omitempty" db:"department"`
+	CapacityPerHour    float64    `json:"capacity_per_hour" db:"capacity_per_hour"`
+	EfficiencyFactor   float64    `json:"efficiency_factor" db:"efficiency_factor"`
+	OEETarget          float64    `json:"oee_target" db:"oee_target"`
+	WorkingHoursPerDay float64    `json:"working_hours_per_day" db:"working_hours_per_day"`
+	HourlyCost         float64    `json:"hourly_cost" db:"hourly_cost"`
+	SetupCost          float64    `json:"setup_cost" db:"setup_cost"`
+	OverheadCost       float64    `json:"overhead_cost" db:"overhead_cost"`
 	// Cost breakdown input fields
-	AssetValue            float64  `json:"asset_value" db:"asset_value"`
-	UsefulLifeYears       float64  `json:"useful_life_years" db:"useful_life_years"`
-	PowerKW               float64  `json:"power_kw" db:"power_kw"`
-	ElectricityRate       float64  `json:"electricity_rate" db:"electricity_rate"`
-	AnnualMaintenance     float64  `json:"annual_maintenance" db:"annual_maintenance"`
-	OperatorMonthlySalary float64  `json:"operator_monthly_salary" db:"operator_monthly_salary"`
-	LaborRateType         string   `json:"labor_rate_type" db:"labor_rate_type"`
-	CostMethod            string   `json:"cost_method" db:"cost_method"`
-	RequireOperator       bool     `json:"require_operator" db:"require_operator"`
+	AssetValue            float64 `json:"asset_value" db:"asset_value"`
+	UsefulLifeYears       float64 `json:"useful_life_years" db:"useful_life_years"`
+	PowerKW               float64 `json:"power_kw" db:"power_kw"`
+	ElectricityRate       float64 `json:"electricity_rate" db:"electricity_rate"`
+	AnnualMaintenance     float64 `json:"annual_maintenance" db:"annual_maintenance"`
+	OperatorMonthlySalary float64 `json:"operator_monthly_salary" db:"operator_monthly_salary"`
+	LaborRateType         string  `json:"labor_rate_type" db:"labor_rate_type"`
+	CostMethod            string  `json:"cost_method" db:"cost_method"`
+	RequireOperator       bool    `json:"require_operator" db:"require_operator"`
 	// Calculated per-hour components
-	DepreciationPerHour   float64  `json:"depreciation_per_hour" db:"depreciation_per_hour"`
-	ElectricityPerHour    float64  `json:"electricity_per_hour" db:"electricity_per_hour"`
-	MaintenancePerHour    float64  `json:"maintenance_per_hour" db:"maintenance_per_hour"`
-	LaborPerHour          float64  `json:"labor_per_hour" db:"labor_per_hour"`
+	DepreciationPerHour float64    `json:"depreciation_per_hour" db:"depreciation_per_hour"`
+	ElectricityPerHour  float64    `json:"electricity_per_hour" db:"electricity_per_hour"`
+	MaintenancePerHour  float64    `json:"maintenance_per_hour" db:"maintenance_per_hour"`
+	LaborPerHour        float64    `json:"labor_per_hour" db:"labor_per_hour"`
 	Currency            string     `json:"currency" db:"currency"`
 	Status              string     `json:"status" db:"status"`
 	IsAvailable         bool       `json:"is_available" db:"is_available"`
@@ -56,18 +56,18 @@ type WorkCenter struct {
 }
 
 type WorkCenterInput struct {
-	Code                string     `json:"code" binding:"required"`
-	Name                string     `json:"name" binding:"required"`
-	Description         *string    `json:"description,omitempty"`
-	WarehouseID         *uuid.UUID `json:"warehouse_id,omitempty"`
-	Department          *string    `json:"department,omitempty"`
-	CapacityPerHour     *float64   `json:"capacity_per_hour,omitempty"`
-	EfficiencyFactor    *float64   `json:"efficiency_factor,omitempty"`
-	OEETarget           *float64   `json:"oee_target,omitempty"`
-	WorkingHoursPerDay  *float64   `json:"working_hours_per_day,omitempty"`
-	HourlyCost          *float64   `json:"hourly_cost,omitempty"`
-	SetupCost           *float64   `json:"setup_cost,omitempty"`
-	OverheadCost        *float64   `json:"overhead_cost,omitempty"`
+	Code               string     `json:"code" binding:"required"`
+	Name               string     `json:"name" binding:"required"`
+	Description        *string    `json:"description,omitempty"`
+	WarehouseID        *uuid.UUID `json:"warehouse_id,omitempty"`
+	Department         *string    `json:"department,omitempty"`
+	CapacityPerHour    *float64   `json:"capacity_per_hour,omitempty"`
+	EfficiencyFactor   *float64   `json:"efficiency_factor,omitempty"`
+	OEETarget          *float64   `json:"oee_target,omitempty"`
+	WorkingHoursPerDay *float64   `json:"working_hours_per_day,omitempty"`
+	HourlyCost         *float64   `json:"hourly_cost,omitempty"`
+	SetupCost          *float64   `json:"setup_cost,omitempty"`
+	OverheadCost       *float64   `json:"overhead_cost,omitempty"`
 	// Cost breakdown input fields
 	AssetValue            *float64 `json:"asset_value,omitempty"`
 	UsefulLifeYears       *float64 `json:"useful_life_years,omitempty"`
@@ -78,58 +78,58 @@ type WorkCenterInput struct {
 	LaborRateType         *string  `json:"labor_rate_type,omitempty"`
 	CostMethod            *string  `json:"cost_method,omitempty"`
 	RequireOperator       *bool    `json:"require_operator,omitempty"`
-	Currency            *string    `json:"currency,omitempty"`
-	Status              *string    `json:"status,omitempty"`
-	IsAvailable         *bool      `json:"is_available,omitempty"`
-	NextMaintenanceDate *string    `json:"next_maintenance_date,omitempty"`
-	Notes               *string    `json:"notes,omitempty"`
+	Currency              *string  `json:"currency,omitempty"`
+	Status                *string  `json:"status,omitempty"`
+	IsAvailable           *bool    `json:"is_available,omitempty"`
+	NextMaintenanceDate   *string  `json:"next_maintenance_date,omitempty"`
+	Notes                 *string  `json:"notes,omitempty"`
 	// AssetID links the work center to the fa_assets register (migration
 	// 465, integration map §6). uuid.Nil clears the link.
 	AssetID *uuid.UUID `json:"asset_id,omitempty"`
 }
 
 type WorkCenterResponse struct {
-	ID                  uuid.UUID  `json:"id"`
-	Code                string     `json:"code"`
-	Name                string     `json:"name"`
-	Description         *string    `json:"description,omitempty"`
-	WarehouseID         *uuid.UUID `json:"warehouse_id,omitempty"`
-	WarehouseName       *string    `json:"warehouse_name,omitempty"`
-	AssetID             *uuid.UUID `json:"asset_id,omitempty"`
-	AssetName           *string    `json:"asset_name,omitempty"`
-	Department          *string    `json:"department,omitempty"`
-	CapacityPerHour     float64    `json:"capacity_per_hour"`
-	EfficiencyFactor    float64    `json:"efficiency_factor"`
-	OEETarget           float64    `json:"oee_target"`
-	WorkingHoursPerDay  float64    `json:"working_hours_per_day"`
-	HourlyCost          float64    `json:"hourly_cost"`
-	SetupCost           float64    `json:"setup_cost"`
-	OverheadCost        float64    `json:"overhead_cost"`
+	ID                 uuid.UUID  `json:"id"`
+	Code               string     `json:"code"`
+	Name               string     `json:"name"`
+	Description        *string    `json:"description,omitempty"`
+	WarehouseID        *uuid.UUID `json:"warehouse_id,omitempty"`
+	WarehouseName      *string    `json:"warehouse_name,omitempty"`
+	AssetID            *uuid.UUID `json:"asset_id,omitempty"`
+	AssetName          *string    `json:"asset_name,omitempty"`
+	Department         *string    `json:"department,omitempty"`
+	CapacityPerHour    float64    `json:"capacity_per_hour"`
+	EfficiencyFactor   float64    `json:"efficiency_factor"`
+	OEETarget          float64    `json:"oee_target"`
+	WorkingHoursPerDay float64    `json:"working_hours_per_day"`
+	HourlyCost         float64    `json:"hourly_cost"`
+	SetupCost          float64    `json:"setup_cost"`
+	OverheadCost       float64    `json:"overhead_cost"`
 	// Cost breakdown fields
-	AssetValue            float64  `json:"asset_value"`
-	UsefulLifeYears       float64  `json:"useful_life_years"`
-	PowerKW               float64  `json:"power_kw"`
-	ElectricityRate       float64  `json:"electricity_rate"`
-	AnnualMaintenance     float64  `json:"annual_maintenance"`
-	OperatorMonthlySalary float64  `json:"operator_monthly_salary"`
-	LaborRateType         string   `json:"labor_rate_type"`
-	CostMethod            string   `json:"cost_method"`
-	RequireOperator       bool     `json:"require_operator"`
-	DepreciationPerHour   float64  `json:"depreciation_per_hour"`
-	ElectricityPerHour    float64  `json:"electricity_per_hour"`
-	MaintenancePerHour    float64  `json:"maintenance_per_hour"`
-	LaborPerHour          float64  `json:"labor_per_hour"`
-	Currency            string     `json:"currency"`
-	Status              string     `json:"status"`
-	IsAvailable         bool       `json:"is_available"`
-	NextMaintenanceDate *string    `json:"next_maintenance_date,omitempty"`
-	LastMaintenanceDate *string    `json:"last_maintenance_date,omitempty"`
-	TotalJobsCompleted  int        `json:"total_jobs_completed"`
-	TotalHoursWorked    float64    `json:"total_hours_worked"`
-	CurrentUtilization  float64    `json:"current_utilization"`
-	Notes               *string    `json:"notes,omitempty"`
-	CreatedAt           time.Time  `json:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at"`
+	AssetValue            float64   `json:"asset_value"`
+	UsefulLifeYears       float64   `json:"useful_life_years"`
+	PowerKW               float64   `json:"power_kw"`
+	ElectricityRate       float64   `json:"electricity_rate"`
+	AnnualMaintenance     float64   `json:"annual_maintenance"`
+	OperatorMonthlySalary float64   `json:"operator_monthly_salary"`
+	LaborRateType         string    `json:"labor_rate_type"`
+	CostMethod            string    `json:"cost_method"`
+	RequireOperator       bool      `json:"require_operator"`
+	DepreciationPerHour   float64   `json:"depreciation_per_hour"`
+	ElectricityPerHour    float64   `json:"electricity_per_hour"`
+	MaintenancePerHour    float64   `json:"maintenance_per_hour"`
+	LaborPerHour          float64   `json:"labor_per_hour"`
+	Currency              string    `json:"currency"`
+	Status                string    `json:"status"`
+	IsAvailable           bool      `json:"is_available"`
+	NextMaintenanceDate   *string   `json:"next_maintenance_date,omitempty"`
+	LastMaintenanceDate   *string   `json:"last_maintenance_date,omitempty"`
+	TotalJobsCompleted    int       `json:"total_jobs_completed"`
+	TotalHoursWorked      float64   `json:"total_hours_worked"`
+	CurrentUtilization    float64   `json:"current_utilization"`
+	Notes                 *string   `json:"notes,omitempty"`
+	CreatedAt             time.Time `json:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at"`
 }
 
 type WorkCenterFilter struct {
@@ -177,25 +177,25 @@ type WorkCenterEmployeeResponse struct {
 // =====================================================
 
 type ProductionOrder struct {
-	ID                   uuid.UUID  `json:"id" db:"id"`
-	TenantID             uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	Code                 string     `json:"code" db:"code"`
-	Name                 *string    `json:"name,omitempty" db:"name"`
-	ProductID            uuid.UUID  `json:"product_id" db:"product_id"`
-	BOMID                *uuid.UUID `json:"bom_id,omitempty" db:"bom_id"`
-	QuantityPlanned      float64    `json:"quantity_planned" db:"quantity_planned"`
-	QuantityProduced     float64    `json:"quantity_produced" db:"quantity_produced"`
-	QuantityScrapped     float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
-	UOM                  string     `json:"uom" db:"uom"`
+	ID               uuid.UUID  `json:"id" db:"id"`
+	TenantID         uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code             string     `json:"code" db:"code"`
+	Name             *string    `json:"name,omitempty" db:"name"`
+	ProductID        uuid.UUID  `json:"product_id" db:"product_id"`
+	BOMID            *uuid.UUID `json:"bom_id,omitempty" db:"bom_id"`
+	QuantityPlanned  float64    `json:"quantity_planned" db:"quantity_planned"`
+	QuantityProduced float64    `json:"quantity_produced" db:"quantity_produced"`
+	QuantityScrapped float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
+	UOM              string     `json:"uom" db:"uom"`
 	// Manufacturing-specific fields
-	MoldCount            int        `json:"mold_count" db:"mold_count"`
-	Shift                *string    `json:"shift,omitempty" db:"shift"`
-	CurrentStage         string     `json:"current_stage" db:"current_stage"`
-	PackageCount         int        `json:"package_count" db:"package_count"`
-	GoodQuantity         float64    `json:"good_quantity" db:"good_quantity"`
-	RejectQuantity       float64    `json:"reject_quantity" db:"reject_quantity"`
-	HasSplitOutput       bool       `json:"has_split_output" db:"has_split_output"`
-	ShortfallReason      *string    `json:"shortfall_reason,omitempty" db:"shortfall_reason"`
+	MoldCount       int     `json:"mold_count" db:"mold_count"`
+	Shift           *string `json:"shift,omitempty" db:"shift"`
+	CurrentStage    string  `json:"current_stage" db:"current_stage"`
+	PackageCount    int     `json:"package_count" db:"package_count"`
+	GoodQuantity    float64 `json:"good_quantity" db:"good_quantity"`
+	RejectQuantity  float64 `json:"reject_quantity" db:"reject_quantity"`
+	HasSplitOutput  bool    `json:"has_split_output" db:"has_split_output"`
+	ShortfallReason *string `json:"shortfall_reason,omitempty" db:"shortfall_reason"`
 	// Schedule fields
 	ScheduledStart       *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
 	ScheduledEnd         *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
@@ -234,31 +234,31 @@ type ProductionOrder struct {
 }
 
 type ProductionOrderInput struct {
-	Name                 *string    `json:"name,omitempty"`
-	ProductID            uuid.UUID  `json:"product_id" binding:"required"`
-	BOMID                *uuid.UUID `json:"bom_id,omitempty"`
-	QuantityPlanned      float64    `json:"quantity_planned" binding:"required,gt=0"`
-	UOM                  string     `json:"uom" binding:"required"`
+	Name            *string    `json:"name,omitempty"`
+	ProductID       uuid.UUID  `json:"product_id" binding:"required"`
+	BOMID           *uuid.UUID `json:"bom_id,omitempty"`
+	QuantityPlanned float64    `json:"quantity_planned" binding:"required,gt=0"`
+	UOM             string     `json:"uom" binding:"required"`
 	// Manufacturing-specific fields
-	MoldCount            *int       `json:"mold_count,omitempty"`
-	Shift                *string    `json:"shift,omitempty"`
+	MoldCount *int    `json:"mold_count,omitempty"`
+	Shift     *string `json:"shift,omitempty"`
 	// Schedule fields
-	ScheduledStart       *string    `json:"scheduled_start,omitempty"`
-	ScheduledEnd         *string    `json:"scheduled_end,omitempty"`
-	Priority             *int       `json:"priority,omitempty"`
-	SourceType           *string    `json:"source_type,omitempty"`
-	SourceID             *uuid.UUID `json:"source_id,omitempty"`
-	SalesOrderID         *uuid.UUID `json:"sales_order_id,omitempty"`
-	CustomerID           *uuid.UUID `json:"customer_id,omitempty"`
-	WarehouseID          *uuid.UUID `json:"warehouse_id,omitempty"`
-	LocationID           *uuid.UUID `json:"location_id,omitempty"`
-	AssignedTo           *uuid.UUID `json:"assigned_to,omitempty"`
-	WorkCenterID         *uuid.UUID `json:"work_center_id,omitempty"`
-	RequiresQualityCheck *bool      `json:"requires_quality_check,omitempty"`
-	Notes                *string    `json:"notes,omitempty"`
-	Tags                 []string   `json:"tags,omitempty"`
+	ScheduledStart          *string    `json:"scheduled_start,omitempty"`
+	ScheduledEnd            *string    `json:"scheduled_end,omitempty"`
+	Priority                *int       `json:"priority,omitempty"`
+	SourceType              *string    `json:"source_type,omitempty"`
+	SourceID                *uuid.UUID `json:"source_id,omitempty"`
+	SalesOrderID            *uuid.UUID `json:"sales_order_id,omitempty"`
+	CustomerID              *uuid.UUID `json:"customer_id,omitempty"`
+	WarehouseID             *uuid.UUID `json:"warehouse_id,omitempty"`
+	LocationID              *uuid.UUID `json:"location_id,omitempty"`
+	AssignedTo              *uuid.UUID `json:"assigned_to,omitempty"`
+	WorkCenterID            *uuid.UUID `json:"work_center_id,omitempty"`
+	RequiresQualityCheck    *bool      `json:"requires_quality_check,omitempty"`
+	Notes                   *string    `json:"notes,omitempty"`
+	Tags                    []string   `json:"tags,omitempty"`
 	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
-	HasSplitOutput       *bool      `json:"has_split_output,omitempty"`
+	HasSplitOutput          *bool      `json:"has_split_output,omitempty"`
 }
 
 type ProductionOrderUpdateInput struct {
@@ -274,86 +274,86 @@ type ProductionOrderUpdateInput struct {
 	Notes                *string    `json:"notes,omitempty"`
 	Tags                 []string   `json:"tags,omitempty"`
 	// Manufacturing-specific fields
-	MoldCount            *int       `json:"mold_count,omitempty"`
-	Shift                *string    `json:"shift,omitempty"`
-	CurrentStage         *string    `json:"current_stage,omitempty"`
-	PackageCount         *int       `json:"package_count,omitempty"`
-	GoodQuantity         *float64   `json:"good_quantity,omitempty"`
-	RejectQuantity       *float64   `json:"reject_quantity,omitempty"`
+	MoldCount               *int       `json:"mold_count,omitempty"`
+	Shift                   *string    `json:"shift,omitempty"`
+	CurrentStage            *string    `json:"current_stage,omitempty"`
+	PackageCount            *int       `json:"package_count,omitempty"`
+	GoodQuantity            *float64   `json:"good_quantity,omitempty"`
+	RejectQuantity          *float64   `json:"reject_quantity,omitempty"`
 	ManufacturingCategoryID *uuid.UUID `json:"manufacturing_category_id,omitempty"`
-	HasSplitOutput       *bool      `json:"has_split_output,omitempty"`
-	Status               *string    `json:"status,omitempty"`
-	ProgressPercent      *float64   `json:"progress_percent,omitempty"`
+	HasSplitOutput          *bool      `json:"has_split_output,omitempty"`
+	Status                  *string    `json:"status,omitempty"`
+	ProgressPercent         *float64   `json:"progress_percent,omitempty"`
 }
 
 type ProductionOrderResponse struct {
-	ID                   uuid.UUID   `json:"id"`
-	Code                 string      `json:"code"`
-	Name                 *string     `json:"name,omitempty"`
-	ProductID            uuid.UUID   `json:"product_id"`
-	ProductName          string      `json:"product_name"`
-	ProductCode          string      `json:"product_code"`
-	BOMID                *uuid.UUID                `json:"bom_id,omitempty"`
-	BOMName              *string                   `json:"bom_name,omitempty"`
-	BOMOperations        []map[string]interface{}  `json:"bom_operations,omitempty"`
-	QuantityPlanned      float64                   `json:"quantity_planned"`
-	QuantityProduced     float64     `json:"quantity_produced"`
-	QuantityScrapped     float64     `json:"quantity_scrapped"`
-	QuantityRemaining    float64     `json:"quantity_remaining"`
-	UOM                  string      `json:"uom"`
+	ID                uuid.UUID                `json:"id"`
+	Code              string                   `json:"code"`
+	Name              *string                  `json:"name,omitempty"`
+	ProductID         uuid.UUID                `json:"product_id"`
+	ProductName       string                   `json:"product_name"`
+	ProductCode       string                   `json:"product_code"`
+	BOMID             *uuid.UUID               `json:"bom_id,omitempty"`
+	BOMName           *string                  `json:"bom_name,omitempty"`
+	BOMOperations     []map[string]interface{} `json:"bom_operations,omitempty"`
+	QuantityPlanned   float64                  `json:"quantity_planned"`
+	QuantityProduced  float64                  `json:"quantity_produced"`
+	QuantityScrapped  float64                  `json:"quantity_scrapped"`
+	QuantityRemaining float64                  `json:"quantity_remaining"`
+	UOM               string                   `json:"uom"`
 	// Manufacturing-specific fields
-	MoldCount            int         `json:"mold_count"`
-	Shift                *string     `json:"shift,omitempty"`
-	CurrentStage         string      `json:"current_stage"`
-	PackageCount         int         `json:"package_count"`
-	GoodQuantity         float64     `json:"good_quantity"`
-	RejectQuantity       float64     `json:"reject_quantity"`
-	HasSplitOutput       bool        `json:"has_split_output"`
-	ShortfallReason      *string     `json:"shortfall_reason,omitempty"`
+	MoldCount       int     `json:"mold_count"`
+	Shift           *string `json:"shift,omitempty"`
+	CurrentStage    string  `json:"current_stage"`
+	PackageCount    int     `json:"package_count"`
+	GoodQuantity    float64 `json:"good_quantity"`
+	RejectQuantity  float64 `json:"reject_quantity"`
+	HasSplitOutput  bool    `json:"has_split_output"`
+	ShortfallReason *string `json:"shortfall_reason,omitempty"`
 	// Schedule fields
-	ScheduledStart       *string     `json:"scheduled_start,omitempty"`
-	ScheduledEnd         *string     `json:"scheduled_end,omitempty"`
-	ActualStart          *string     `json:"actual_start,omitempty"`
-	ActualEnd            *string     `json:"actual_end,omitempty"`
-	Priority             int         `json:"priority"`
-	Status               string      `json:"status"`
-	ProgressPercent      float64     `json:"progress_percent"`
-	SourceType           *string     `json:"source_type,omitempty"`
-	WarehouseID          *uuid.UUID  `json:"warehouse_id,omitempty"`
-	WarehouseName        *string     `json:"warehouse_name,omitempty"`
-	PlannedCost          float64     `json:"planned_cost"`
-	ActualCost           float64     `json:"actual_cost"`
-	MaterialCost         float64     `json:"material_cost"`
-	LaborCost            float64     `json:"labor_cost"`
-	OverheadCost         float64     `json:"overhead_cost"`
-	Currency             string      `json:"currency"`
-	AssignedTo           *uuid.UUID  `json:"assigned_to,omitempty"`
-	AssignedToName       *string     `json:"assigned_to_name,omitempty"`
-	WorkCenterID         *uuid.UUID  `json:"work_center_id,omitempty"`
-	WorkCenterName       *string     `json:"work_center_name,omitempty"`
-	RequiresQualityCheck bool        `json:"requires_quality_check"`
-	QualityStatus        *string     `json:"quality_status,omitempty"`
-	Notes                *string     `json:"notes,omitempty"`
-	Tags                 []string    `json:"tags"`
-	WorkOrders           []WorkOrder `json:"work_orders,omitempty"`
-	Stages               []ProductionOrderStageResponse `json:"stages,omitempty"`
-	ManufacturingCategoryID   *uuid.UUID `json:"manufacturing_category_id,omitempty"`
-	ManufacturingCategoryName *string    `json:"manufacturing_category_name,omitempty"`
+	ScheduledStart            *string                        `json:"scheduled_start,omitempty"`
+	ScheduledEnd              *string                        `json:"scheduled_end,omitempty"`
+	ActualStart               *string                        `json:"actual_start,omitempty"`
+	ActualEnd                 *string                        `json:"actual_end,omitempty"`
+	Priority                  int                            `json:"priority"`
+	Status                    string                         `json:"status"`
+	ProgressPercent           float64                        `json:"progress_percent"`
+	SourceType                *string                        `json:"source_type,omitempty"`
+	WarehouseID               *uuid.UUID                     `json:"warehouse_id,omitempty"`
+	WarehouseName             *string                        `json:"warehouse_name,omitempty"`
+	PlannedCost               float64                        `json:"planned_cost"`
+	ActualCost                float64                        `json:"actual_cost"`
+	MaterialCost              float64                        `json:"material_cost"`
+	LaborCost                 float64                        `json:"labor_cost"`
+	OverheadCost              float64                        `json:"overhead_cost"`
+	Currency                  string                         `json:"currency"`
+	AssignedTo                *uuid.UUID                     `json:"assigned_to,omitempty"`
+	AssignedToName            *string                        `json:"assigned_to_name,omitempty"`
+	WorkCenterID              *uuid.UUID                     `json:"work_center_id,omitempty"`
+	WorkCenterName            *string                        `json:"work_center_name,omitempty"`
+	RequiresQualityCheck      bool                           `json:"requires_quality_check"`
+	QualityStatus             *string                        `json:"quality_status,omitempty"`
+	Notes                     *string                        `json:"notes,omitempty"`
+	Tags                      []string                       `json:"tags"`
+	WorkOrders                []WorkOrder                    `json:"work_orders,omitempty"`
+	Stages                    []ProductionOrderStageResponse `json:"stages,omitempty"`
+	ManufacturingCategoryID   *uuid.UUID                     `json:"manufacturing_category_id,omitempty"`
+	ManufacturingCategoryName *string                        `json:"manufacturing_category_name,omitempty"`
 	// Customer the production order is for (via po.customer_id → contacts),
 	// shown on the Shop Floor card so operators see who they're building for.
-	CustomerName         *string    `json:"customer_name,omitempty"`
+	CustomerName *string `json:"customer_name,omitempty"`
 	// Sales order link (populated when the production order was
 	// created from a sales order — frontend shows the SO number on
 	// the Stage Workflow modal so operators see what they're
 	// building for, and stays empty for ad-hoc production orders).
-	SalesOrderID         *uuid.UUID `json:"sales_order_id,omitempty"`
-	SalesOrderNumber     *string    `json:"sales_order_number,omitempty"`
-	CreatedBy            *uuid.UUID  `json:"created_by,omitempty"`
-	CreatedByName        *string     `json:"created_by_name,omitempty"`
-	ConfirmedAt          *string     `json:"confirmed_at,omitempty"`
-	CompletedAt          *string     `json:"completed_at,omitempty"`
-	CreatedAt            time.Time   `json:"created_at"`
-	UpdatedAt            time.Time   `json:"updated_at"`
+	SalesOrderID     *uuid.UUID `json:"sales_order_id,omitempty"`
+	SalesOrderNumber *string    `json:"sales_order_number,omitempty"`
+	CreatedBy        *uuid.UUID `json:"created_by,omitempty"`
+	CreatedByName    *string    `json:"created_by_name,omitempty"`
+	ConfirmedAt      *string    `json:"confirmed_at,omitempty"`
+	CompletedAt      *string    `json:"completed_at,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 type ProductionOrderFilter struct {
@@ -377,41 +377,41 @@ type ProductionOrderFilter struct {
 // =====================================================
 
 type WorkOrder struct {
-	ID                  uuid.UUID  `json:"id" db:"id"`
-	TenantID            uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	ProductionOrderID   uuid.UUID  `json:"production_order_id" db:"production_order_id"`
-	Code                string     `json:"code" db:"code"`
-	Name                *string    `json:"name,omitempty" db:"name"`
-	Sequence            int        `json:"sequence" db:"sequence"`
-	OperationID         *uuid.UUID `json:"operation_id,omitempty" db:"operation_id"`
-	WorkCenterID        *uuid.UUID `json:"work_center_id,omitempty" db:"work_center_id"`
-	WorkCenterName      *string    `json:"work_center_name,omitempty" db:"-"` // Joined field
-	QuantityToProduce   float64    `json:"quantity_to_produce" db:"quantity_to_produce"`
-	QuantityProduced    float64    `json:"quantity_produced" db:"quantity_produced"`
-	QuantityScrapped    float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
-	UOM                 string     `json:"uom" db:"uom"`
-	PlannedDurationHrs  float64    `json:"planned_duration_hours" db:"planned_duration_hours"`
-	ActualDurationHrs   float64    `json:"actual_duration_hours" db:"actual_duration_hours"`
-	SetupTimeHrs        float64    `json:"setup_time_hours" db:"setup_time_hours"`
-	ScheduledStart      *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
-	ScheduledEnd        *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
-	ActualStart         *time.Time `json:"actual_start,omitempty" db:"actual_start"`
-	ActualEnd           *time.Time `json:"actual_end,omitempty" db:"actual_end"`
-	Status              string     `json:"status" db:"status"`
-	ProgressPercent     float64    `json:"progress_percent" db:"progress_percent"`
-	PlannedCost         float64    `json:"planned_cost" db:"planned_cost"`
-	ActualCost          float64    `json:"actual_cost" db:"actual_cost"`
-	LaborCost           float64    `json:"labor_cost" db:"labor_cost"`
-	MachineCost         float64    `json:"machine_cost" db:"machine_cost"`
-	AssignedTo          *uuid.UUID `json:"assigned_to,omitempty" db:"assigned_to"`
-	Instructions        *string    `json:"instructions,omitempty" db:"instructions"`
-	Notes               *string    `json:"notes,omitempty" db:"notes"`
-	CreatedBy           *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	StartedBy           *uuid.UUID `json:"started_by,omitempty" db:"started_by"`
-	CompletedBy         *uuid.UUID `json:"completed_by,omitempty" db:"completed_by"`
-	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
-	DeletedAt           *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	ProductionOrderID  uuid.UUID  `json:"production_order_id" db:"production_order_id"`
+	Code               string     `json:"code" db:"code"`
+	Name               *string    `json:"name,omitempty" db:"name"`
+	Sequence           int        `json:"sequence" db:"sequence"`
+	OperationID        *uuid.UUID `json:"operation_id,omitempty" db:"operation_id"`
+	WorkCenterID       *uuid.UUID `json:"work_center_id,omitempty" db:"work_center_id"`
+	WorkCenterName     *string    `json:"work_center_name,omitempty" db:"-"` // Joined field
+	QuantityToProduce  float64    `json:"quantity_to_produce" db:"quantity_to_produce"`
+	QuantityProduced   float64    `json:"quantity_produced" db:"quantity_produced"`
+	QuantityScrapped   float64    `json:"quantity_scrapped" db:"quantity_scrapped"`
+	UOM                string     `json:"uom" db:"uom"`
+	PlannedDurationHrs float64    `json:"planned_duration_hours" db:"planned_duration_hours"`
+	ActualDurationHrs  float64    `json:"actual_duration_hours" db:"actual_duration_hours"`
+	SetupTimeHrs       float64    `json:"setup_time_hours" db:"setup_time_hours"`
+	ScheduledStart     *time.Time `json:"scheduled_start,omitempty" db:"scheduled_start"`
+	ScheduledEnd       *time.Time `json:"scheduled_end,omitempty" db:"scheduled_end"`
+	ActualStart        *time.Time `json:"actual_start,omitempty" db:"actual_start"`
+	ActualEnd          *time.Time `json:"actual_end,omitempty" db:"actual_end"`
+	Status             string     `json:"status" db:"status"`
+	ProgressPercent    float64    `json:"progress_percent" db:"progress_percent"`
+	PlannedCost        float64    `json:"planned_cost" db:"planned_cost"`
+	ActualCost         float64    `json:"actual_cost" db:"actual_cost"`
+	LaborCost          float64    `json:"labor_cost" db:"labor_cost"`
+	MachineCost        float64    `json:"machine_cost" db:"machine_cost"`
+	AssignedTo         *uuid.UUID `json:"assigned_to,omitempty" db:"assigned_to"`
+	Instructions       *string    `json:"instructions,omitempty" db:"instructions"`
+	Notes              *string    `json:"notes,omitempty" db:"notes"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	StartedBy          *uuid.UUID `json:"started_by,omitempty" db:"started_by"`
+	CompletedBy        *uuid.UUID `json:"completed_by,omitempty" db:"completed_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
+	DeletedAt          *time.Time `json:"deleted_at,omitempty" db:"deleted_at"`
 }
 
 // =====================================================
@@ -598,24 +598,24 @@ type MRPRecommendation struct {
 }
 
 type MRPRecommendationResponse struct {
-	ID                 uuid.UUID  `json:"id"`
-	ProductID          uuid.UUID  `json:"product_id"`
-	ProductName        string     `json:"product_name"`
-	ProductCode        string     `json:"product_code"`
-	RecommendationType string     `json:"recommendation_type"`
-	Quantity           float64    `json:"quantity"`
-	UOM                string     `json:"uom"`
-	RecommendedDate    string     `json:"recommended_date"`
-	DueDate            *string    `json:"due_date,omitempty"`
-	Priority           int        `json:"priority"`
-	Urgency            string     `json:"urgency"`
-	Status             string     `json:"status"`
-	Reason             *string    `json:"reason,omitempty"`
-	Notes              *string    `json:"notes,omitempty"`
-	CurrentStock       float64    `json:"current_stock"`
-	OnOrderQty         float64    `json:"on_order_qty"`
-	InProductionQty    float64    `json:"in_production_qty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                 uuid.UUID `json:"id"`
+	ProductID          uuid.UUID `json:"product_id"`
+	ProductName        string    `json:"product_name"`
+	ProductCode        string    `json:"product_code"`
+	RecommendationType string    `json:"recommendation_type"`
+	Quantity           float64   `json:"quantity"`
+	UOM                string    `json:"uom"`
+	RecommendedDate    string    `json:"recommended_date"`
+	DueDate            *string   `json:"due_date,omitempty"`
+	Priority           int       `json:"priority"`
+	Urgency            string    `json:"urgency"`
+	Status             string    `json:"status"`
+	Reason             *string   `json:"reason,omitempty"`
+	Notes              *string   `json:"notes,omitempty"`
+	CurrentStock       float64   `json:"current_stock"`
+	OnOrderQty         float64   `json:"on_order_qty"`
+	InProductionQty    float64   `json:"in_production_qty"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // =====================================================
@@ -624,46 +624,46 @@ type MRPRecommendationResponse struct {
 
 type ManufacturingStats struct {
 	// Production Orders
-	TotalProductionOrders   int     `json:"total_production_orders"`
-	DraftOrders             int     `json:"draft_orders"`
-	ConfirmedOrders         int     `json:"confirmed_orders"`
-	InProgressOrders        int     `json:"in_progress_orders"`
-	CompletedOrders         int     `json:"completed_orders"`
-	OverdueOrders           int     `json:"overdue_orders"`
-	CompletionRate          float64 `json:"completion_rate"`
-	AverageLeadTimeDays     float64 `json:"average_lead_time_days"`
+	TotalProductionOrders int     `json:"total_production_orders"`
+	DraftOrders           int     `json:"draft_orders"`
+	ConfirmedOrders       int     `json:"confirmed_orders"`
+	InProgressOrders      int     `json:"in_progress_orders"`
+	CompletedOrders       int     `json:"completed_orders"`
+	OverdueOrders         int     `json:"overdue_orders"`
+	CompletionRate        float64 `json:"completion_rate"`
+	AverageLeadTimeDays   float64 `json:"average_lead_time_days"`
 
 	// Work Centers
-	TotalWorkCenters        int     `json:"total_work_centers"`
-	ActiveWorkCenters       int     `json:"active_work_centers"`
-	AverageUtilization      float64 `json:"average_utilization"`
-	AverageOEE              float64 `json:"average_oee"`
+	TotalWorkCenters   int     `json:"total_work_centers"`
+	ActiveWorkCenters  int     `json:"active_work_centers"`
+	AverageUtilization float64 `json:"average_utilization"`
+	AverageOEE         float64 `json:"average_oee"`
 
 	// Quality
-	TotalQualityChecks      int     `json:"total_quality_checks"`
-	PassedChecks            int     `json:"passed_checks"`
-	FailedChecks            int     `json:"failed_checks"`
-	OverallPassRate         float64 `json:"overall_pass_rate"`
-	TotalDefects            int     `json:"total_defects"`
+	TotalQualityChecks int     `json:"total_quality_checks"`
+	PassedChecks       int     `json:"passed_checks"`
+	FailedChecks       int     `json:"failed_checks"`
+	OverallPassRate    float64 `json:"overall_pass_rate"`
+	TotalDefects       int     `json:"total_defects"`
 
 	// Efficiency
-	TotalUnitsProduced      float64 `json:"total_units_produced"`
-	TotalUnitsScrapped      float64 `json:"total_units_scrapped"`
-	ScrapRate               float64 `json:"scrap_rate"`
-	PlannedVsActualCost     float64 `json:"planned_vs_actual_cost"`
+	TotalUnitsProduced  float64 `json:"total_units_produced"`
+	TotalUnitsScrapped  float64 `json:"total_units_scrapped"`
+	ScrapRate           float64 `json:"scrap_rate"`
+	PlannedVsActualCost float64 `json:"planned_vs_actual_cost"`
 }
 
 type WorkCenterStats struct {
-	WorkCenterID       uuid.UUID `json:"work_center_id"`
-	WorkCenterName     string    `json:"work_center_name"`
-	TotalOrders        int       `json:"total_orders"`
-	CompletedOrders    int       `json:"completed_orders"`
-	TotalHoursWorked   float64   `json:"total_hours_worked"`
-	Utilization        float64   `json:"utilization"`
-	OEE                float64   `json:"oee"`
-	Availability       float64   `json:"availability"`
-	Performance        float64   `json:"performance"`
-	Quality            float64   `json:"quality"`
+	WorkCenterID     uuid.UUID `json:"work_center_id"`
+	WorkCenterName   string    `json:"work_center_name"`
+	TotalOrders      int       `json:"total_orders"`
+	CompletedOrders  int       `json:"completed_orders"`
+	TotalHoursWorked float64   `json:"total_hours_worked"`
+	Utilization      float64   `json:"utilization"`
+	OEE              float64   `json:"oee"`
+	Availability     float64   `json:"availability"`
+	Performance      float64   `json:"performance"`
+	Quality          float64   `json:"quality"`
 }
 
 type ProductionScheduleItem struct {
@@ -713,18 +713,18 @@ type ProductionOrderStageInput struct {
 }
 
 type ProductionOrderStageResponse struct {
-	ID                uuid.UUID `json:"id"`
-	ProductionOrderID uuid.UUID `json:"production_order_id"`
-	StageName         string    `json:"stage_name"`
-	Sequence          int       `json:"sequence"`
-	Status            string    `json:"status"`
-	StartedAt         *string   `json:"started_at,omitempty"`
-	CompletedAt       *string   `json:"completed_at,omitempty"`
+	ID                uuid.UUID  `json:"id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id"`
+	StageName         string     `json:"stage_name"`
+	Sequence          int        `json:"sequence"`
+	Status            string     `json:"status"`
+	StartedAt         *string    `json:"started_at,omitempty"`
+	CompletedAt       *string    `json:"completed_at,omitempty"`
 	OperatorID        *uuid.UUID `json:"operator_id,omitempty"`
-	OperatorName      *string   `json:"operator_name,omitempty"`
-	DurationMinutes   int       `json:"duration_minutes"`
-	Notes             *string   `json:"notes,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	OperatorName      *string    `json:"operator_name,omitempty"`
+	DurationMinutes   int        `json:"duration_minutes"`
+	Notes             *string    `json:"notes,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // ProductionOutput tracks output quantities at each stage
@@ -756,19 +756,19 @@ type ProductionOutputInput struct {
 }
 
 type ProductionOutputResponse struct {
-	ID                uuid.UUID `json:"id"`
-	ProductionOrderID uuid.UUID `json:"production_order_id"`
+	ID                uuid.UUID  `json:"id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id"`
 	StageID           *uuid.UUID `json:"stage_id,omitempty"`
-	StageName         *string   `json:"stage_name,omitempty"`
-	OutputType        string    `json:"output_type"`
-	Quantity          float64   `json:"quantity"`
-	UOM               string    `json:"uom"`
-	PackageCount      int       `json:"package_count"`
-	Notes             *string   `json:"notes,omitempty"`
+	StageName         *string    `json:"stage_name,omitempty"`
+	OutputType        string     `json:"output_type"`
+	Quantity          float64    `json:"quantity"`
+	UOM               string     `json:"uom"`
+	PackageCount      int        `json:"package_count"`
+	Notes             *string    `json:"notes,omitempty"`
 	RecordedBy        *uuid.UUID `json:"recorded_by,omitempty"`
-	RecordedByName    *string   `json:"recorded_by_name,omitempty"`
-	RecordedAt        string    `json:"recorded_at"`
-	CreatedAt         time.Time `json:"created_at"`
+	RecordedByName    *string    `json:"recorded_by_name,omitempty"`
+	RecordedAt        string     `json:"recorded_at"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // =====================================================
@@ -783,15 +783,15 @@ type SplitOutputMaterial struct {
 
 // SplitOutputItem is the input for one packaged product line in a split output
 type SplitOutputItem struct {
-	ProductID    uuid.UUID              `json:"product_id" binding:"required"`
-	Quantity     float64                `json:"quantity" binding:"required,gt=0"`
-	WarehouseID  *uuid.UUID             `json:"warehouse_id,omitempty"`
-	Materials    []SplitOutputMaterial   `json:"materials,omitempty"`
+	ProductID   uuid.UUID             `json:"product_id" binding:"required"`
+	Quantity    float64               `json:"quantity" binding:"required,gt=0"`
+	WarehouseID *uuid.UUID            `json:"warehouse_id,omitempty"`
+	Materials   []SplitOutputMaterial `json:"materials,omitempty"`
 }
 
 // CompleteSplitOutputInput is sent by the worker to finalize packaging
 type CompleteSplitOutputInput struct {
-	Items []SplitOutputItem `json:"items" binding:"required,min=1"`
+	Items []SplitOutputItem `json:"items" binding:"required,min=1,dive"`
 }
 
 // SplitOutputResponse is the DB row returned to the client
@@ -812,13 +812,13 @@ type SplitOutputResponse struct {
 
 // Manufacturing stage constants
 const (
-	StageDraft    = "draft"
-	StageMixing   = "mixing"
-	StageRising   = "rising"
-	StageDrying   = "drying"
-	StageCutting  = "cutting"
-	StagePacking  = "packing"
-	StageDone     = "done"
+	StageDraft   = "draft"
+	StageMixing  = "mixing"
+	StageRising  = "rising"
+	StageDrying  = "drying"
+	StageCutting = "cutting"
+	StagePacking = "packing"
+	StageDone    = "done"
 )
 
 // Shift constants

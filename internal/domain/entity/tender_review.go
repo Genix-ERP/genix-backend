@@ -32,15 +32,15 @@ type CreateReviewInput struct {
 }
 
 type ReviewResponse struct {
-	ID                  uuid.UUID `json:"id"`
+	ID                  uuid.UUID  `json:"id"`
 	TenderID            *uuid.UUID `json:"tender_id"`
-	ReviewerID          uuid.UUID `json:"reviewer_id"`
-	ReviewerName        string    `json:"reviewer_name"`
-	QualityRating       int       `json:"quality_rating"`
-	PriceRating         int       `json:"price_rating"`
-	DeliveryRating      int       `json:"delivery_rating"`
-	CommunicationRating int       `json:"communication_rating"`
-	OverallRating       float64   `json:"overall_rating"`
-	Comment             string    `json:"comment"`
-	CreatedAt           time.Time `json:"created_at"`
+	ReviewerID          uuid.UUID  `json:"reviewer_id"`
+	ReviewerName        string     `json:"reviewer_name"`
+	QualityRating       int        `json:"quality_rating"`
+	PriceRating         int        `json:"price_rating"`
+	DeliveryRating      int        `json:"delivery_rating"`
+	CommunicationRating int        `json:"communication_rating"`
+	OverallRating       float64    `json:"overall_rating"`
+	Comment             string     `json:"comment"`
+	CreatedAt           time.Time  `json:"created_at"`
 }

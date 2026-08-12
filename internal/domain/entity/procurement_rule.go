@@ -56,11 +56,11 @@ const (
 
 // RuleConditions represents the conditions for a procurement rule
 type RuleConditions struct {
-	AmountMin    *float64  `json:"amount_min,omitempty"`
-	AmountMax    *float64  `json:"amount_max,omitempty"`
-	VendorIDs    []string  `json:"vendor_ids,omitempty"`
-	CategoryIDs  []string  `json:"category_ids,omitempty"`
-	WarehouseIDs []string  `json:"warehouse_ids,omitempty"`
+	AmountMin    *float64 `json:"amount_min,omitempty"`
+	AmountMax    *float64 `json:"amount_max,omitempty"`
+	VendorIDs    []string `json:"vendor_ids,omitempty"`
+	CategoryIDs  []string `json:"category_ids,omitempty"`
+	WarehouseIDs []string `json:"warehouse_ids,omitempty"`
 }
 
 // RuleActions represents the actions for a procurement rule
@@ -157,13 +157,13 @@ type RuleEvaluationLog struct {
 
 // RuleEvaluationResult represents the result of rule evaluation
 type RuleEvaluationResult struct {
-	Action            string                    `json:"action"`
-	Message           string                    `json:"message,omitempty"`
-	MatchedRule       *ProcurementRule          `json:"matched_rule,omitempty"`
-	WorkflowInstance  *ApprovalWorkflowInstance `json:"workflow_instance,omitempty"`
-	ApproverIDs       []uuid.UUID               `json:"approver_ids,omitempty"`
-	ApprovalType      string                    `json:"approval_type,omitempty"`
-	RulesEvaluated    []RuleEvaluationEntry     `json:"rules_evaluated"`
+	Action           string                    `json:"action"`
+	Message          string                    `json:"message,omitempty"`
+	MatchedRule      *ProcurementRule          `json:"matched_rule,omitempty"`
+	WorkflowInstance *ApprovalWorkflowInstance `json:"workflow_instance,omitempty"`
+	ApproverIDs      []uuid.UUID               `json:"approver_ids,omitempty"`
+	ApprovalType     string                    `json:"approval_type,omitempty"`
+	RulesEvaluated   []RuleEvaluationEntry     `json:"rules_evaluated"`
 }
 
 // RuleEvaluationEntry represents a single rule evaluation

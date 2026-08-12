@@ -63,6 +63,6 @@ type ProfitTaxCalcResult struct {
 
 	// Set when a snapshot exists for this period — frontend can show a
 	// "closed" badge and disable recalculation.
-	Snapshotted bool `json:"snapshotted"`
+	Snapshotted bool       `json:"snapshotted"`
 	SnapshotID  *uuid.UUID `json:"snapshot_id,omitempty"`
 }

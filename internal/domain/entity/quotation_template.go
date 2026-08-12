@@ -8,27 +8,27 @@ import (
 
 // QuotationTemplate represents a reusable quotation blueprint
 type QuotationTemplate struct {
-	ID                  uuid.UUID  `json:"id" db:"id"`
-	TenantID            uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	Name                string     `json:"name" db:"name"`
-	Code                *string    `json:"code,omitempty" db:"code"`
-	Description         *string    `json:"description,omitempty" db:"description"`
-	ValidityDays        int        `json:"validity_days" db:"validity_days"`
-	PaymentTermID       *uuid.UUID `json:"payment_term_id,omitempty" db:"payment_term_id"`
-	PricelistID         *uuid.UUID `json:"pricelist_id,omitempty" db:"pricelist_id"`
-	TermsAndConditions  *string    `json:"terms_and_conditions,omitempty" db:"terms_and_conditions"`
-	HeaderNote          *string    `json:"header_note,omitempty" db:"header_note"`
-	FooterNote          *string    `json:"footer_note,omitempty" db:"footer_note"`
-	RequireSignature    bool       `json:"require_signature" db:"require_signature"`
-	RequirePayment      bool       `json:"require_payment" db:"require_payment"`
-	PaymentPercentage   float64    `json:"payment_percentage" db:"payment_percentage"`
-	ShowLineSubtotals   bool       `json:"show_line_subtotals" db:"show_line_subtotals"`
-	ShowLineDiscounts   bool       `json:"show_line_discounts" db:"show_line_discounts"`
-	GroupBySection      bool       `json:"group_by_section" db:"group_by_section"`
-	IsActive            bool       `json:"is_active" db:"is_active"`
-	CreatedBy           *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Name               string     `json:"name" db:"name"`
+	Code               *string    `json:"code,omitempty" db:"code"`
+	Description        *string    `json:"description,omitempty" db:"description"`
+	ValidityDays       int        `json:"validity_days" db:"validity_days"`
+	PaymentTermID      *uuid.UUID `json:"payment_term_id,omitempty" db:"payment_term_id"`
+	PricelistID        *uuid.UUID `json:"pricelist_id,omitempty" db:"pricelist_id"`
+	TermsAndConditions *string    `json:"terms_and_conditions,omitempty" db:"terms_and_conditions"`
+	HeaderNote         *string    `json:"header_note,omitempty" db:"header_note"`
+	FooterNote         *string    `json:"footer_note,omitempty" db:"footer_note"`
+	RequireSignature   bool       `json:"require_signature" db:"require_signature"`
+	RequirePayment     bool       `json:"require_payment" db:"require_payment"`
+	PaymentPercentage  float64    `json:"payment_percentage" db:"payment_percentage"`
+	ShowLineSubtotals  bool       `json:"show_line_subtotals" db:"show_line_subtotals"`
+	ShowLineDiscounts  bool       `json:"show_line_discounts" db:"show_line_discounts"`
+	GroupBySection     bool       `json:"group_by_section" db:"group_by_section"`
+	IsActive           bool       `json:"is_active" db:"is_active"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	PaymentTerm *PaymentTerm                `json:"payment_term,omitempty"`
@@ -40,12 +40,12 @@ type QuotationTemplate struct {
 
 // QuotationTemplateSection represents a section for grouping lines
 type QuotationTemplateSection struct {
-	ID          uuid.UUID  `json:"id" db:"id"`
-	TemplateID  uuid.UUID  `json:"template_id" db:"template_id"`
-	Name        string     `json:"name" db:"name"`
-	Description *string    `json:"description,omitempty" db:"description"`
-	Sequence    int        `json:"sequence" db:"sequence"`
-	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	ID          uuid.UUID `json:"id" db:"id"`
+	TemplateID  uuid.UUID `json:"template_id" db:"template_id"`
+	Name        string    `json:"name" db:"name"`
+	Description *string   `json:"description,omitempty" db:"description"`
+	Sequence    int       `json:"sequence" db:"sequence"`
+	CreatedAt   time.Time `json:"created_at" db:"created_at"`
 }
 
 // QuotationTemplateLine represents a product line in a template
@@ -93,25 +93,25 @@ type QuotationTemplateOptional struct {
 
 // CreateQuotationTemplateInput represents input for creating a template
 type CreateQuotationTemplateInput struct {
-	Name               string                          `json:"name" binding:"required"`
-	Code               string                          `json:"code,omitempty"`
-	Description        string                          `json:"description,omitempty"`
-	ValidityDays       int                             `json:"validity_days,omitempty"`
-	PaymentTermID      string                          `json:"payment_term_id,omitempty"`
-	PricelistID        string                          `json:"pricelist_id,omitempty"`
-	TermsAndConditions string                          `json:"terms_and_conditions,omitempty"`
-	HeaderNote         string                          `json:"header_note,omitempty"`
-	FooterNote         string                          `json:"footer_note,omitempty"`
-	RequireSignature   bool                            `json:"require_signature,omitempty"`
-	RequirePayment     bool                            `json:"require_payment,omitempty"`
-	PaymentPercentage  float64                         `json:"payment_percentage,omitempty"`
-	ShowLineSubtotals  *bool                           `json:"show_line_subtotals,omitempty"`
-	ShowLineDiscounts  *bool                           `json:"show_line_discounts,omitempty"`
-	GroupBySection     *bool                           `json:"group_by_section,omitempty"`
-	IsActive           *bool                           `json:"is_active,omitempty"`
-	Sections           []TemplateSectionInput          `json:"sections,omitempty"`
-	Lines              []TemplateLineInput             `json:"lines,omitempty"`
-	Optionals          []TemplateOptionalInput         `json:"optionals,omitempty"`
+	Name               string                  `json:"name" binding:"required"`
+	Code               string                  `json:"code,omitempty"`
+	Description        string                  `json:"description,omitempty"`
+	ValidityDays       int                     `json:"validity_days,omitempty"`
+	PaymentTermID      string                  `json:"payment_term_id,omitempty"`
+	PricelistID        string                  `json:"pricelist_id,omitempty"`
+	TermsAndConditions string                  `json:"terms_and_conditions,omitempty"`
+	HeaderNote         string                  `json:"header_note,omitempty"`
+	FooterNote         string                  `json:"footer_note,omitempty"`
+	RequireSignature   bool                    `json:"require_signature,omitempty"`
+	RequirePayment     bool                    `json:"require_payment,omitempty"`
+	PaymentPercentage  float64                 `json:"payment_percentage,omitempty"`
+	ShowLineSubtotals  *bool                   `json:"show_line_subtotals,omitempty"`
+	ShowLineDiscounts  *bool                   `json:"show_line_discounts,omitempty"`
+	GroupBySection     *bool                   `json:"group_by_section,omitempty"`
+	IsActive           *bool                   `json:"is_active,omitempty"`
+	Sections           []TemplateSectionInput  `json:"sections,omitempty"`
+	Lines              []TemplateLineInput     `json:"lines,omitempty"`
+	Optionals          []TemplateOptionalInput `json:"optionals,omitempty"`
 }
 
 // UpdateQuotationTemplateInput represents input for updating a template
@@ -191,9 +191,9 @@ type QuotationTemplateResponse struct {
 
 // ApplyTemplateInput represents input for applying a template to create a quotation
 type ApplyTemplateInput struct {
-	TemplateID        string   `json:"template_id" binding:"required"`
-	CustomerID        string   `json:"customer_id" binding:"required"`
-	IncludeOptionals  []string `json:"include_optionals,omitempty"`
-	ExpirationDate    string   `json:"expiration_date,omitempty"`
-	Notes             string   `json:"notes,omitempty"`
+	TemplateID       string   `json:"template_id" binding:"required"`
+	CustomerID       string   `json:"customer_id" binding:"required"`
+	IncludeOptionals []string `json:"include_optionals,omitempty"`
+	ExpirationDate   string   `json:"expiration_date,omitempty"`
+	Notes            string   `json:"notes,omitempty"`
 }

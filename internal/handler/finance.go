@@ -9070,7 +9070,7 @@ func (h *Handler) CreateFiscalPeriod(c *gin.Context) {
 
 // BatchCreateFiscalPeriodsInput represents the input for batch creating fiscal periods
 type BatchCreateFiscalPeriodsInput struct {
-	Periods []CreateFiscalPeriodInput `json:"periods" binding:"required"`
+	Periods []CreateFiscalPeriodInput `json:"periods" binding:"required,dive"`
 }
 
 // BatchCreateFiscalPeriods godoc

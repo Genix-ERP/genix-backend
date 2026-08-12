@@ -9,65 +9,65 @@ import (
 
 // ExpenseCategory represents an expense category
 type ExpenseCategory struct {
-	ID          uuid.UUID    `json:"id" db:"id"`
-	TenantID    uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	Code        string       `json:"code" db:"code"`
-	Name        string       `json:"name" db:"name"`
-	Description *string      `json:"description,omitempty" db:"description"`
-	ParentID    *uuid.UUID   `json:"parent_id,omitempty" db:"parent_id"`
-	AccountID   *uuid.UUID   `json:"account_id,omitempty" db:"account_id"`
-	IsActive    bool         `json:"is_active" db:"is_active"`
-	Color       string       `json:"color" db:"color"`
-	Icon        string       `json:"icon" db:"icon"`
-	Position    int          `json:"position" db:"position"`
-	CreatedAt   time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at" db:"updated_at"`
+	ID          uuid.UUID  `json:"id" db:"id"`
+	TenantID    uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code        string     `json:"code" db:"code"`
+	Name        string     `json:"name" db:"name"`
+	Description *string    `json:"description,omitempty" db:"description"`
+	ParentID    *uuid.UUID `json:"parent_id,omitempty" db:"parent_id"`
+	AccountID   *uuid.UUID `json:"account_id,omitempty" db:"account_id"`
+	IsActive    bool       `json:"is_active" db:"is_active"`
+	Color       string     `json:"color" db:"color"`
+	Icon        string     `json:"icon" db:"icon"`
+	Position    int        `json:"position" db:"position"`
+	CreatedAt   time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // Expense represents an expense record
 type Expense struct {
-	ID            uuid.UUID    `json:"id" db:"id"`
-	TenantID      uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	ExpenseNumber string       `json:"expense_number" db:"expense_number"`
-	CategoryID    *uuid.UUID   `json:"category_id,omitempty" db:"category_id"`
-	EmployeeID    *uuid.UUID   `json:"employee_id,omitempty" db:"employee_id"`
-	EmployeeName  *string      `json:"employee_name,omitempty" db:"employee_name"`
-	VendorID      *uuid.UUID   `json:"vendor_id,omitempty" db:"vendor_id"`
-	VendorName    *string      `json:"vendor_name,omitempty" db:"vendor_name"`
-	ExpenseDate   time.Time    `json:"expense_date" db:"expense_date"`
-	Description   string       `json:"description" db:"description"`
-	Amount        float64      `json:"amount" db:"amount"`
-	TaxAmount     float64      `json:"tax_amount" db:"tax_amount"`
-	TotalAmount   float64      `json:"total_amount" db:"total_amount"`
-	Currency      string       `json:"currency" db:"currency"`
-	PaymentMethod *string      `json:"payment_method,omitempty" db:"payment_method"`
-	Reference     *string      `json:"reference,omitempty" db:"reference"`
-	ReceiptURL    *string      `json:"receipt_url,omitempty" db:"receipt_url"`
-	Status        string       `json:"status" db:"status"`
-	Reimbursable  bool         `json:"reimbursable" db:"reimbursable"`
+	ID            uuid.UUID  `json:"id" db:"id"`
+	TenantID      uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	ExpenseNumber string     `json:"expense_number" db:"expense_number"`
+	CategoryID    *uuid.UUID `json:"category_id,omitempty" db:"category_id"`
+	EmployeeID    *uuid.UUID `json:"employee_id,omitempty" db:"employee_id"`
+	EmployeeName  *string    `json:"employee_name,omitempty" db:"employee_name"`
+	VendorID      *uuid.UUID `json:"vendor_id,omitempty" db:"vendor_id"`
+	VendorName    *string    `json:"vendor_name,omitempty" db:"vendor_name"`
+	ExpenseDate   time.Time  `json:"expense_date" db:"expense_date"`
+	Description   string     `json:"description" db:"description"`
+	Amount        float64    `json:"amount" db:"amount"`
+	TaxAmount     float64    `json:"tax_amount" db:"tax_amount"`
+	TotalAmount   float64    `json:"total_amount" db:"total_amount"`
+	Currency      string     `json:"currency" db:"currency"`
+	PaymentMethod *string    `json:"payment_method,omitempty" db:"payment_method"`
+	Reference     *string    `json:"reference,omitempty" db:"reference"`
+	ReceiptURL    *string    `json:"receipt_url,omitempty" db:"receipt_url"`
+	Status        string     `json:"status" db:"status"`
+	Reimbursable  bool       `json:"reimbursable" db:"reimbursable"`
 	// IsRecognized drives whether this expense is deducted from the
 	// profit-tax base. Non-recognized expenses (fines, undocumented
 	// spending, dividends, etc.) still count in the accounting profit but
 	// are excluded from the tax base — see migration 336 and §6 of
 	// ТЗ_Ish_Haqi_Soliq_Tolik.docx.
-	IsRecognized   bool        `json:"is_recognized" db:"is_recognized"`
-	ReimbursedDate *time.Time  `json:"reimbursed_date,omitempty" db:"reimbursed_date"`
-	ApprovedBy    *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
-	ApprovedAt    *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
+	IsRecognized   bool       `json:"is_recognized" db:"is_recognized"`
+	ReimbursedDate *time.Time `json:"reimbursed_date,omitempty" db:"reimbursed_date"`
+	ApprovedBy     *uuid.UUID `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt     *time.Time `json:"approved_at,omitempty" db:"approved_at"`
 	// Lifecycle v2 (migration 444)
-	SubmittedAt      *time.Time `json:"submitted_at,omitempty" db:"submitted_at"`
-	RejectedBy       *uuid.UUID `json:"rejected_by,omitempty" db:"rejected_by"`
-	RejectedAt       *time.Time `json:"rejected_at,omitempty" db:"rejected_at"`
-	RejectionReason  *string    `json:"rejection_reason,omitempty" db:"rejection_reason"`
-	PaidAt           *time.Time `json:"paid_at,omitempty" db:"paid_at"`
-	PaidBy           *uuid.UUID `json:"paid_by,omitempty" db:"paid_by"`
-	PaymentAccountID *uuid.UUID `json:"payment_account_id,omitempty" db:"payment_account_id"`
-	JournalEntryID   *uuid.UUID `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
-	Notes         *string      `json:"notes,omitempty" db:"notes"`
-	CreatedBy     *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt     time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt     time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt     sql.NullTime `json:"-" db:"deleted_at"`
+	SubmittedAt      *time.Time   `json:"submitted_at,omitempty" db:"submitted_at"`
+	RejectedBy       *uuid.UUID   `json:"rejected_by,omitempty" db:"rejected_by"`
+	RejectedAt       *time.Time   `json:"rejected_at,omitempty" db:"rejected_at"`
+	RejectionReason  *string      `json:"rejection_reason,omitempty" db:"rejection_reason"`
+	PaidAt           *time.Time   `json:"paid_at,omitempty" db:"paid_at"`
+	PaidBy           *uuid.UUID   `json:"paid_by,omitempty" db:"paid_by"`
+	PaymentAccountID *uuid.UUID   `json:"payment_account_id,omitempty" db:"payment_account_id"`
+	JournalEntryID   *uuid.UUID   `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
+	Notes            *string      `json:"notes,omitempty" db:"notes"`
+	CreatedBy        *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt        time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt        sql.NullTime `json:"-" db:"deleted_at"`
 
 	// Computed fields
 	CategoryName  string `json:"category_name,omitempty"`
@@ -98,8 +98,8 @@ type CreateExpenseInput struct {
 	Reimbursable  bool    `json:"reimbursable"`
 	// Defaults to TRUE (matches the DB default) so callers that don't
 	// know about recognition get the safe "deductible" semantics.
-	IsRecognized  *bool   `json:"is_recognized,omitempty"`
-	Notes         string  `json:"notes,omitempty"`
+	IsRecognized *bool  `json:"is_recognized,omitempty"`
+	Notes        string `json:"notes,omitempty"`
 }
 
 // UpdateExpenseInput represents input for updating an expense.

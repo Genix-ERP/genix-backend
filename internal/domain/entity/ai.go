@@ -86,14 +86,14 @@ const (
 
 // AIRequest represents a request to the AI service
 type AIRequest struct {
-	ConversationID *uuid.UUID               `json:"conversation_id,omitempty"`
-	Messages       []AIMessageInput         `json:"messages" binding:"required"`
-	Model          string                   `json:"model,omitempty"`
-	MaxTokens      int                      `json:"max_tokens,omitempty"`
-	Temperature    float64                  `json:"temperature,omitempty"`
-	Stream         bool                     `json:"stream,omitempty"`
-	Functions      []AIFunction             `json:"functions,omitempty"`
-	Context        map[string]interface{}   `json:"context,omitempty"`
+	ConversationID *uuid.UUID             `json:"conversation_id,omitempty"`
+	Messages       []AIMessageInput       `json:"messages" binding:"required,dive"`
+	Model          string                 `json:"model,omitempty"`
+	MaxTokens      int                    `json:"max_tokens,omitempty"`
+	Temperature    float64                `json:"temperature,omitempty"`
+	Stream         bool                   `json:"stream,omitempty"`
+	Functions      []AIFunction           `json:"functions,omitempty"`
+	Context        map[string]interface{} `json:"context,omitempty"`
 }
 
 // AIMessageInput represents input for an AI message
@@ -112,12 +112,12 @@ type AIFunction struct {
 
 // AIResponse represents a response from the AI service
 type AIResponse struct {
-	ID             string            `json:"id"`
-	ConversationID uuid.UUID         `json:"conversation_id"`
-	Message        AIMessageOutput   `json:"message"`
-	Usage          AIUsage           `json:"usage"`
-	FinishReason   string            `json:"finish_reason"`
-	FunctionCall   *AIFunctionCall   `json:"function_call,omitempty"`
+	ID             string          `json:"id"`
+	ConversationID uuid.UUID       `json:"conversation_id"`
+	Message        AIMessageOutput `json:"message"`
+	Usage          AIUsage         `json:"usage"`
+	FinishReason   string          `json:"finish_reason"`
+	FunctionCall   *AIFunctionCall `json:"function_call,omitempty"`
 }
 
 // AIMessageOutput represents an output message from the AI

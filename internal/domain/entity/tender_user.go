@@ -26,13 +26,13 @@ type TenderUser struct {
 
 // TenderRegisterInput represents the registration form data
 type TenderRegisterInput struct {
-	Email       string `json:"email" binding:"required,email"`
-	Password    string `json:"password" binding:"required,min=6"`
-	FullName    string `json:"full_name" binding:"required,min=2,max=200"`
-	Phone       string `json:"phone"`
-	Role        string `json:"role" binding:"required,oneof=buyer supplier"`
-	CompanyName string `json:"company_name"`
-	INN         string `json:"inn"`
+	Email       string     `json:"email" binding:"required,email"`
+	Password    string     `json:"password" binding:"required,min=6"`
+	FullName    string     `json:"full_name" binding:"required,min=2,max=200"`
+	Phone       string     `json:"phone"`
+	Role        string     `json:"role" binding:"required,oneof=buyer supplier"`
+	CompanyName string     `json:"company_name"`
+	INN         string     `json:"inn"`
 	RegionID    *uuid.UUID `json:"region_id"`
 }
 

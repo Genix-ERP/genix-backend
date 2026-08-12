@@ -88,25 +88,25 @@ type DropshipOrderLine struct {
 
 // DropshipVendorSettings represents vendor-specific dropshipping configuration
 type DropshipVendorSettings struct {
-	ID                    uuid.UUID  `json:"id" db:"id"`
-	TenantID              uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	VendorID              uuid.UUID  `json:"vendor_id" db:"vendor_id"`
-	IsDropshipEnabled     bool       `json:"is_dropship_enabled" db:"is_dropship_enabled"`
-	AutoSendOrders        bool       `json:"auto_send_orders" db:"auto_send_orders"`
-	NotificationEmail     *string    `json:"notification_email,omitempty" db:"notification_email"`
-	OrderFormat           string     `json:"order_format" db:"order_format"`
-	DefaultLeadTimeDays   int        `json:"default_lead_time_days" db:"default_lead_time_days"`
-	ShipsDirectToCustomer bool       `json:"ships_direct_to_customer" db:"ships_direct_to_customer"`
-	ProvidesTracking      bool       `json:"provides_tracking" db:"provides_tracking"`
-	MarkupType            string     `json:"markup_type" db:"markup_type"`
-	DefaultMarkup         float64    `json:"default_markup" db:"default_markup"`
-	MinOrderValue         *float64   `json:"min_order_value,omitempty" db:"min_order_value"`
-	MinOrderQuantity      *int       `json:"min_order_quantity,omitempty" db:"min_order_quantity"`
-	APIEndpoint           *string    `json:"api_endpoint,omitempty" db:"api_endpoint"`
-	Notes                 *string    `json:"notes,omitempty" db:"notes"`
-	IsActive              bool       `json:"is_active" db:"is_active"`
-	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt             time.Time  `json:"updated_at" db:"updated_at"`
+	ID                    uuid.UUID `json:"id" db:"id"`
+	TenantID              uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	VendorID              uuid.UUID `json:"vendor_id" db:"vendor_id"`
+	IsDropshipEnabled     bool      `json:"is_dropship_enabled" db:"is_dropship_enabled"`
+	AutoSendOrders        bool      `json:"auto_send_orders" db:"auto_send_orders"`
+	NotificationEmail     *string   `json:"notification_email,omitempty" db:"notification_email"`
+	OrderFormat           string    `json:"order_format" db:"order_format"`
+	DefaultLeadTimeDays   int       `json:"default_lead_time_days" db:"default_lead_time_days"`
+	ShipsDirectToCustomer bool      `json:"ships_direct_to_customer" db:"ships_direct_to_customer"`
+	ProvidesTracking      bool      `json:"provides_tracking" db:"provides_tracking"`
+	MarkupType            string    `json:"markup_type" db:"markup_type"`
+	DefaultMarkup         float64   `json:"default_markup" db:"default_markup"`
+	MinOrderValue         *float64  `json:"min_order_value,omitempty" db:"min_order_value"`
+	MinOrderQuantity      *int      `json:"min_order_quantity,omitempty" db:"min_order_quantity"`
+	APIEndpoint           *string   `json:"api_endpoint,omitempty" db:"api_endpoint"`
+	Notes                 *string   `json:"notes,omitempty" db:"notes"`
+	IsActive              bool      `json:"is_active" db:"is_active"`
+	CreatedAt             time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time `json:"updated_at" db:"updated_at"`
 
 	// Computed/joined fields
 	VendorName string `json:"vendor_name,omitempty"`
@@ -114,20 +114,20 @@ type DropshipVendorSettings struct {
 
 // DropshipProductVendor represents a vendor that can dropship a specific product
 type DropshipProductVendor struct {
-	ID           uuid.UUID  `json:"id" db:"id"`
-	TenantID     uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	ProductID    uuid.UUID  `json:"product_id" db:"product_id"`
-	VendorID     uuid.UUID  `json:"vendor_id" db:"vendor_id"`
-	VendorPrice  *float64   `json:"vendor_price,omitempty" db:"vendor_price"`
-	Currency     string     `json:"currency" db:"currency"`
-	LeadTimeDays int        `json:"lead_time_days" db:"lead_time_days"`
-	IsAvailable  bool       `json:"is_available" db:"is_available"`
-	MinOrderQty  float64    `json:"min_order_qty" db:"min_order_qty"`
-	Priority     int        `json:"priority" db:"priority"`
-	VendorSKU    *string    `json:"vendor_sku,omitempty" db:"vendor_sku"`
-	IsActive     bool       `json:"is_active" db:"is_active"`
-	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
+	ID           uuid.UUID `json:"id" db:"id"`
+	TenantID     uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	ProductID    uuid.UUID `json:"product_id" db:"product_id"`
+	VendorID     uuid.UUID `json:"vendor_id" db:"vendor_id"`
+	VendorPrice  *float64  `json:"vendor_price,omitempty" db:"vendor_price"`
+	Currency     string    `json:"currency" db:"currency"`
+	LeadTimeDays int       `json:"lead_time_days" db:"lead_time_days"`
+	IsAvailable  bool      `json:"is_available" db:"is_available"`
+	MinOrderQty  float64   `json:"min_order_qty" db:"min_order_qty"`
+	Priority     int       `json:"priority" db:"priority"`
+	VendorSKU    *string   `json:"vendor_sku,omitempty" db:"vendor_sku"`
+	IsActive     bool      `json:"is_active" db:"is_active"`
+	CreatedAt    time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
 
 	// Computed/joined fields
 	ProductName string `json:"product_name,omitempty"`
@@ -136,13 +136,13 @@ type DropshipProductVendor struct {
 
 // CreateDropshipOrderInput represents input for creating a dropship order
 type CreateDropshipOrderInput struct {
-	SalesOrderID    string                         `json:"sales_order_id" binding:"required"`
-	VendorID        string                         `json:"vendor_id" binding:"required"`
-	ShippingMethod  string                         `json:"shipping_method,omitempty"`
-	VendorNotes     string                         `json:"vendor_notes,omitempty"`
-	InternalNotes   string                         `json:"internal_notes,omitempty"`
-	Lines           []CreateDropshipOrderLineInput `json:"lines" binding:"required,min=1"`
-	CreatePO        bool                           `json:"create_po"` // Auto-create purchase order
+	SalesOrderID   string                         `json:"sales_order_id" binding:"required"`
+	VendorID       string                         `json:"vendor_id" binding:"required"`
+	ShippingMethod string                         `json:"shipping_method,omitempty"`
+	VendorNotes    string                         `json:"vendor_notes,omitempty"`
+	InternalNotes  string                         `json:"internal_notes,omitempty"`
+	Lines          []CreateDropshipOrderLineInput `json:"lines" binding:"required,min=1,dive"`
+	CreatePO       bool                           `json:"create_po"` // Auto-create purchase order
 }
 
 // CreateDropshipOrderLineInput represents input for a dropship order line
@@ -156,14 +156,14 @@ type CreateDropshipOrderLineInput struct {
 
 // UpdateDropshipOrderInput represents input for updating a dropship order
 type UpdateDropshipOrderInput struct {
-	Status           *string  `json:"status,omitempty"`
-	ShippingMethod   *string  `json:"shipping_method,omitempty"`
-	TrackingNumber   *string  `json:"tracking_number,omitempty"`
-	Carrier          *string  `json:"carrier,omitempty"`
-	EstimatedDelivery *string `json:"estimated_delivery,omitempty"`
-	VendorNotes      *string  `json:"vendor_notes,omitempty"`
-	InternalNotes    *string  `json:"internal_notes,omitempty"`
-	ShippingCost     *float64 `json:"shipping_cost,omitempty"`
+	Status            *string  `json:"status,omitempty"`
+	ShippingMethod    *string  `json:"shipping_method,omitempty"`
+	TrackingNumber    *string  `json:"tracking_number,omitempty"`
+	Carrier           *string  `json:"carrier,omitempty"`
+	EstimatedDelivery *string  `json:"estimated_delivery,omitempty"`
+	VendorNotes       *string  `json:"vendor_notes,omitempty"`
+	InternalNotes     *string  `json:"internal_notes,omitempty"`
+	ShippingCost      *float64 `json:"shipping_cost,omitempty"`
 }
 
 // MarkShippedInput represents input for marking a dropship order as shipped
@@ -234,13 +234,13 @@ type UpdateDropshipProductVendorInput struct {
 
 // DropshipOrderListFilter represents filters for listing dropship orders
 type DropshipOrderListFilter struct {
-	Search        string `form:"search"`
-	Status        string `form:"status"`
-	VendorID      string `form:"vendor_id"`
-	CustomerID    string `form:"customer_id"`
-	SalesOrderID  string `form:"sales_order_id"`
-	DateFrom      string `form:"date_from"`
-	DateTo        string `form:"date_to"`
+	Search       string `form:"search"`
+	Status       string `form:"status"`
+	VendorID     string `form:"vendor_id"`
+	CustomerID   string `form:"customer_id"`
+	SalesOrderID string `form:"sales_order_id"`
+	DateFrom     string `form:"date_from"`
+	DateTo       string `form:"date_to"`
 }
 
 // DropshipStats represents dropshipping statistics

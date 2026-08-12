@@ -376,7 +376,7 @@ type CreateJournalEntryInput struct {
 	Tags           []string                      `json:"tags"`
 	CurrencyID     *string                       `json:"currency_id"`
 	ExchangeRate   float64                       `json:"exchange_rate"`
-	Lines          []CreateJournalEntryLineInput `json:"lines" binding:"required,min=2"`
+	Lines          []CreateJournalEntryLineInput `json:"lines" binding:"required,min=2,dive"`
 }
 
 // CreateJournalEntryLineInput is the input for a journal entry line

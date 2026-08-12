@@ -107,23 +107,23 @@ type Product struct {
 	IsPurchasable      bool            `json:"is_purchasable" db:"is_purchasable"`
 	IsSellable         bool            `json:"is_sellable" db:"is_sellable"`
 	// Module visibility fields (Odoo-style)
-	CanBeSold          bool            `json:"can_be_sold" db:"can_be_sold"`
-	CanBePurchased     bool            `json:"can_be_purchased" db:"can_be_purchased"`
-	AvailableInPOS     bool            `json:"available_in_pos" db:"available_in_pos"`
-	CanBeExpensed      bool            `json:"can_be_expensed" db:"can_be_expensed"`
-	CanBeRented        bool            `json:"can_be_rented" db:"can_be_rented"`
-	CanBeSubcontracted bool            `json:"can_be_subcontracted" db:"can_be_subcontracted"`
-	IsOverheadExpense  bool            `json:"is_overhead_expense" db:"is_overhead_expense"`
-	IsManufacturable   bool            `json:"is_manufacturable" db:"is_manufacturable"`
-	AutoManufacture    bool            `json:"auto_manufacture" db:"auto_manufacture"`
-	HasVariants        bool            `json:"has_variants" db:"has_variants"`
-	HasDelivery        bool            `json:"has_delivery" db:"has_delivery"`
-	DeliveryPrice      float64         `json:"delivery_price" db:"delivery_price"`
-	IsActive           bool            `json:"is_active" db:"is_active"`
-	CreatedBy          *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt          time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at" db:"updated_at"`
-	DeletedAt          sql.NullTime    `json:"-" db:"deleted_at"`
+	CanBeSold          bool         `json:"can_be_sold" db:"can_be_sold"`
+	CanBePurchased     bool         `json:"can_be_purchased" db:"can_be_purchased"`
+	AvailableInPOS     bool         `json:"available_in_pos" db:"available_in_pos"`
+	CanBeExpensed      bool         `json:"can_be_expensed" db:"can_be_expensed"`
+	CanBeRented        bool         `json:"can_be_rented" db:"can_be_rented"`
+	CanBeSubcontracted bool         `json:"can_be_subcontracted" db:"can_be_subcontracted"`
+	IsOverheadExpense  bool         `json:"is_overhead_expense" db:"is_overhead_expense"`
+	IsManufacturable   bool         `json:"is_manufacturable" db:"is_manufacturable"`
+	AutoManufacture    bool         `json:"auto_manufacture" db:"auto_manufacture"`
+	HasVariants        bool         `json:"has_variants" db:"has_variants"`
+	HasDelivery        bool         `json:"has_delivery" db:"has_delivery"`
+	DeliveryPrice      float64      `json:"delivery_price" db:"delivery_price"`
+	IsActive           bool         `json:"is_active" db:"is_active"`
+	CreatedBy          *uuid.UUID   `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt          time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt          sql.NullTime `json:"-" db:"deleted_at"`
 
 	// Relationships
 	Category     *ProductCategory `json:"category,omitempty"`
@@ -157,8 +157,8 @@ type CreateProductInput struct {
 	MinStockLevel    float64     `json:"min_stock_level"`
 	ReorderPoint     float64     `json:"reorder_point"`
 	ReorderQuantity  float64     `json:"reorder_quantity"`
-	IsPurchasable      *bool    `json:"is_purchasable,omitempty"`
-	IsSellable         *bool    `json:"is_sellable,omitempty"`
+	IsPurchasable    *bool       `json:"is_purchasable,omitempty"`
+	IsSellable       *bool       `json:"is_sellable,omitempty"`
 	// Module visibility fields
 	CanBeSold          *bool    `json:"can_be_sold,omitempty"`
 	CanBePurchased     *bool    `json:"can_be_purchased,omitempty"`
@@ -178,27 +178,27 @@ type CreateProductInput struct {
 
 // UpdateProductInput represents input for updating a product
 type UpdateProductInput struct {
-	CategoryID       *string     `json:"category_id,omitempty"`
-	SKU              *string     `json:"sku,omitempty"`
-	Barcode          *string     `json:"barcode,omitempty"`
-	SearchKey        *string     `json:"search_key,omitempty"`
-	Name             *string     `json:"name,omitempty"`
-	Description      *string     `json:"description,omitempty"`
-	ShortDescription *string     `json:"short_description,omitempty"`
-	UnitID           *string     `json:"unit_id,omitempty"`
-	InventoryUOM     *string     `json:"inventory_uom,omitempty"`
-	SalesUOM         *string     `json:"sales_uom,omitempty"`
-	PurchaseUOM      *string     `json:"purchase_uom,omitempty"`
-	CostPrice        *float64    `json:"cost_price,omitempty"`
-	ListPrice        *float64    `json:"list_price,omitempty"`
-	MinPrice         *float64    `json:"min_price,omitempty"`
-	IsStockable      *bool       `json:"is_stockable,omitempty"`
-	TrackInventory   *bool       `json:"track_inventory,omitempty"`
-	MinStockLevel    *float64    `json:"min_stock_level,omitempty"`
-	ReorderPoint     *float64    `json:"reorder_point,omitempty"`
-	ReorderQuantity  *float64    `json:"reorder_quantity,omitempty"`
-	IsPurchasable      *bool    `json:"is_purchasable,omitempty"`
-	IsSellable         *bool    `json:"is_sellable,omitempty"`
+	CategoryID       *string  `json:"category_id,omitempty"`
+	SKU              *string  `json:"sku,omitempty"`
+	Barcode          *string  `json:"barcode,omitempty"`
+	SearchKey        *string  `json:"search_key,omitempty"`
+	Name             *string  `json:"name,omitempty"`
+	Description      *string  `json:"description,omitempty"`
+	ShortDescription *string  `json:"short_description,omitempty"`
+	UnitID           *string  `json:"unit_id,omitempty"`
+	InventoryUOM     *string  `json:"inventory_uom,omitempty"`
+	SalesUOM         *string  `json:"sales_uom,omitempty"`
+	PurchaseUOM      *string  `json:"purchase_uom,omitempty"`
+	CostPrice        *float64 `json:"cost_price,omitempty"`
+	ListPrice        *float64 `json:"list_price,omitempty"`
+	MinPrice         *float64 `json:"min_price,omitempty"`
+	IsStockable      *bool    `json:"is_stockable,omitempty"`
+	TrackInventory   *bool    `json:"track_inventory,omitempty"`
+	MinStockLevel    *float64 `json:"min_stock_level,omitempty"`
+	ReorderPoint     *float64 `json:"reorder_point,omitempty"`
+	ReorderQuantity  *float64 `json:"reorder_quantity,omitempty"`
+	IsPurchasable    *bool    `json:"is_purchasable,omitempty"`
+	IsSellable       *bool    `json:"is_sellable,omitempty"`
 	// Module visibility fields
 	CanBeSold          *bool    `json:"can_be_sold,omitempty"`
 	CanBePurchased     *bool    `json:"can_be_purchased,omitempty"`
@@ -255,25 +255,25 @@ type ProductResponse struct {
 	IsStockable      bool             `json:"is_stockable"`
 	TrackInventory   bool             `json:"track_inventory"`
 	MinStockLevel    float64          `json:"min_stock_level"`
-	IsPurchasable      bool      `json:"is_purchasable"`
-	IsSellable         bool      `json:"is_sellable"`
+	IsPurchasable    bool             `json:"is_purchasable"`
+	IsSellable       bool             `json:"is_sellable"`
 	// Module visibility fields
-	CanBeSold          bool      `json:"can_be_sold"`
-	CanBePurchased     bool      `json:"can_be_purchased"`
-	AvailableInPOS     bool      `json:"available_in_pos"`
-	CanBeExpensed      bool      `json:"can_be_expensed"`
-	CanBeRented        bool      `json:"can_be_rented"`
-	CanBeSubcontracted bool      `json:"can_be_subcontracted"`
-	IsOverheadExpense  bool      `json:"is_overhead_expense"`
-	IsManufacturable   bool      `json:"is_manufacturable"`
-	AutoManufacture    bool      `json:"auto_manufacture"`
-	HasVariants        bool      `json:"has_variants"`
-	HasDelivery        bool      `json:"has_delivery"`
-	DeliveryPrice      float64   `json:"delivery_price"`
-	Weight             *float64  `json:"weight,omitempty"`
-	Length             *float64  `json:"length,omitempty"`
-	Width              *float64  `json:"width,omitempty"`
-	Height             *float64  `json:"height,omitempty"`
+	CanBeSold          bool        `json:"can_be_sold"`
+	CanBePurchased     bool        `json:"can_be_purchased"`
+	AvailableInPOS     bool        `json:"available_in_pos"`
+	CanBeExpensed      bool        `json:"can_be_expensed"`
+	CanBeRented        bool        `json:"can_be_rented"`
+	CanBeSubcontracted bool        `json:"can_be_subcontracted"`
+	IsOverheadExpense  bool        `json:"is_overhead_expense"`
+	IsManufacturable   bool        `json:"is_manufacturable"`
+	AutoManufacture    bool        `json:"auto_manufacture"`
+	HasVariants        bool        `json:"has_variants"`
+	HasDelivery        bool        `json:"has_delivery"`
+	DeliveryPrice      float64     `json:"delivery_price"`
+	Weight             *float64    `json:"weight,omitempty"`
+	Length             *float64    `json:"length,omitempty"`
+	Width              *float64    `json:"width,omitempty"`
+	Height             *float64    `json:"height,omitempty"`
 	IsActive           bool        `json:"is_active"`
 	Tags               []string    `json:"tags"`
 	ImageURL           string      `json:"image_url"`

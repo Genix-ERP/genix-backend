@@ -76,7 +76,7 @@ type ConstructionProject struct {
 	City        sql.NullString `json:"city" db:"city"`
 	District    sql.NullString `json:"district" db:"district"`
 	Region      sql.NullString `json:"region" db:"region"`
-	Coordinates []byte `json:"coordinates" db:"coordinates" swaggertype:"object"`
+	Coordinates []byte         `json:"coordinates" db:"coordinates" swaggertype:"object"`
 
 	// Client Info
 	ClientName    sql.NullString `json:"client_name" db:"client_name"`
@@ -131,9 +131,9 @@ type ConstructionProject struct {
 	DeletedAt   sql.NullTime `json:"-" db:"deleted_at"`
 
 	// Computed fields (not in DB)
-	ProjectManagerName string `json:"project_manager_name,omitempty" db:"project_manager_name"`
-	ChiefEngineerName  string `json:"chief_engineer_name,omitempty" db:"chief_engineer_name"`
-	SectionsCount      int    `json:"sections_count,omitempty" db:"sections_count"`
+	ProjectManagerName string  `json:"project_manager_name,omitempty" db:"project_manager_name"`
+	ChiefEngineerName  string  `json:"chief_engineer_name,omitempty" db:"chief_engineer_name"`
+	SectionsCount      int     `json:"sections_count,omitempty" db:"sections_count"`
 	TotalSmeta         float64 `json:"total_smeta,omitempty" db:"total_smeta"`
 	// FilesCount drives the badge on the "Fayllar" button on each
 	// project card. Computed via a subquery against project_files.
@@ -144,46 +144,46 @@ type ConstructionProject struct {
 func (p ConstructionProject) MarshalJSON() ([]byte, error) {
 	type Alias ConstructionProject
 	return json.Marshal(&struct {
-		Description      interface{} `json:"description"`
-		Address          interface{} `json:"address"`
-		City             interface{} `json:"city"`
-		District         interface{} `json:"district"`
-		Region           interface{} `json:"region"`
-		ClientName       interface{} `json:"client_name"`
-		ClientContact    interface{} `json:"client_contact"`
-		ClientPhone      interface{} `json:"client_phone"`
-		ProjectType      interface{} `json:"project_type"`
-		BuildingType     interface{} `json:"building_type"`
-		TotalArea        interface{} `json:"total_area"`
-		FloorsCount      interface{} `json:"floors_count"`
-		ContractAmount   interface{} `json:"contract_amount"`
-		ContractDate     interface{} `json:"contract_date"`
-		PlannedStartDate interface{} `json:"planned_start_date"`
-		PlannedEndDate   interface{} `json:"planned_end_date"`
-		ActualStartDate  interface{} `json:"actual_start_date"`
-		ActualEndDate    interface{} `json:"actual_end_date"`
-		ProgressPercent  interface{} `json:"progress_percent"`
-		ProjectManagerID interface{} `json:"project_manager_id"`
-		ChiefEngineerID  interface{} `json:"chief_engineer_id"`
-		OrganizationID   interface{} `json:"organization_id"`
-		WarehouseID      interface{} `json:"warehouse_id"`
-		CRMProjectID     interface{} `json:"crm_project_id"`
-		ID               int64       `json:"id"`
-		TenantID         uuid.UUID   `json:"tenant_id"`
-		Code             string      `json:"code"`
-		Name             string      `json:"name"`
-		Coordinates      json.RawMessage `json:"coordinates,omitempty"`
-		Currency         string      `json:"currency"`
-		Status           string      `json:"status"`
-		CreatedBy        *uuid.UUID  `json:"created_by"`
-		CreatedDate      time.Time   `json:"created_date"`
-		UpdatedDate      time.Time   `json:"updated_date"`
-		ProjectManagerName string    `json:"project_manager_name,omitempty"`
-		ChiefEngineerName  string    `json:"chief_engineer_name,omitempty"`
-		WarehouseName      string    `json:"warehouse_name,omitempty"`
-		SectionsCount      int       `json:"sections_count,omitempty"`
-		TotalSmeta         float64   `json:"total_smeta,omitempty"`
-		FilesCount         int       `json:"files_count"`
+		Description        interface{}     `json:"description"`
+		Address            interface{}     `json:"address"`
+		City               interface{}     `json:"city"`
+		District           interface{}     `json:"district"`
+		Region             interface{}     `json:"region"`
+		ClientName         interface{}     `json:"client_name"`
+		ClientContact      interface{}     `json:"client_contact"`
+		ClientPhone        interface{}     `json:"client_phone"`
+		ProjectType        interface{}     `json:"project_type"`
+		BuildingType       interface{}     `json:"building_type"`
+		TotalArea          interface{}     `json:"total_area"`
+		FloorsCount        interface{}     `json:"floors_count"`
+		ContractAmount     interface{}     `json:"contract_amount"`
+		ContractDate       interface{}     `json:"contract_date"`
+		PlannedStartDate   interface{}     `json:"planned_start_date"`
+		PlannedEndDate     interface{}     `json:"planned_end_date"`
+		ActualStartDate    interface{}     `json:"actual_start_date"`
+		ActualEndDate      interface{}     `json:"actual_end_date"`
+		ProgressPercent    interface{}     `json:"progress_percent"`
+		ProjectManagerID   interface{}     `json:"project_manager_id"`
+		ChiefEngineerID    interface{}     `json:"chief_engineer_id"`
+		OrganizationID     interface{}     `json:"organization_id"`
+		WarehouseID        interface{}     `json:"warehouse_id"`
+		CRMProjectID       interface{}     `json:"crm_project_id"`
+		ID                 int64           `json:"id"`
+		TenantID           uuid.UUID       `json:"tenant_id"`
+		Code               string          `json:"code"`
+		Name               string          `json:"name"`
+		Coordinates        json.RawMessage `json:"coordinates,omitempty"`
+		Currency           string          `json:"currency"`
+		Status             string          `json:"status"`
+		CreatedBy          *uuid.UUID      `json:"created_by"`
+		CreatedDate        time.Time       `json:"created_date"`
+		UpdatedDate        time.Time       `json:"updated_date"`
+		ProjectManagerName string          `json:"project_manager_name,omitempty"`
+		ChiefEngineerName  string          `json:"chief_engineer_name,omitempty"`
+		WarehouseName      string          `json:"warehouse_name,omitempty"`
+		SectionsCount      int             `json:"sections_count,omitempty"`
+		TotalSmeta         float64         `json:"total_smeta,omitempty"`
+		FilesCount         int             `json:"files_count"`
 	}{
 		Description:        nullStringValue(p.Description),
 		Address:            nullStringValue(p.Address),
@@ -517,14 +517,14 @@ type UpdateConstructionBuildingInput struct {
 
 // SmetaSection represents a section in smeta (estimate)
 type SmetaSection struct {
-	ID         int64          `json:"id" db:"id"`
-	TenantID   uuid.UUID      `json:"tenant_id" db:"tenant_id"`
-	ProjectID  int64          `json:"project_id" db:"project_id"`
-	BuildingID sql.NullInt64  `json:"building_id" db:"building_id"`
-	ParentID   sql.NullInt64  `json:"parent_id" db:"parent_id"`
-	Code       string         `json:"code" db:"code"`
-	Name       string         `json:"name" db:"name"`
-	NameUz     sql.NullString `json:"name_uz" db:"name_uz"`
+	ID          int64          `json:"id" db:"id"`
+	TenantID    uuid.UUID      `json:"tenant_id" db:"tenant_id"`
+	ProjectID   int64          `json:"project_id" db:"project_id"`
+	BuildingID  sql.NullInt64  `json:"building_id" db:"building_id"`
+	ParentID    sql.NullInt64  `json:"parent_id" db:"parent_id"`
+	Code        string         `json:"code" db:"code"`
+	Name        string         `json:"name" db:"name"`
+	NameUz      sql.NullString `json:"name_uz" db:"name_uz"`
 	Description sql.NullString `json:"description" db:"description"`
 
 	// Calculated totals
@@ -645,11 +645,11 @@ type SmetaItem struct {
 	Status          string          `json:"status" db:"status"`
 	ProgressPercent sql.NullFloat64 `json:"progress_percent" db:"progress_percent"`
 
-	Notes         sql.NullString  `json:"notes" db:"notes"`
+	Notes          sql.NullString  `json:"notes" db:"notes"`
 	TechnicalSpecs json.RawMessage `json:"technical_specs" db:"technical_specs" swaggertype:"object"`
-	SortOrder     int             `json:"sort_order" db:"sort_order"`
-	CreatedDate   time.Time       `json:"created_date" db:"created_date"`
-	UpdatedDate   time.Time       `json:"updated_date" db:"updated_date"`
+	SortOrder      int             `json:"sort_order" db:"sort_order"`
+	CreatedDate    time.Time       `json:"created_date" db:"created_date"`
+	UpdatedDate    time.Time       `json:"updated_date" db:"updated_date"`
 
 	// Computed
 	SectionName string `json:"section_name,omitempty" db:"section_name"`
@@ -806,10 +806,10 @@ type CreateSmetaResourceInput struct {
 
 // ConstructionWorkProgress represents completed work progress (KS-2 style)
 type ConstructionWorkProgress struct {
-	ID          int64          `json:"id" db:"id"`
-	TenantID    uuid.UUID      `json:"tenant_id" db:"tenant_id"`
-	ProjectID   int64          `json:"project_id" db:"project_id"`
-	SmetaItemID int64          `json:"smeta_item_id" db:"smeta_item_id"`
+	ID          int64     `json:"id" db:"id"`
+	TenantID    uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	ProjectID   int64     `json:"project_id" db:"project_id"`
+	SmetaItemID int64     `json:"smeta_item_id" db:"smeta_item_id"`
 
 	ReportNumber sql.NullString `json:"report_number" db:"report_number"`
 	ReportDate   time.Time      `json:"report_date" db:"report_date"`
@@ -830,8 +830,8 @@ type ConstructionWorkProgress struct {
 	UpdatedDate time.Time  `json:"updated_date" db:"updated_date"`
 
 	// Computed
-	SmetaItemName  string `json:"smeta_item_name,omitempty" db:"smeta_item_name"`
-	VerifierName   string `json:"verifier_name,omitempty" db:"verifier_name"`
+	SmetaItemName string `json:"smeta_item_name,omitempty" db:"smeta_item_name"`
+	VerifierName  string `json:"verifier_name,omitempty" db:"verifier_name"`
 }
 
 // CreateWorkProgressInput represents input for creating work progress
@@ -855,21 +855,21 @@ type ConstructionDailyReport struct {
 	TenantID  uuid.UUID `json:"tenant_id" db:"tenant_id"`
 	ProjectID int64     `json:"project_id" db:"project_id"`
 
-	ReportDate        time.Time       `json:"report_date" db:"report_date"`
-	WeatherMorning    sql.NullString  `json:"weather_morning" db:"weather_morning"`
-	WeatherAfternoon  sql.NullString  `json:"weather_afternoon" db:"weather_afternoon"`
-	TemperatureMin    sql.NullFloat64 `json:"temperature_min" db:"temperature_min"`
-	TemperatureMax    sql.NullFloat64 `json:"temperature_max" db:"temperature_max"`
+	ReportDate       time.Time       `json:"report_date" db:"report_date"`
+	WeatherMorning   sql.NullString  `json:"weather_morning" db:"weather_morning"`
+	WeatherAfternoon sql.NullString  `json:"weather_afternoon" db:"weather_afternoon"`
+	TemperatureMin   sql.NullFloat64 `json:"temperature_min" db:"temperature_min"`
+	TemperatureMax   sql.NullFloat64 `json:"temperature_max" db:"temperature_max"`
 
 	WorkSummary       sql.NullString `json:"work_summary" db:"work_summary"`
 	IssuesEncountered sql.NullString `json:"issues_encountered" db:"issues_encountered"`
 	SafetyNotes       sql.NullString `json:"safety_notes" db:"safety_notes"`
 
-	WorkersCount    int             `json:"workers_count" db:"workers_count"`
-	WorkersDetails  json.RawMessage `json:"workers_details" db:"workers_details" swaggertype:"object"`
-	EquipmentUsed   json.RawMessage `json:"equipment_used" db:"equipment_used" swaggertype:"object"`
+	WorkersCount      int             `json:"workers_count" db:"workers_count"`
+	WorkersDetails    json.RawMessage `json:"workers_details" db:"workers_details" swaggertype:"object"`
+	EquipmentUsed     json.RawMessage `json:"equipment_used" db:"equipment_used" swaggertype:"object"`
 	MaterialsReceived json.RawMessage `json:"materials_received" db:"materials_received" swaggertype:"object"`
-	Visitors        json.RawMessage `json:"visitors" db:"visitors" swaggertype:"object"`
+	Visitors          json.RawMessage `json:"visitors" db:"visitors" swaggertype:"object"`
 
 	ReportedBy         uuid.NullUUID `json:"reported_by" db:"reported_by"`
 	VerifiedBy         uuid.NullUUID `json:"verified_by" db:"verified_by"`
@@ -885,18 +885,18 @@ type ConstructionDailyReport struct {
 
 // CreateDailyReportInput represents input for creating a daily report
 type CreateDailyReportInput struct {
-	ReportDate        string `json:"report_date" binding:"required"`
-	WeatherMorning    string `json:"weather_morning"`
-	WeatherAfternoon  string `json:"weather_afternoon"`
-	TemperatureMin    float64 `json:"temperature_min"`
-	TemperatureMax    float64 `json:"temperature_max"`
-	WorkSummary       string `json:"work_summary"`
-	IssuesEncountered string `json:"issues_encountered"`
-	SafetyNotes       string `json:"safety_notes"`
-	WorkersCount      int    `json:"workers_count"`
-	WorkersDetails    string `json:"workers_details"`
-	EquipmentUsed     string `json:"equipment_used"`
-	MaterialsReceived string `json:"materials_received"`
+	ReportDate        string                   `json:"report_date" binding:"required"`
+	WeatherMorning    string                   `json:"weather_morning"`
+	WeatherAfternoon  string                   `json:"weather_afternoon"`
+	TemperatureMin    float64                  `json:"temperature_min"`
+	TemperatureMax    float64                  `json:"temperature_max"`
+	WorkSummary       string                   `json:"work_summary"`
+	IssuesEncountered string                   `json:"issues_encountered"`
+	SafetyNotes       string                   `json:"safety_notes"`
+	WorkersCount      int                      `json:"workers_count"`
+	WorkersDetails    string                   `json:"workers_details"`
+	EquipmentUsed     string                   `json:"equipment_used"`
+	MaterialsReceived string                   `json:"materials_received"`
 	Visitors          string                   `json:"visitors"`
 	ReportedBy        int64                    `json:"reported_by"`
 	Photos            []map[string]interface{} `json:"photos"`
@@ -949,8 +949,8 @@ type ConstructionProjectVendor struct {
 
 // CreateProjectVendorInput represents input for adding a vendor to a project
 type CreateProjectVendorInput struct {
-	VendorID       string  `json:"vendor_id"`       // UUID of existing organization (optional)
-	VendorName     string  `json:"vendor_name"`     // Name for new vendor organization (used if vendor_id is empty)
+	VendorID       string  `json:"vendor_id"`   // UUID of existing organization (optional)
+	VendorName     string  `json:"vendor_name"` // Name for new vendor organization (used if vendor_id is empty)
 	ContractNumber string  `json:"contract_number"`
 	ContractDate   string  `json:"contract_date"`
 	ContractAmount float64 `json:"contract_amount"`
@@ -976,8 +976,8 @@ type ConstructionMaterialDelivery struct {
 	ProjectID int64     `json:"project_id" db:"project_id"`
 	VendorID  int64     `json:"vendor_id" db:"vendor_id"`
 
-	DeliveryNumber  string    `json:"delivery_number" db:"delivery_number"`
-	DeliveryDate    time.Time `json:"delivery_date" db:"delivery_date"`
+	DeliveryNumber  string        `json:"delivery_number" db:"delivery_number"`
+	DeliveryDate    time.Time     `json:"delivery_date" db:"delivery_date"`
 	PurchaseOrderID uuid.NullUUID `json:"purchase_order_id" db:"purchase_order_id"`
 	GoodsReceiptID  uuid.NullUUID `json:"goods_receipt_id" db:"goods_receipt_id"`
 

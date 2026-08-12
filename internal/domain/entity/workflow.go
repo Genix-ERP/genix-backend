@@ -14,14 +14,14 @@ type Workflow struct {
 	TenantID          uuid.UUID       `json:"tenant_id" db:"tenant_id"`
 	Name              string          `json:"name" db:"name"`
 	Description       *string         `json:"description,omitempty" db:"description"`
-	Category          string          `json:"category" db:"category"` // hr, procurement, customer_support, sales, inventory, finance, marketing
-	Trigger           string          `json:"trigger" db:"trigger"` // manual, scheduled, event_based, ai_triggered
-	Status            string          `json:"status" db:"status"` // active, paused, draft
-	AutomationLevel   string          `json:"automation_level" db:"automation_level"` // manual, semi_automated, fully_automated
-	Steps             json.RawMessage `json:"steps" db:"steps" swaggertype:"object"` // JSON array of workflow steps
-	SuccessRate       float64         `json:"success_rate" db:"success_rate"` // Percentage
+	Category          string          `json:"category" db:"category"`                       // hr, procurement, customer_support, sales, inventory, finance, marketing
+	Trigger           string          `json:"trigger" db:"trigger"`                         // manual, scheduled, event_based, ai_triggered
+	Status            string          `json:"status" db:"status"`                           // active, paused, draft
+	AutomationLevel   string          `json:"automation_level" db:"automation_level"`       // manual, semi_automated, fully_automated
+	Steps             json.RawMessage `json:"steps" db:"steps" swaggertype:"object"`        // JSON array of workflow steps
+	SuccessRate       float64         `json:"success_rate" db:"success_rate"`               // Percentage
 	AvgCompletionTime float64         `json:"avg_completion_time" db:"avg_completion_time"` // Hours
-	CostSavings       float64         `json:"cost_savings" db:"cost_savings"` // Monthly savings in currency
+	CostSavings       float64         `json:"cost_savings" db:"cost_savings"`               // Monthly savings in currency
 	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
 	UpdatedAt         time.Time       `json:"updated_at" db:"updated_at"`
 	DeletedAt         sql.NullTime    `json:"-" db:"deleted_at"`

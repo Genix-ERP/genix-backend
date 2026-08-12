@@ -88,11 +88,11 @@ type UpdateEmployeeTaxInput struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 type PayrollEntryTax struct {
-	ID              uuid.UUID  `json:"id" db:"id"`
-	TenantID        uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	OrganizationID  *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
-	PayrollEntryID  uuid.UUID  `json:"payroll_entry_id" db:"payroll_entry_id"`
-	TaxID           *uuid.UUID `json:"tax_id,omitempty" db:"tax_id"`
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	PayrollEntryID uuid.UUID  `json:"payroll_entry_id" db:"payroll_entry_id"`
+	TaxID          *uuid.UUID `json:"tax_id,omitempty" db:"tax_id"`
 
 	TaxCodeSnapshot  string  `json:"tax_code" db:"tax_code_snapshot"`
 	TaxNameSnapshot  string  `json:"tax_name" db:"tax_name_snapshot"`

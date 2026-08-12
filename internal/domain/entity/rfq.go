@@ -62,11 +62,11 @@ type RFQItem struct {
 
 // RFQInvite represents a vendor invitation to an RFQ
 type RFQInvite struct {
-	ID         uuid.UUID  `json:"id" db:"id"`
-	RFQID      uuid.UUID  `json:"rfq_id" db:"rfq_id"`
-	VendorID   uuid.UUID  `json:"vendor_id" db:"vendor_id"`
-	InvitedAt  time.Time  `json:"invited_at" db:"invited_at"`
-	ViewedAt   *time.Time `json:"viewed_at,omitempty" db:"viewed_at"`
+	ID          uuid.UUID  `json:"id" db:"id"`
+	RFQID       uuid.UUID  `json:"rfq_id" db:"rfq_id"`
+	VendorID    uuid.UUID  `json:"vendor_id" db:"vendor_id"`
+	InvitedAt   time.Time  `json:"invited_at" db:"invited_at"`
+	ViewedAt    *time.Time `json:"viewed_at,omitempty" db:"viewed_at"`
 	RespondedAt *time.Time `json:"responded_at,omitempty" db:"responded_at"`
 
 	// Computed
@@ -75,20 +75,20 @@ type RFQInvite struct {
 
 // RFQResponse represents a vendor's response to an RFQ
 type RFQResponse struct {
-	ID           uuid.UUID `json:"id" db:"id"`
-	RFQID        uuid.UUID `json:"rfq_id" db:"rfq_id"`
-	VendorID     uuid.UUID `json:"vendor_id" db:"vendor_id"`
-	TotalAmount  float64   `json:"total_amount" db:"total_amount"`
-	LeadTimeDays int       `json:"lead_time_days" db:"lead_time_days"`
+	ID           uuid.UUID  `json:"id" db:"id"`
+	RFQID        uuid.UUID  `json:"rfq_id" db:"rfq_id"`
+	VendorID     uuid.UUID  `json:"vendor_id" db:"vendor_id"`
+	TotalAmount  float64    `json:"total_amount" db:"total_amount"`
+	LeadTimeDays int        `json:"lead_time_days" db:"lead_time_days"`
 	ValidUntil   *time.Time `json:"valid_until,omitempty" db:"valid_until"`
-	Notes        *string   `json:"notes,omitempty" db:"notes"`
-	IsWinner     bool      `json:"is_winner" db:"is_winner"`
-	CreatedAt    time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at" db:"updated_at"`
+	Notes        *string    `json:"notes,omitempty" db:"notes"`
+	IsWinner     bool       `json:"is_winner" db:"is_winner"`
+	CreatedAt    time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Computed
-	VendorName string             `json:"vendor_name,omitempty"`
-	Items      []RFQResponseItem  `json:"items,omitempty"`
+	VendorName string            `json:"vendor_name,omitempty"`
+	Items      []RFQResponseItem `json:"items,omitempty"`
 }
 
 // RFQResponseItem represents a line item in an RFQ response
@@ -103,13 +103,13 @@ type RFQResponseItem struct {
 
 // CreateRFQInput represents input for creating an RFQ
 type CreateRFQInput struct {
-	Title       string              `json:"title" binding:"required"`
-	Description string              `json:"description,omitempty"`
-	Deadline    string              `json:"deadline,omitempty"`
-	Terms       string              `json:"terms,omitempty"`
-	Notes       string              `json:"notes,omitempty"`
-	Items       []CreateRFQItemInput `json:"items" binding:"required,min=1"`
-	VendorIDs   []string            `json:"vendor_ids,omitempty"`
+	Title       string               `json:"title" binding:"required"`
+	Description string               `json:"description,omitempty"`
+	Deadline    string               `json:"deadline,omitempty"`
+	Terms       string               `json:"terms,omitempty"`
+	Notes       string               `json:"notes,omitempty"`
+	Items       []CreateRFQItemInput `json:"items" binding:"required,min=1,dive"`
+	VendorIDs   []string             `json:"vendor_ids,omitempty"`
 }
 
 // CreateRFQItemInput represents input for an RFQ item
@@ -124,11 +124,11 @@ type CreateRFQItemInput struct {
 
 // SubmitRFQResponseInput represents input for submitting an RFQ response
 type SubmitRFQResponseInput struct {
-	VendorID     string                      `json:"vendor_id" binding:"required"`
-	LeadTimeDays int                         `json:"lead_time_days"`
-	ValidUntil   string                      `json:"valid_until,omitempty"`
-	Notes        string                      `json:"notes,omitempty"`
-	Items        []SubmitRFQResponseItemInput `json:"items" binding:"required,min=1"`
+	VendorID     string                       `json:"vendor_id" binding:"required"`
+	LeadTimeDays int                          `json:"lead_time_days"`
+	ValidUntil   string                       `json:"valid_until,omitempty"`
+	Notes        string                       `json:"notes,omitempty"`
+	Items        []SubmitRFQResponseItemInput `json:"items" binding:"required,min=1,dive"`
 }
 
 // SubmitRFQResponseItemInput represents input for a response item

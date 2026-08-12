@@ -158,8 +158,8 @@ type POSOrderInput struct {
 	CustomerPhone   string              `json:"customer_phone,omitempty"`
 	DiscountPercent float64             `json:"discount_percent,omitempty"`
 	Notes           string              `json:"notes,omitempty"`
-	Lines           []POSOrderLineInput `json:"lines" binding:"required,min=1"`
-	Payments        []POSPaymentInput   `json:"payments" binding:"required,min=1"`
+	Lines           []POSOrderLineInput `json:"lines" binding:"required,min=1,dive"`
+	Payments        []POSPaymentInput   `json:"payments" binding:"required,min=1,dive"`
 }
 
 type POSOrderLineInput struct {

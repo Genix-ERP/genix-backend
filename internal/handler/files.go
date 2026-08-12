@@ -178,14 +178,25 @@ func (h *Handler) GetFile(c *gin.Context) {
 }
 
 // DeleteFile deletes a file by ID from the database.
+//
+// Reading is open by design — file ids are unguessable random tokens and
+// logos/favicons must be servable without auth. Deleting is not: without the
+// tenant filter below, any authenticated user could delete ANY tenant's file
+// by id (the tenant-isolation sweep flagged it). Legacy rows with NULL
+// tenant_id (platform assets) stay undeletable through this endpoint.
 func (h *Handler) DeleteFile(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
 	fileID := c.Param("id")
 	if fileID == "" {
 		response.NotFound(c, "File")
 		return
 	}
 
-	res, err := h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1`, fileID)
+	res, err := h.db.Exec(`DELETE FROM uploaded_files WHERE id = $1 AND tenant_id = $2`, fileID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to delete uploaded file", "error", err, "id", fileID)
 		response.Error(c, http.StatusInternalServerError, "STORAGE_ERROR", "Failed to delete file")

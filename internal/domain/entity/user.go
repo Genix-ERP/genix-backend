@@ -107,11 +107,11 @@ type APIKey struct {
 
 // UserSettings represents user preferences
 type UserSettings struct {
-	Theme            string `json:"theme"`
-	DashboardLayout  string `json:"dashboard_layout"`
-	DefaultView      string `json:"default_view"`
-	EmailNotifications bool `json:"email_notifications"`
-	PushNotifications bool `json:"push_notifications"`
+	Theme              string `json:"theme"`
+	DashboardLayout    string `json:"dashboard_layout"`
+	DefaultView        string `json:"default_view"`
+	EmailNotifications bool   `json:"email_notifications"`
+	PushNotifications  bool   `json:"push_notifications"`
 }
 
 // CreateUserInput represents input for creating a user

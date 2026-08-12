@@ -79,8 +79,8 @@ type SalesOrder struct {
 	DeletedAt       sql.NullTime    `json:"-" db:"deleted_at"`
 
 	// Relationships
-	Customer *Contact          `json:"customer,omitempty"`
-	Lines    []SalesOrderLine  `json:"lines,omitempty"`
+	Customer *Contact         `json:"customer,omitempty"`
+	Lines    []SalesOrderLine `json:"lines,omitempty"`
 }
 
 // SalesOrderLine represents a line item in a sales order
@@ -115,44 +115,44 @@ type SalesOrderLine struct {
 
 // SalesInvoice represents a sales invoice
 type SalesInvoice struct {
-	ID              uuid.UUID       `json:"id" db:"id"`
-	TenantID        uuid.UUID       `json:"tenant_id" db:"tenant_id"`
-	OrganizationID  *uuid.UUID      `json:"organization_id,omitempty" db:"organization_id"`
-	InvoiceNumber   string          `json:"invoice_number" db:"invoice_number"`
-	CustomerID      uuid.UUID       `json:"customer_id" db:"customer_id"`
-	SalesOrderID    *uuid.UUID      `json:"sales_order_id,omitempty" db:"sales_order_id"`
-	InvoiceDate     time.Time       `json:"invoice_date" db:"invoice_date"`
-	DueDate         time.Time       `json:"due_date" db:"due_date"`
-	BillingAddress  json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
-	ShippingAddress json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
-	CurrencyID      *uuid.UUID      `json:"currency_id,omitempty" db:"currency_id"`
-	ExchangeRate    float64         `json:"exchange_rate" db:"exchange_rate"`
-	Subtotal        float64         `json:"subtotal" db:"subtotal"`
-	DiscountAmount  float64         `json:"discount_amount" db:"discount_amount"`
-	TaxAmount       float64         `json:"tax_amount" db:"tax_amount"`
-	TotalAmount     float64         `json:"total_amount" db:"total_amount"`
-	AmountPaid      float64         `json:"amount_paid" db:"amount_paid"`
-	AmountDue       float64         `json:"amount_due" db:"amount_due"`
-	Status          InvoiceStatus   `json:"status" db:"status"`
-	Reference       *string         `json:"reference,omitempty" db:"reference"`
-	PONumber        *string         `json:"po_number,omitempty" db:"po_number"`
-	Notes           *string         `json:"notes,omitempty" db:"notes"`
-	TermsConditions *string         `json:"terms_conditions,omitempty" db:"terms_conditions"`
+	ID                uuid.UUID       `json:"id" db:"id"`
+	TenantID          uuid.UUID       `json:"tenant_id" db:"tenant_id"`
+	OrganizationID    *uuid.UUID      `json:"organization_id,omitempty" db:"organization_id"`
+	InvoiceNumber     string          `json:"invoice_number" db:"invoice_number"`
+	CustomerID        uuid.UUID       `json:"customer_id" db:"customer_id"`
+	SalesOrderID      *uuid.UUID      `json:"sales_order_id,omitempty" db:"sales_order_id"`
+	InvoiceDate       time.Time       `json:"invoice_date" db:"invoice_date"`
+	DueDate           time.Time       `json:"due_date" db:"due_date"`
+	BillingAddress    json.RawMessage `json:"billing_address" db:"billing_address" swaggertype:"object"`
+	ShippingAddress   json.RawMessage `json:"shipping_address" db:"shipping_address" swaggertype:"object"`
+	CurrencyID        *uuid.UUID      `json:"currency_id,omitempty" db:"currency_id"`
+	ExchangeRate      float64         `json:"exchange_rate" db:"exchange_rate"`
+	Subtotal          float64         `json:"subtotal" db:"subtotal"`
+	DiscountAmount    float64         `json:"discount_amount" db:"discount_amount"`
+	TaxAmount         float64         `json:"tax_amount" db:"tax_amount"`
+	TotalAmount       float64         `json:"total_amount" db:"total_amount"`
+	AmountPaid        float64         `json:"amount_paid" db:"amount_paid"`
+	AmountDue         float64         `json:"amount_due" db:"amount_due"`
+	Status            InvoiceStatus   `json:"status" db:"status"`
+	Reference         *string         `json:"reference,omitempty" db:"reference"`
+	PONumber          *string         `json:"po_number,omitempty" db:"po_number"`
+	Notes             *string         `json:"notes,omitempty" db:"notes"`
+	TermsConditions   *string         `json:"terms_conditions,omitempty" db:"terms_conditions"`
 	InvoiceType       string          `json:"invoice_type" db:"invoice_type"` // invoice, credit_note
 	OriginalInvoiceID *uuid.UUID      `json:"original_invoice_id,omitempty" db:"original_invoice_id"`
 	Reason            *string         `json:"reason,omitempty" db:"reason"`
 	JournalEntryID    *uuid.UUID      `json:"journal_entry_id,omitempty" db:"journal_entry_id"`
 	SentAt            *time.Time      `json:"sent_at,omitempty" db:"sent_at"`
-	ViewedAt        *time.Time      `json:"viewed_at,omitempty" db:"viewed_at"`
-	CreatedBy       *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt       time.Time       `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time       `json:"updated_at" db:"updated_at"`
-	DeletedAt       sql.NullTime    `json:"-" db:"deleted_at"`
+	ViewedAt          *time.Time      `json:"viewed_at,omitempty" db:"viewed_at"`
+	CreatedBy         *uuid.UUID      `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt         time.Time       `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time       `json:"updated_at" db:"updated_at"`
+	DeletedAt         sql.NullTime    `json:"-" db:"deleted_at"`
 
 	// Relationships
-	Customer   *Contact             `json:"customer,omitempty"`
-	SalesOrder *SalesOrder          `json:"sales_order,omitempty"`
-	Lines      []SalesInvoiceLine   `json:"lines,omitempty"`
+	Customer   *Contact           `json:"customer,omitempty"`
+	SalesOrder *SalesOrder        `json:"sales_order,omitempty"`
+	Lines      []SalesInvoiceLine `json:"lines,omitempty"`
 }
 
 // SalesInvoiceLine represents a line item in a sales invoice
@@ -182,9 +182,9 @@ type SalesInvoiceLine struct {
 
 // CreateCreditNoteInput represents input for creating a credit note from an invoice
 type CreateCreditNoteInput struct {
-	Reason         string                  `json:"reason" binding:"required"`
-	CreditNoteDate string                  `json:"credit_note_date"` // defaults to today
-	Lines          []CreditNoteLineInput   `json:"lines"`            // optional: partial credit; if empty, full reversal
+	Reason         string                `json:"reason" binding:"required"`
+	CreditNoteDate string                `json:"credit_note_date"` // defaults to today
+	Lines          []CreditNoteLineInput `json:"lines"`            // optional: partial credit; if empty, full reversal
 }
 
 // CreditNoteLineInput represents a line in a partial credit note
@@ -216,7 +216,7 @@ type CreateSalesOrderInput struct {
 	WarehouseID     string                      `json:"warehouse_id,omitempty"`
 	SalesRepID      string                      `json:"sales_rep_id,omitempty"`
 	ContractID      string                      `json:"contract_id,omitempty"`
-	Lines           []CreateSalesOrderLineInput `json:"lines" binding:"required,min=1"`
+	Lines           []CreateSalesOrderLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 // CreateSalesOrderLineInput represents input for creating a sales order line
@@ -289,7 +289,7 @@ type CreateSalesInvoiceInput struct {
 	PONumber        string                        `json:"po_number,omitempty"`
 	Notes           string                        `json:"notes,omitempty"`
 	TermsConditions string                        `json:"terms_conditions,omitempty"`
-	Lines           []CreateSalesInvoiceLineInput `json:"lines" binding:"required,min=1"`
+	Lines           []CreateSalesInvoiceLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 // CreateSalesInvoiceLineInput represents input for creating an invoice line
