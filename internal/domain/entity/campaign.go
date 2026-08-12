@@ -182,17 +182,17 @@ type CampaignResponse struct {
 
 // CampaignStats represents campaign statistics
 type CampaignStats struct {
-	TotalCampaigns     int            `json:"total_campaigns"`
-	ActiveCampaigns    int            `json:"active_campaigns"`
-	TotalBudget        float64        `json:"total_budget"`
-	TotalSpent         float64        `json:"total_spent"`
-	TotalLeads         int            `json:"total_leads"`
-	TotalConversions   int            `json:"total_conversions"`
-	TotalRevenue       float64        `json:"total_revenue"`
-	AverageROI         float64        `json:"average_roi"`
-	AverageConversion  float64        `json:"average_conversion_rate"`
-	ByType             map[string]int `json:"by_type"`
-	ByStatus           map[string]int `json:"by_status"`
+	TotalCampaigns    int            `json:"total_campaigns"`
+	ActiveCampaigns   int            `json:"active_campaigns"`
+	TotalBudget       float64        `json:"total_budget"`
+	TotalSpent        float64        `json:"total_spent"`
+	TotalLeads        int            `json:"total_leads"`
+	TotalConversions  int            `json:"total_conversions"`
+	TotalRevenue      float64        `json:"total_revenue"`
+	AverageROI        float64        `json:"average_roi"`
+	AverageConversion float64        `json:"average_conversion_rate"`
+	ByType            map[string]int `json:"by_type"`
+	ByStatus          map[string]int `json:"by_status"`
 }
 
 // AddCampaignMemberInput represents input for adding members to a campaign

@@ -8,16 +8,16 @@ import (
 
 // Warehouse represents a warehouse
 type Warehouse struct {
-	ID             uuid.UUID    `json:"id" db:"id"`
-	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	OrganizationID *uuid.UUID   `json:"organization_id,omitempty" db:"organization_id"`
-	Code           string       `json:"code" db:"code"`
-	Name           string       `json:"name" db:"name"`
-	Address        *Address     `json:"address,omitempty" db:"address"`
-	ManagerID      *uuid.UUID   `json:"manager_id,omitempty" db:"manager_id"`
-	IsDefault      bool         `json:"is_default" db:"is_default"`
-	IsActive       bool         `json:"is_active" db:"is_active"`
-	WarehouseType  string       `json:"warehouse_type" db:"warehouse_type"` // regular, scrap
+	ID             uuid.UUID  `json:"id" db:"id"`
+	TenantID       uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	Code           string     `json:"code" db:"code"`
+	Name           string     `json:"name" db:"name"`
+	Address        *Address   `json:"address,omitempty" db:"address"`
+	ManagerID      *uuid.UUID `json:"manager_id,omitempty" db:"manager_id"`
+	IsDefault      bool       `json:"is_default" db:"is_default"`
+	IsActive       bool       `json:"is_active" db:"is_active"`
+	WarehouseType  string     `json:"warehouse_type" db:"warehouse_type"` // regular, scrap
 	// Odoo-style warehouse operation steps
 	// 1 = Direct, 2 = 2-step, 3 = 3-step
 	ReceptionSteps int       `json:"reception_steps" db:"reception_steps"` // 1=Receive to stock, 2=Input+Stock, 3=Input+QC+Stock
@@ -59,23 +59,23 @@ type WarehouseLocation struct {
 
 // Inventory represents inventory at a specific location
 type Inventory struct {
-	ID                uuid.UUID    `json:"id" db:"id"`
-	TenantID          uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	ProductID         uuid.UUID    `json:"product_id" db:"product_id"`
-	WarehouseID       uuid.UUID    `json:"warehouse_id" db:"warehouse_id"`
-	LocationID        *uuid.UUID   `json:"location_id,omitempty" db:"location_id"`
-	LotNumber         *string      `json:"lot_number,omitempty" db:"lot_number"`
-	SerialNumber      *string      `json:"serial_number,omitempty" db:"serial_number"`
-	ExpiryDate        *time.Time   `json:"expiry_date,omitempty" db:"expiry_date"`
-	QuantityOnHand    float64      `json:"quantity_on_hand" db:"quantity_on_hand"`
-	QuantityReserved  float64      `json:"quantity_reserved" db:"quantity_reserved"`
-	QuantityAvailable float64      `json:"quantity_available" db:"quantity_available"`
-	UnitCost          float64      `json:"unit_cost" db:"unit_cost"`
-	TotalValue        float64      `json:"total_value" db:"total_value"`
-	LastCountDate     *time.Time   `json:"last_count_date,omitempty" db:"last_count_date"`
-	LastMovementDate  *time.Time   `json:"last_movement_date,omitempty" db:"last_movement_date"`
-	CreatedAt         time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt         time.Time    `json:"updated_at" db:"updated_at"`
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	ProductID         uuid.UUID  `json:"product_id" db:"product_id"`
+	WarehouseID       uuid.UUID  `json:"warehouse_id" db:"warehouse_id"`
+	LocationID        *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+	LotNumber         *string    `json:"lot_number,omitempty" db:"lot_number"`
+	SerialNumber      *string    `json:"serial_number,omitempty" db:"serial_number"`
+	ExpiryDate        *time.Time `json:"expiry_date,omitempty" db:"expiry_date"`
+	QuantityOnHand    float64    `json:"quantity_on_hand" db:"quantity_on_hand"`
+	QuantityReserved  float64    `json:"quantity_reserved" db:"quantity_reserved"`
+	QuantityAvailable float64    `json:"quantity_available" db:"quantity_available"`
+	UnitCost          float64    `json:"unit_cost" db:"unit_cost"`
+	TotalValue        float64    `json:"total_value" db:"total_value"`
+	LastCountDate     *time.Time `json:"last_count_date,omitempty" db:"last_count_date"`
+	LastMovementDate  *time.Time `json:"last_movement_date,omitempty" db:"last_movement_date"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	Product   *Product   `json:"product,omitempty"`
@@ -122,7 +122,7 @@ type CreateWarehouseInput struct {
 	Address        *Address `json:"address,omitempty"`
 	ManagerID      string   `json:"manager_id,omitempty"`
 	IsDefault      bool     `json:"is_default,omitempty"`
-	WarehouseType  string   `json:"warehouse_type,omitempty"` // regular, scrap
+	WarehouseType  string   `json:"warehouse_type,omitempty"`  // regular, scrap
 	ReceptionSteps int      `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
 	DeliverySteps  int      `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
@@ -134,7 +134,7 @@ type UpdateWarehouseInput struct {
 	ManagerID      *string  `json:"manager_id,omitempty"`
 	IsDefault      *bool    `json:"is_default,omitempty"`
 	IsActive       *bool    `json:"is_active,omitempty"`
-	WarehouseType  *string  `json:"warehouse_type,omitempty"` // regular, scrap
+	WarehouseType  *string  `json:"warehouse_type,omitempty"`  // regular, scrap
 	ReceptionSteps *int     `json:"reception_steps,omitempty"` // 1=Direct, 2=Input+Stock, 3=Input+QC+Stock
 	DeliverySteps  *int     `json:"delivery_steps,omitempty"`  // 1=Direct, 2=Pick+Ship, 3=Pick+Pack+Ship
 }
@@ -180,46 +180,46 @@ type InventoryTransferInput struct {
 
 // InventoryListFilter represents filters for listing inventory
 type InventoryListFilter struct {
-	Search      string  `form:"search"`
-	ProductID   string  `form:"product_id"`
-	WarehouseID string  `form:"warehouse_id"`
-	LocationID  string  `form:"location_id"`
-	LowStock    *bool   `form:"low_stock"`
-	OutOfStock  *bool   `form:"out_of_stock"`
-	Expiring    *bool   `form:"expiring"`
-	ExpiryDays  int     `form:"expiry_days"`
+	Search      string `form:"search"`
+	ProductID   string `form:"product_id"`
+	WarehouseID string `form:"warehouse_id"`
+	LocationID  string `form:"location_id"`
+	LowStock    *bool  `form:"low_stock"`
+	OutOfStock  *bool  `form:"out_of_stock"`
+	Expiring    *bool  `form:"expiring"`
+	ExpiryDays  int    `form:"expiry_days"`
 }
 
 // InventorySummary represents a summary of inventory for a product
 type InventorySummary struct {
-	ProductID         uuid.UUID `json:"product_id"`
-	ProductCode       string    `json:"product_code"`
-	ProductName       string    `json:"product_name"`
-	TotalOnHand       float64   `json:"total_on_hand"`
-	TotalReserved     float64   `json:"total_reserved"`
-	TotalAvailable    float64   `json:"total_available"`
-	TotalValue        float64   `json:"total_value"`
-	WarehouseCount    int       `json:"warehouse_count"`
-	MinStockLevel     float64   `json:"min_stock_level"`
-	ReorderPoint      float64   `json:"reorder_point"`
-	NeedsReorder      bool      `json:"needs_reorder"`
+	ProductID      uuid.UUID `json:"product_id"`
+	ProductCode    string    `json:"product_code"`
+	ProductName    string    `json:"product_name"`
+	TotalOnHand    float64   `json:"total_on_hand"`
+	TotalReserved  float64   `json:"total_reserved"`
+	TotalAvailable float64   `json:"total_available"`
+	TotalValue     float64   `json:"total_value"`
+	WarehouseCount int       `json:"warehouse_count"`
+	MinStockLevel  float64   `json:"min_stock_level"`
+	ReorderPoint   float64   `json:"reorder_point"`
+	NeedsReorder   bool      `json:"needs_reorder"`
 }
 
 // StockMovementReport represents a stock movement report entry
 type StockMovementReport struct {
-	Date              time.Time       `json:"date"`
-	ProductID         uuid.UUID       `json:"product_id"`
-	ProductCode       string          `json:"product_code"`
-	ProductName       string          `json:"product_name"`
-	TransactionType   TransactionType `json:"transaction_type"`
-	ReferenceType     *string         `json:"reference_type,omitempty"`
-	ReferenceNumber   *string         `json:"reference_number,omitempty"`
-	WarehouseName     string          `json:"warehouse_name"`
-	QuantityIn        float64         `json:"quantity_in"`
-	QuantityOut       float64         `json:"quantity_out"`
-	Balance           float64         `json:"balance"`
-	UnitCost          float64         `json:"unit_cost"`
-	TotalValue        float64         `json:"total_value"`
+	Date            time.Time       `json:"date"`
+	ProductID       uuid.UUID       `json:"product_id"`
+	ProductCode     string          `json:"product_code"`
+	ProductName     string          `json:"product_name"`
+	TransactionType TransactionType `json:"transaction_type"`
+	ReferenceType   *string         `json:"reference_type,omitempty"`
+	ReferenceNumber *string         `json:"reference_number,omitempty"`
+	WarehouseName   string          `json:"warehouse_name"`
+	QuantityIn      float64         `json:"quantity_in"`
+	QuantityOut     float64         `json:"quantity_out"`
+	Balance         float64         `json:"balance"`
+	UnitCost        float64         `json:"unit_cost"`
+	TotalValue      float64         `json:"total_value"`
 }
 
 // WarehouseListFilter represents filters for listing warehouses
@@ -271,13 +271,13 @@ type WarehouseOperationType struct {
 	UpdatedAt              time.Time         `json:"updated_at" db:"updated_at"`
 
 	// TT extensions
-	JournalID                *uuid.UUID `json:"journal_id,omitempty" db:"journal_id"`
-	DebitAccountID           *uuid.UUID `json:"debit_account_id,omitempty" db:"debit_account_id"`
-	CreditAccountID          *uuid.UUID `json:"credit_account_id,omitempty" db:"credit_account_id"`
-	AutoPostAccounting       bool       `json:"auto_post_accounting" db:"auto_post_accounting"`
-	ApprovalRule             string     `json:"approval_rule" db:"approval_rule"`
-	ApprovalAmountThreshold  *float64   `json:"approval_amount_threshold,omitempty" db:"approval_amount_threshold"`
-	ApprovalQuantityThreshold *float64  `json:"approval_quantity_threshold,omitempty" db:"approval_quantity_threshold"`
+	JournalID                 *uuid.UUID `json:"journal_id,omitempty" db:"journal_id"`
+	DebitAccountID            *uuid.UUID `json:"debit_account_id,omitempty" db:"debit_account_id"`
+	CreditAccountID           *uuid.UUID `json:"credit_account_id,omitempty" db:"credit_account_id"`
+	AutoPostAccounting        bool       `json:"auto_post_accounting" db:"auto_post_accounting"`
+	ApprovalRule              string     `json:"approval_rule" db:"approval_rule"`
+	ApprovalAmountThreshold   *float64   `json:"approval_amount_threshold,omitempty" db:"approval_amount_threshold"`
+	ApprovalQuantityThreshold *float64   `json:"approval_quantity_threshold,omitempty" db:"approval_quantity_threshold"`
 
 	// Relationships
 	Warehouse *Warehouse `json:"warehouse,omitempty"`
@@ -322,19 +322,19 @@ type UpdateOperationTypeInput struct {
 
 // OperationTypeResponse represents the API response for an operation type
 type OperationTypeResponse struct {
-	ID                     uuid.UUID `json:"id"`
-	WarehouseID            uuid.UUID `json:"warehouse_id"`
-	WarehouseName          string    `json:"warehouse_name,omitempty"`
-	Code                   string    `json:"code"`
-	Name                   string    `json:"name"`
-	Type                   string    `json:"type"`
-	OperationType          string    `json:"operation_type"`
-	Sequence               int       `json:"sequence"`
-	Color                  string    `json:"color"`
-	ShowOperations         bool      `json:"show_operations"`
-	CountPickingReady      int       `json:"count_picking_ready"`
-	CountPickingLate       int       `json:"count_picking_late"`
-	CountPickingWaiting    int       `json:"count_picking_waiting"`
+	ID                     uuid.UUID  `json:"id"`
+	WarehouseID            uuid.UUID  `json:"warehouse_id"`
+	WarehouseName          string     `json:"warehouse_name,omitempty"`
+	Code                   string     `json:"code"`
+	Name                   string     `json:"name"`
+	Type                   string     `json:"type"`
+	OperationType          string     `json:"operation_type"`
+	Sequence               int        `json:"sequence"`
+	Color                  string     `json:"color"`
+	ShowOperations         bool       `json:"show_operations"`
+	CountPickingReady      int        `json:"count_picking_ready"`
+	CountPickingLate       int        `json:"count_picking_late"`
+	CountPickingWaiting    int        `json:"count_picking_waiting"`
 	CountPickingBackorders int        `json:"count_picking_backorders"`
 	IsActive               bool       `json:"is_active"`
 	CreatedAt              time.Time  `json:"created_at"`
@@ -370,54 +370,54 @@ type OperationTypeStep struct {
 
 // StockOperation represents a stock operation (receipt, delivery, internal transfer, write-off)
 type StockOperation struct {
-	ID              uuid.UUID  `json:"id"`
-	TenantID        uuid.UUID  `json:"tenant_id"`
-	Name            string     `json:"name"`
-	OperationTypeID uuid.UUID  `json:"operation_type_id"`
-	Direction       string     `json:"direction"` // receipt, delivery, internal, write_off
-	Date            time.Time  `json:"date"`
-	ScheduledDate   *time.Time `json:"scheduled_date,omitempty"`
-	PartnerID       *uuid.UUID `json:"partner_id,omitempty"`
-	PartnerName     string     `json:"partner_name,omitempty"`
-	SourceDocument  string     `json:"source_document,omitempty"`
-	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
-	DestLocationID  *uuid.UUID `json:"dest_location_id,omitempty"`
-	WarehouseName   string     `json:"warehouse_name,omitempty"`
-	State           string     `json:"state"` // draft, in_progress, waiting, done, cancelled
-	CurrentStep     int        `json:"current_step"`
-	TotalSteps      int        `json:"total_steps"`
-	Priority        string     `json:"priority"`
-	BackorderID     *uuid.UUID `json:"backorder_id,omitempty"`
-	ResponsibleID   *uuid.UUID `json:"responsible_id,omitempty"`
-	Note            string     `json:"note,omitempty"`
-	WriteOffReason  string     `json:"write_off_reason,omitempty"`
-	CarrierID       *uuid.UUID `json:"carrier_id,omitempty"`
-	DeliveryAddress string     `json:"delivery_address,omitempty"`
-	TrackingNumber  string     `json:"tracking_number,omitempty"`
-	Lines           []StockOperationLine    `json:"lines,omitempty"`
-	StepLogs        []StockOperationStepLog `json:"step_logs,omitempty"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID               uuid.UUID               `json:"id"`
+	TenantID         uuid.UUID               `json:"tenant_id"`
+	Name             string                  `json:"name"`
+	OperationTypeID  uuid.UUID               `json:"operation_type_id"`
+	Direction        string                  `json:"direction"` // receipt, delivery, internal, write_off
+	Date             time.Time               `json:"date"`
+	ScheduledDate    *time.Time              `json:"scheduled_date,omitempty"`
+	PartnerID        *uuid.UUID              `json:"partner_id,omitempty"`
+	PartnerName      string                  `json:"partner_name,omitempty"`
+	SourceDocument   string                  `json:"source_document,omitempty"`
+	SourceLocationID *uuid.UUID              `json:"source_location_id,omitempty"`
+	DestLocationID   *uuid.UUID              `json:"dest_location_id,omitempty"`
+	WarehouseName    string                  `json:"warehouse_name,omitempty"`
+	State            string                  `json:"state"` // draft, in_progress, waiting, done, cancelled
+	CurrentStep      int                     `json:"current_step"`
+	TotalSteps       int                     `json:"total_steps"`
+	Priority         string                  `json:"priority"`
+	BackorderID      *uuid.UUID              `json:"backorder_id,omitempty"`
+	ResponsibleID    *uuid.UUID              `json:"responsible_id,omitempty"`
+	Note             string                  `json:"note,omitempty"`
+	WriteOffReason   string                  `json:"write_off_reason,omitempty"`
+	CarrierID        *uuid.UUID              `json:"carrier_id,omitempty"`
+	DeliveryAddress  string                  `json:"delivery_address,omitempty"`
+	TrackingNumber   string                  `json:"tracking_number,omitempty"`
+	Lines            []StockOperationLine    `json:"lines,omitempty"`
+	StepLogs         []StockOperationStepLog `json:"step_logs,omitempty"`
+	CreatedAt        time.Time               `json:"created_at"`
+	UpdatedAt        time.Time               `json:"updated_at"`
 }
 
 // StockOperationLine represents a product row in a stock operation
 type StockOperationLine struct {
-	ID               uuid.UUID  `json:"id"`
-	TenantID         uuid.UUID  `json:"tenant_id"`
-	OperationID      uuid.UUID  `json:"operation_id"`
-	ProductID        uuid.UUID  `json:"product_id"`
-	ProductName      string     `json:"product_name,omitempty"`
-	ProductCode      string     `json:"product_code,omitempty"`
-	ExpectedQty      float64    `json:"expected_qty"`
-	DoneQty          float64    `json:"done_qty"`
-	UOM              string     `json:"uom"`
-	UnitPrice        *float64   `json:"unit_price,omitempty"`
-	LotID            *uuid.UUID `json:"lot_id,omitempty"`
-	LotNumber        string     `json:"lot_number,omitempty"`
-	ExpiryDate       *string    `json:"expiry_date,omitempty"`
-	QualityStatus    string     `json:"quality_status"` // good, defective, rejected
-	SourceLocationID *uuid.UUID `json:"source_location_id,omitempty"`
-	DestLocationID   *uuid.UUID `json:"dest_location_id,omitempty"`
+	ID                 uuid.UUID  `json:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id"`
+	OperationID        uuid.UUID  `json:"operation_id"`
+	ProductID          uuid.UUID  `json:"product_id"`
+	ProductName        string     `json:"product_name,omitempty"`
+	ProductCode        string     `json:"product_code,omitempty"`
+	ExpectedQty        float64    `json:"expected_qty"`
+	DoneQty            float64    `json:"done_qty"`
+	UOM                string     `json:"uom"`
+	UnitPrice          *float64   `json:"unit_price,omitempty"`
+	LotID              *uuid.UUID `json:"lot_id,omitempty"`
+	LotNumber          string     `json:"lot_number,omitempty"`
+	ExpiryDate         *string    `json:"expiry_date,omitempty"`
+	QualityStatus      string     `json:"quality_status"` // good, defective, rejected
+	SourceLocationID   *uuid.UUID `json:"source_location_id,omitempty"`
+	DestLocationID     *uuid.UUID `json:"dest_location_id,omitempty"`
 	WriteOffReason     string     `json:"write_off_reason,omitempty"`
 	Note               string     `json:"note,omitempty"`
 	LineTrackingNumber string     `json:"tracking_number,omitempty"`
@@ -448,20 +448,20 @@ type StockOperationStepLog struct {
 
 // CreateStockOperationInput is the input for creating a stock operation
 type CreateStockOperationInput struct {
-	OperationTypeID  string                       `json:"operation_type_id" binding:"required"`
-	Direction        string                       `json:"direction" binding:"required"`
-	ScheduledDate    *string                      `json:"scheduled_date,omitempty"`
-	PartnerID        string                       `json:"partner_id,omitempty"`
-	SourceDocument   string                       `json:"source_document,omitempty"`
-	SourceLocationID string                       `json:"source_location_id,omitempty"`
-	DestLocationID   string                       `json:"dest_location_id,omitempty"`
-	Priority         string                       `json:"priority,omitempty"`
-	Note             string                       `json:"note,omitempty"`
-	WriteOffReason   string                       `json:"write_off_reason,omitempty"`
-	CarrierID        string                       `json:"carrier_id,omitempty"`
-	DeliveryAddress  string                       `json:"delivery_address,omitempty"`
-	TrackingNumber   string                       `json:"tracking_number,omitempty"`
-	Lines            []CreateStockOperationLine   `json:"lines,omitempty"`
+	OperationTypeID  string                     `json:"operation_type_id" binding:"required"`
+	Direction        string                     `json:"direction" binding:"required"`
+	ScheduledDate    *string                    `json:"scheduled_date,omitempty"`
+	PartnerID        string                     `json:"partner_id,omitempty"`
+	SourceDocument   string                     `json:"source_document,omitempty"`
+	SourceLocationID string                     `json:"source_location_id,omitempty"`
+	DestLocationID   string                     `json:"dest_location_id,omitempty"`
+	Priority         string                     `json:"priority,omitempty"`
+	Note             string                     `json:"note,omitempty"`
+	WriteOffReason   string                     `json:"write_off_reason,omitempty"`
+	CarrierID        string                     `json:"carrier_id,omitempty"`
+	DeliveryAddress  string                     `json:"delivery_address,omitempty"`
+	TrackingNumber   string                     `json:"tracking_number,omitempty"`
+	Lines            []CreateStockOperationLine `json:"lines,omitempty"`
 }
 
 // CreateStockOperationLine is the input for a single product line
@@ -492,7 +492,7 @@ type UpdateStockOperationInput struct {
 
 // UpdateStockOperationLinesInput is the input for batch updating operation lines
 type UpdateStockOperationLinesInput struct {
-	Lines []UpdateStockOperationLineItem `json:"lines" binding:"required"`
+	Lines []UpdateStockOperationLineItem `json:"lines" binding:"required,dive"`
 }
 
 // UpdateStockOperationLineItem represents a single line update
@@ -585,7 +585,7 @@ type TransferOrder struct {
 	TransferDate    time.Time  `json:"transfer_date" db:"transfer_date"`
 	ExpectedArrival *time.Time `json:"expected_arrival,omitempty" db:"expected_arrival"`
 	ActualArrival   *time.Time `json:"actual_arrival,omitempty" db:"actual_arrival"`
-	Status          string     `json:"status" db:"status"` // draft, pending, approved, in_transit, received, cancelled
+	Status          string     `json:"status" db:"status"`     // draft, pending, approved, in_transit, received, cancelled
 	Priority        string     `json:"priority" db:"priority"` // low, normal, high, urgent
 	Notes           *string    `json:"notes,omitempty" db:"notes"`
 	Reason          *string    `json:"reason,omitempty" db:"reason"`
@@ -600,28 +600,28 @@ type TransferOrder struct {
 	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
-	FromWarehouse *Warehouse           `json:"from_warehouse,omitempty"`
-	ToWarehouse   *Warehouse           `json:"to_warehouse,omitempty"`
-	Lines         []TransferOrderLine  `json:"lines,omitempty"`
+	FromWarehouse *Warehouse          `json:"from_warehouse,omitempty"`
+	ToWarehouse   *Warehouse          `json:"to_warehouse,omitempty"`
+	Lines         []TransferOrderLine `json:"lines,omitempty"`
 }
 
 // TransferOrderLine represents a line item in a transfer order
 type TransferOrderLine struct {
-	ID               uuid.UUID  `json:"id" db:"id"`
-	TransferOrderID  uuid.UUID  `json:"transfer_order_id" db:"transfer_order_id"`
-	ProductID        uuid.UUID  `json:"product_id" db:"product_id"`
-	FromLocationID   *uuid.UUID `json:"from_location_id,omitempty" db:"from_location_id"`
-	ToLocationID     *uuid.UUID `json:"to_location_id,omitempty" db:"to_location_id"`
-	LotID            *uuid.UUID `json:"lot_id,omitempty" db:"lot_id"`
-	LotNumber        *string    `json:"lot_number,omitempty" db:"lot_number"`
-	SerialNumber     *string    `json:"serial_number,omitempty" db:"serial_number"`
-	QuantityRequested float64   `json:"quantity_requested" db:"quantity_requested"`
-	QuantityShipped  float64    `json:"quantity_shipped" db:"quantity_shipped"`
-	QuantityReceived float64    `json:"quantity_received" db:"quantity_received"`
-	UnitCost         *float64   `json:"unit_cost,omitempty" db:"unit_cost"`
-	Notes            *string    `json:"notes,omitempty" db:"notes"`
-	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TransferOrderID   uuid.UUID  `json:"transfer_order_id" db:"transfer_order_id"`
+	ProductID         uuid.UUID  `json:"product_id" db:"product_id"`
+	FromLocationID    *uuid.UUID `json:"from_location_id,omitempty" db:"from_location_id"`
+	ToLocationID      *uuid.UUID `json:"to_location_id,omitempty" db:"to_location_id"`
+	LotID             *uuid.UUID `json:"lot_id,omitempty" db:"lot_id"`
+	LotNumber         *string    `json:"lot_number,omitempty" db:"lot_number"`
+	SerialNumber      *string    `json:"serial_number,omitempty" db:"serial_number"`
+	QuantityRequested float64    `json:"quantity_requested" db:"quantity_requested"`
+	QuantityShipped   float64    `json:"quantity_shipped" db:"quantity_shipped"`
+	QuantityReceived  float64    `json:"quantity_received" db:"quantity_received"`
+	UnitCost          *float64   `json:"unit_cost,omitempty" db:"unit_cost"`
+	Notes             *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt         time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	Product *Product `json:"product,omitempty"`
@@ -646,14 +646,14 @@ type TransferOrderResponse struct {
 
 // CreateTransferOrderInput represents input for creating a transfer order
 type CreateTransferOrderInput struct {
-	FromWarehouseID string                          `json:"from_warehouse_id" binding:"required"`
-	ToWarehouseID   string                          `json:"to_warehouse_id" binding:"required"`
-	TransferDate    string                          `json:"transfer_date" binding:"required"`
-	ExpectedArrival string                          `json:"expected_arrival,omitempty"`
-	Priority        string                          `json:"priority,omitempty"`
-	Notes           string                          `json:"notes,omitempty"`
-	Reason          string                          `json:"reason,omitempty"`
-	Lines           []CreateTransferOrderLineInput  `json:"lines" binding:"required,min=1"`
+	FromWarehouseID string                         `json:"from_warehouse_id" binding:"required"`
+	ToWarehouseID   string                         `json:"to_warehouse_id" binding:"required"`
+	TransferDate    string                         `json:"transfer_date" binding:"required"`
+	ExpectedArrival string                         `json:"expected_arrival,omitempty"`
+	Priority        string                         `json:"priority,omitempty"`
+	Notes           string                         `json:"notes,omitempty"`
+	Reason          string                         `json:"reason,omitempty"`
+	Lines           []CreateTransferOrderLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 // CreateTransferOrderLineInput represents a line item in transfer order creation
@@ -712,34 +712,34 @@ type StockCount struct {
 
 // StockCountLine represents a line item in a stock count
 type StockCountLine struct {
-	ID              uuid.UUID  `json:"id" db:"id"`
-	StockCountID    uuid.UUID  `json:"stock_count_id" db:"stock_count_id"`
-	ProductID       uuid.UUID  `json:"product_id" db:"product_id"`
-	LocationID      *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
-	LotID           *uuid.UUID `json:"lot_id,omitempty" db:"lot_id"`
-	LotNumber       *string    `json:"lot_number,omitempty" db:"lot_number"`
-	SerialNumber    *string    `json:"serial_number,omitempty" db:"serial_number"`
-	SystemQuantity  float64    `json:"system_quantity" db:"system_quantity"`
-	CountedQuantity *float64   `json:"counted_quantity,omitempty" db:"counted_quantity"`
-	VarianceQuantity float64   `json:"variance_quantity" db:"variance_quantity"`
-	UnitCost        *float64   `json:"unit_cost,omitempty" db:"unit_cost"`
-	SystemValue     *float64   `json:"system_value,omitempty" db:"system_value"`
-	CountedValue    *float64   `json:"counted_value,omitempty" db:"counted_value"`
-	VarianceValue   *float64   `json:"variance_value,omitempty" db:"variance_value"`
-	Status          string     `json:"status" db:"status"` // pending, counted, verified, adjusted
-	CountedBy       *uuid.UUID `json:"counted_by,omitempty" db:"counted_by"`
-	CountedAt       *time.Time `json:"counted_at,omitempty" db:"counted_at"`
-	VerifiedBy      *uuid.UUID `json:"verified_by,omitempty" db:"verified_by"`
-	VerifiedAt      *time.Time `json:"verified_at,omitempty" db:"verified_at"`
-	Resolution      string     `json:"resolution" db:"resolution"`                    // pending, employee, company, cash
+	ID               uuid.UUID  `json:"id" db:"id"`
+	StockCountID     uuid.UUID  `json:"stock_count_id" db:"stock_count_id"`
+	ProductID        uuid.UUID  `json:"product_id" db:"product_id"`
+	LocationID       *uuid.UUID `json:"location_id,omitempty" db:"location_id"`
+	LotID            *uuid.UUID `json:"lot_id,omitempty" db:"lot_id"`
+	LotNumber        *string    `json:"lot_number,omitempty" db:"lot_number"`
+	SerialNumber     *string    `json:"serial_number,omitempty" db:"serial_number"`
+	SystemQuantity   float64    `json:"system_quantity" db:"system_quantity"`
+	CountedQuantity  *float64   `json:"counted_quantity,omitempty" db:"counted_quantity"`
+	VarianceQuantity float64    `json:"variance_quantity" db:"variance_quantity"`
+	UnitCost         *float64   `json:"unit_cost,omitempty" db:"unit_cost"`
+	SystemValue      *float64   `json:"system_value,omitempty" db:"system_value"`
+	CountedValue     *float64   `json:"counted_value,omitempty" db:"counted_value"`
+	VarianceValue    *float64   `json:"variance_value,omitempty" db:"variance_value"`
+	Status           string     `json:"status" db:"status"` // pending, counted, verified, adjusted
+	CountedBy        *uuid.UUID `json:"counted_by,omitempty" db:"counted_by"`
+	CountedAt        *time.Time `json:"counted_at,omitempty" db:"counted_at"`
+	VerifiedBy       *uuid.UUID `json:"verified_by,omitempty" db:"verified_by"`
+	VerifiedAt       *time.Time `json:"verified_at,omitempty" db:"verified_at"`
+	Resolution       string     `json:"resolution" db:"resolution"` // pending, employee, company, cash
 	ResponsibleEmpID *uuid.UUID `json:"responsible_emp_id,omitempty" db:"responsible_emp_id"`
-	Notes           *string    `json:"notes,omitempty" db:"notes"`
-	CreatedAt       time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at" db:"updated_at"`
+	Notes            *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt        time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
-	Product          *Product  `json:"product,omitempty"`
-	ResponsibleName  string    `json:"responsible_name,omitempty" db:"responsible_name"`
+	Product         *Product `json:"product,omitempty"`
+	ResponsibleName string   `json:"responsible_name,omitempty" db:"responsible_name"`
 }
 
 // CreateStockCountInput represents input for creating a stock count
@@ -754,12 +754,12 @@ type CreateStockCountInput struct {
 
 // RecordCountLineInput represents input for recording a count
 type RecordCountLineInput struct {
-	ProductID       string  `json:"product_id" binding:"required"`
-	LocationID      string  `json:"location_id,omitempty"`
-	LotNumber       string  `json:"lot_number,omitempty"`
-	SerialNumber    string  `json:"serial_number,omitempty"`
+	ProductID       string   `json:"product_id" binding:"required"`
+	LocationID      string   `json:"location_id,omitempty"`
+	LotNumber       string   `json:"lot_number,omitempty"`
+	SerialNumber    string   `json:"serial_number,omitempty"`
 	CountedQuantity *float64 `json:"counted_quantity" binding:"required"`
-	Notes           string  `json:"notes,omitempty"`
+	Notes           string   `json:"notes,omitempty"`
 }
 
 // StockCountListFilter represents filters for listing stock counts
@@ -777,27 +777,27 @@ type StockCountListFilter struct {
 
 // ReorderAlert represents a low stock or reorder notification
 type ReorderAlert struct {
-	ID                   uuid.UUID  `json:"id" db:"id"`
-	TenantID             uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	ProductID            uuid.UUID  `json:"product_id" db:"product_id"`
-	WarehouseID          *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
-	AlertType            string     `json:"alert_type" db:"alert_type"` // low_stock, out_of_stock, expiring, overstock
-	CurrentQuantity      float64    `json:"current_quantity" db:"current_quantity"`
-	ThresholdQuantity    float64    `json:"threshold_quantity" db:"threshold_quantity"`
-	SuggestedOrderQty    float64    `json:"suggested_order_qty" db:"suggested_order_qty"`
-	ExpiryDate           *time.Time `json:"expiry_date,omitempty" db:"expiry_date"`
-	DaysUntilExpiry      *int       `json:"days_until_expiry,omitempty" db:"days_until_expiry"`
-	Priority             string     `json:"priority" db:"priority"` // low, medium, high, critical
-	Status               string     `json:"status" db:"status"` // active, acknowledged, resolved, ignored, snoozed
-	SnoozedUntil         *time.Time `json:"snoozed_until,omitempty" db:"snoozed_until"`
-	AcknowledgedBy       *uuid.UUID `json:"acknowledged_by,omitempty" db:"acknowledged_by"`
-	AcknowledgedAt       *time.Time `json:"acknowledged_at,omitempty" db:"acknowledged_at"`
-	ResolvedAt           *time.Time `json:"resolved_at,omitempty" db:"resolved_at"`
-	ResolvedBy           *uuid.UUID `json:"resolved_by,omitempty" db:"resolved_by"`
-	ResolutionNotes      *string    `json:"resolution_notes,omitempty" db:"resolution_notes"`
+	ID                     uuid.UUID  `json:"id" db:"id"`
+	TenantID               uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	ProductID              uuid.UUID  `json:"product_id" db:"product_id"`
+	WarehouseID            *uuid.UUID `json:"warehouse_id,omitempty" db:"warehouse_id"`
+	AlertType              string     `json:"alert_type" db:"alert_type"` // low_stock, out_of_stock, expiring, overstock
+	CurrentQuantity        float64    `json:"current_quantity" db:"current_quantity"`
+	ThresholdQuantity      float64    `json:"threshold_quantity" db:"threshold_quantity"`
+	SuggestedOrderQty      float64    `json:"suggested_order_qty" db:"suggested_order_qty"`
+	ExpiryDate             *time.Time `json:"expiry_date,omitempty" db:"expiry_date"`
+	DaysUntilExpiry        *int       `json:"days_until_expiry,omitempty" db:"days_until_expiry"`
+	Priority               string     `json:"priority" db:"priority"` // low, medium, high, critical
+	Status                 string     `json:"status" db:"status"`     // active, acknowledged, resolved, ignored, snoozed
+	SnoozedUntil           *time.Time `json:"snoozed_until,omitempty" db:"snoozed_until"`
+	AcknowledgedBy         *uuid.UUID `json:"acknowledged_by,omitempty" db:"acknowledged_by"`
+	AcknowledgedAt         *time.Time `json:"acknowledged_at,omitempty" db:"acknowledged_at"`
+	ResolvedAt             *time.Time `json:"resolved_at,omitempty" db:"resolved_at"`
+	ResolvedBy             *uuid.UUID `json:"resolved_by,omitempty" db:"resolved_by"`
+	ResolutionNotes        *string    `json:"resolution_notes,omitempty" db:"resolution_notes"`
 	RelatedPurchaseOrderID *uuid.UUID `json:"related_purchase_order_id,omitempty" db:"related_purchase_order_id"`
-	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+	CreatedAt              time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	Product   *Product   `json:"product,omitempty"`
@@ -806,19 +806,19 @@ type ReorderAlert struct {
 
 // ReorderAlertResponse is the API response format
 type ReorderAlertResponse struct {
-	ID                uuid.UUID `json:"id"`
-	ProductID         uuid.UUID `json:"product_id"`
-	ProductCode       string    `json:"product_code,omitempty"`
-	ProductName       string    `json:"product_name,omitempty"`
+	ID                uuid.UUID  `json:"id"`
+	ProductID         uuid.UUID  `json:"product_id"`
+	ProductCode       string     `json:"product_code,omitempty"`
+	ProductName       string     `json:"product_name,omitempty"`
 	WarehouseID       *uuid.UUID `json:"warehouse_id,omitempty"`
-	WarehouseName     string    `json:"warehouse_name,omitempty"`
-	AlertType         string    `json:"alert_type"`
-	CurrentQuantity   float64   `json:"current_quantity"`
-	ThresholdQuantity float64   `json:"threshold_quantity"`
-	SuggestedOrderQty float64   `json:"suggested_order_qty"`
-	Priority          string    `json:"priority"`
-	Status            string    `json:"status"`
-	CreatedAt         time.Time `json:"created_at"`
+	WarehouseName     string     `json:"warehouse_name,omitempty"`
+	AlertType         string     `json:"alert_type"`
+	CurrentQuantity   float64    `json:"current_quantity"`
+	ThresholdQuantity float64    `json:"threshold_quantity"`
+	SuggestedOrderQty float64    `json:"suggested_order_qty"`
+	Priority          string     `json:"priority"`
+	Status            string     `json:"status"`
+	CreatedAt         time.Time  `json:"created_at"`
 }
 
 // ReorderAlertListFilter represents filters for listing reorder alerts
@@ -837,7 +837,7 @@ type AcknowledgeAlertInput struct {
 
 // ResolveAlertInput represents input for resolving an alert
 type ResolveAlertInput struct {
-	ResolutionNotes      string `json:"resolution_notes,omitempty"`
+	ResolutionNotes        string `json:"resolution_notes,omitempty"`
 	RelatedPurchaseOrderID string `json:"related_purchase_order_id,omitempty"`
 }
 
@@ -882,20 +882,20 @@ type ProductBOM struct {
 
 // BOMLine represents a component in a BOM
 type BOMLine struct {
-	ID                   uuid.UUID  `json:"id" db:"id"`
-	BOMID                uuid.UUID  `json:"bom_id" db:"bom_id"`
-	LineNumber           int        `json:"line_number" db:"line_number"`
-	ComponentID          uuid.UUID  `json:"component_id" db:"component_id"`
-	Quantity             float64    `json:"quantity" db:"quantity"`
-	UnitID               *uuid.UUID `json:"unit_id,omitempty" db:"unit_id"`
-	UnitOfMeasure        string     `json:"unit_of_measure" db:"unit_of_measure"`
-	ScrapPercent         float64    `json:"scrap_percent" db:"scrap_percent"`
-	IsOptional           bool       `json:"is_optional" db:"is_optional"`
+	ID                    uuid.UUID  `json:"id" db:"id"`
+	BOMID                 uuid.UUID  `json:"bom_id" db:"bom_id"`
+	LineNumber            int        `json:"line_number" db:"line_number"`
+	ComponentID           uuid.UUID  `json:"component_id" db:"component_id"`
+	Quantity              float64    `json:"quantity" db:"quantity"`
+	UnitID                *uuid.UUID `json:"unit_id,omitempty" db:"unit_id"`
+	UnitOfMeasure         string     `json:"unit_of_measure" db:"unit_of_measure"`
+	ScrapPercent          float64    `json:"scrap_percent" db:"scrap_percent"`
+	IsOptional            bool       `json:"is_optional" db:"is_optional"`
 	SubstituteComponentID *uuid.UUID `json:"substitute_component_id,omitempty" db:"substitute_component_id"`
-	OperationSequence    int        `json:"operation_sequence" db:"operation_sequence"`
-	Notes                *string    `json:"notes,omitempty" db:"notes"`
-	CreatedAt            time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt            time.Time  `json:"updated_at" db:"updated_at"`
+	OperationSequence     int        `json:"operation_sequence" db:"operation_sequence"`
+	Notes                 *string    `json:"notes,omitempty" db:"notes"`
+	CreatedAt             time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt             time.Time  `json:"updated_at" db:"updated_at"`
 
 	// Relationships
 	Component           *Product `json:"component,omitempty"`
@@ -920,55 +920,55 @@ type BOMOperation struct {
 
 // CreateBOMInput represents input for creating a BOM
 type CreateBOMInput struct {
-	Code          string              `json:"code" binding:"required,min=1,max=50"`
-	Name          string              `json:"name" binding:"required,min=1,max=255"`
-	ProductID     string              `json:"product_id" binding:"required"`
-	BOMType       string              `json:"bom_type,omitempty"`
-	Quantity      float64             `json:"quantity,omitempty"`
-	IsDefault     bool                `json:"is_default,omitempty"`
-	EffectiveDate string              `json:"effective_date,omitempty"`
-	ExpiryDate    string              `json:"expiry_date,omitempty"`
-	Notes         string              `json:"notes,omitempty"`
-	WarehouseID      string              `json:"warehouse_id,omitempty"`
-	HasSplitOutput   bool                `json:"has_split_output,omitempty"`
-	Lines            []CreateBOMLineInput `json:"lines,omitempty"`
+	Code           string               `json:"code" binding:"required,min=1,max=50"`
+	Name           string               `json:"name" binding:"required,min=1,max=255"`
+	ProductID      string               `json:"product_id" binding:"required"`
+	BOMType        string               `json:"bom_type,omitempty"`
+	Quantity       float64              `json:"quantity,omitempty"`
+	IsDefault      bool                 `json:"is_default,omitempty"`
+	EffectiveDate  string               `json:"effective_date,omitempty"`
+	ExpiryDate     string               `json:"expiry_date,omitempty"`
+	Notes          string               `json:"notes,omitempty"`
+	WarehouseID    string               `json:"warehouse_id,omitempty"`
+	HasSplitOutput bool                 `json:"has_split_output,omitempty"`
+	Lines          []CreateBOMLineInput `json:"lines,omitempty"`
 }
 
 // UpdateBOMInput represents input for updating a BOM
 type UpdateBOMInput struct {
-	Name          *string `json:"name,omitempty"`
-	BOMType       *string `json:"bom_type,omitempty"`
-	Quantity      *float64 `json:"quantity,omitempty"`
-	IsActive      *bool   `json:"is_active,omitempty"`
-	IsDefault     *bool   `json:"is_default,omitempty"`
-	EffectiveDate *string `json:"effective_date,omitempty"`
-	ExpiryDate    *string `json:"expiry_date,omitempty"`
-	Notes            *string `json:"notes,omitempty"`
-	WarehouseID      *string `json:"warehouse_id,omitempty"`
-	HasSplitOutput   *bool   `json:"has_split_output,omitempty"`
+	Name           *string  `json:"name,omitempty"`
+	BOMType        *string  `json:"bom_type,omitempty"`
+	Quantity       *float64 `json:"quantity,omitempty"`
+	IsActive       *bool    `json:"is_active,omitempty"`
+	IsDefault      *bool    `json:"is_default,omitempty"`
+	EffectiveDate  *string  `json:"effective_date,omitempty"`
+	ExpiryDate     *string  `json:"expiry_date,omitempty"`
+	Notes          *string  `json:"notes,omitempty"`
+	WarehouseID    *string  `json:"warehouse_id,omitempty"`
+	HasSplitOutput *bool    `json:"has_split_output,omitempty"`
 }
 
 // CreateBOMLineInput represents input for creating a BOM line
 type CreateBOMLineInput struct {
-	ComponentID          string  `json:"component_id" binding:"required"`
-	Quantity             float64 `json:"quantity" binding:"required,gt=0"`
-	UnitOfMeasure        string  `json:"unit_of_measure,omitempty"`
-	ScrapPercent         float64 `json:"scrap_percent,omitempty"`
-	IsOptional           bool    `json:"is_optional,omitempty"`
+	ComponentID           string  `json:"component_id" binding:"required"`
+	Quantity              float64 `json:"quantity" binding:"required,gt=0"`
+	UnitOfMeasure         string  `json:"unit_of_measure,omitempty"`
+	ScrapPercent          float64 `json:"scrap_percent,omitempty"`
+	IsOptional            bool    `json:"is_optional,omitempty"`
 	SubstituteComponentID string  `json:"substitute_component_id,omitempty"`
-	OperationSequence    int     `json:"operation_sequence,omitempty"`
-	Notes                string  `json:"notes,omitempty"`
+	OperationSequence     int     `json:"operation_sequence,omitempty"`
+	Notes                 string  `json:"notes,omitempty"`
 }
 
 // UpdateBOMLineInput represents input for updating a BOM line
 type UpdateBOMLineInput struct {
-	Quantity             *float64 `json:"quantity,omitempty"`
-	UnitOfMeasure        *string  `json:"unit_of_measure,omitempty"`
-	ScrapPercent         *float64 `json:"scrap_percent,omitempty"`
-	IsOptional           *bool    `json:"is_optional,omitempty"`
+	Quantity              *float64 `json:"quantity,omitempty"`
+	UnitOfMeasure         *string  `json:"unit_of_measure,omitempty"`
+	ScrapPercent          *float64 `json:"scrap_percent,omitempty"`
+	IsOptional            *bool    `json:"is_optional,omitempty"`
 	SubstituteComponentID *string  `json:"substitute_component_id,omitempty"`
-	OperationSequence    *int     `json:"operation_sequence,omitempty"`
-	Notes                *string  `json:"notes,omitempty"`
+	OperationSequence     *int     `json:"operation_sequence,omitempty"`
+	Notes                 *string  `json:"notes,omitempty"`
 }
 
 // BOMListFilter represents filters for listing BOMs
@@ -981,41 +981,41 @@ type BOMListFilter struct {
 
 // BOMResponse represents the API response for a BOM
 type BOMResponse struct {
-	ID            uuid.UUID           `json:"id"`
-	Code          string              `json:"code"`
-	Name          string              `json:"name"`
-	ProductID     uuid.UUID           `json:"product_id"`
-	ProductCode   string              `json:"product_code,omitempty"`
-	ProductName   string              `json:"product_name,omitempty"`
-	BOMType       string              `json:"bom_type"`
-	Quantity      float64             `json:"quantity"`
-	Version       int                 `json:"version"`
-	IsActive      bool                `json:"is_active"`
-	IsDefault     bool                `json:"is_default"`
-	EffectiveDate *string             `json:"effective_date,omitempty"`
-	ExpiryDate    *string             `json:"expiry_date,omitempty"`
-	TotalCost     float64             `json:"total_cost"`
-	LineCount     int                 `json:"line_count"`
-	WarehouseID    *uuid.UUID          `json:"warehouse_id,omitempty"`
-	WarehouseName  *string             `json:"warehouse_name,omitempty"`
-	HasSplitOutput bool                `json:"has_split_output"`
-	Lines          []BOMLineResponse   `json:"lines,omitempty"`
-	CreatedAt     time.Time           `json:"created_at"`
+	ID             uuid.UUID         `json:"id"`
+	Code           string            `json:"code"`
+	Name           string            `json:"name"`
+	ProductID      uuid.UUID         `json:"product_id"`
+	ProductCode    string            `json:"product_code,omitempty"`
+	ProductName    string            `json:"product_name,omitempty"`
+	BOMType        string            `json:"bom_type"`
+	Quantity       float64           `json:"quantity"`
+	Version        int               `json:"version"`
+	IsActive       bool              `json:"is_active"`
+	IsDefault      bool              `json:"is_default"`
+	EffectiveDate  *string           `json:"effective_date,omitempty"`
+	ExpiryDate     *string           `json:"expiry_date,omitempty"`
+	TotalCost      float64           `json:"total_cost"`
+	LineCount      int               `json:"line_count"`
+	WarehouseID    *uuid.UUID        `json:"warehouse_id,omitempty"`
+	WarehouseName  *string           `json:"warehouse_name,omitempty"`
+	HasSplitOutput bool              `json:"has_split_output"`
+	Lines          []BOMLineResponse `json:"lines,omitempty"`
+	CreatedAt      time.Time         `json:"created_at"`
 }
 
 // BOMLineResponse represents the API response for a BOM line
 type BOMLineResponse struct {
-	ID               uuid.UUID `json:"id"`
-	LineNumber       int       `json:"line_number"`
-	ComponentID      uuid.UUID `json:"component_id"`
-	ComponentCode    string    `json:"component_code,omitempty"`
-	ComponentName    string    `json:"component_name,omitempty"`
-	Quantity         float64   `json:"quantity"`
-	UnitOfMeasure    string    `json:"unit_of_measure"`
-	ScrapPercent     float64   `json:"scrap_percent"`
-	IsOptional       bool      `json:"is_optional"`
-	UnitCost         float64   `json:"unit_cost"`
-	TotalCost        float64   `json:"total_cost"`
+	ID            uuid.UUID `json:"id"`
+	LineNumber    int       `json:"line_number"`
+	ComponentID   uuid.UUID `json:"component_id"`
+	ComponentCode string    `json:"component_code,omitempty"`
+	ComponentName string    `json:"component_name,omitempty"`
+	Quantity      float64   `json:"quantity"`
+	UnitOfMeasure string    `json:"unit_of_measure"`
+	ScrapPercent  float64   `json:"scrap_percent"`
+	IsOptional    bool      `json:"is_optional"`
+	UnitCost      float64   `json:"unit_cost"`
+	TotalCost     float64   `json:"total_cost"`
 }
 
 // =====================================================
@@ -1156,11 +1156,11 @@ type ScrapOrderResponse struct {
 
 // ScrapSummary represents a summary of scrap activity
 type ScrapSummary struct {
-	TotalScrapOrders   int     `json:"total_scrap_orders"`
-	TotalQuantity      float64 `json:"total_quantity"`
-	TotalValue         float64 `json:"total_value"`
-	PendingApproval    int     `json:"pending_approval"`
-	ByReason           map[string]float64 `json:"by_reason"`
+	TotalScrapOrders int                `json:"total_scrap_orders"`
+	TotalQuantity    float64            `json:"total_quantity"`
+	TotalValue       float64            `json:"total_value"`
+	PendingApproval  int                `json:"pending_approval"`
+	ByReason         map[string]float64 `json:"by_reason"`
 }
 
 // =====================================================
@@ -1243,25 +1243,25 @@ type ReorderRuleListFilter struct {
 
 // ReorderRuleResponse represents the API response for a reorder rule
 type ReorderRuleResponse struct {
-	ID                 uuid.UUID  `json:"id"`
-	ProductID          uuid.UUID  `json:"product_id"`
-	ProductCode        string     `json:"product_code,omitempty"`
-	ProductName        string     `json:"product_name,omitempty"`
-	WarehouseID        *uuid.UUID `json:"warehouse_id,omitempty"`
-	WarehouseName      string     `json:"warehouse_name,omitempty"`
-	MinQty             float64    `json:"min_qty"`
-	MaxQty             *float64   `json:"max_qty,omitempty"`
-	ReorderQty         float64    `json:"reorder_qty"`
-	TriggerType        string     `json:"trigger_type"`
-	PreferredVendorID  *uuid.UUID `json:"preferred_vendor_id,omitempty"`
-	PreferredVendorName string    `json:"preferred_vendor_name,omitempty"`
-	LeadTimeDays       int        `json:"lead_time_days"`
-	SafetyStock        float64    `json:"safety_stock"`
-	AutoCreatePO       bool       `json:"auto_create_po"`
-	IsActive           bool       `json:"is_active"`
-	CurrentStock       float64    `json:"current_stock,omitempty"`
-	NeedsReorder       bool       `json:"needs_reorder,omitempty"`
-	CreatedAt          time.Time  `json:"created_at"`
+	ID                  uuid.UUID  `json:"id"`
+	ProductID           uuid.UUID  `json:"product_id"`
+	ProductCode         string     `json:"product_code,omitempty"`
+	ProductName         string     `json:"product_name,omitempty"`
+	WarehouseID         *uuid.UUID `json:"warehouse_id,omitempty"`
+	WarehouseName       string     `json:"warehouse_name,omitempty"`
+	MinQty              float64    `json:"min_qty"`
+	MaxQty              *float64   `json:"max_qty,omitempty"`
+	ReorderQty          float64    `json:"reorder_qty"`
+	TriggerType         string     `json:"trigger_type"`
+	PreferredVendorID   *uuid.UUID `json:"preferred_vendor_id,omitempty"`
+	PreferredVendorName string     `json:"preferred_vendor_name,omitempty"`
+	LeadTimeDays        int        `json:"lead_time_days"`
+	SafetyStock         float64    `json:"safety_stock"`
+	AutoCreatePO        bool       `json:"auto_create_po"`
+	IsActive            bool       `json:"is_active"`
+	CurrentStock        float64    `json:"current_stock,omitempty"`
+	NeedsReorder        bool       `json:"needs_reorder,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 // =====================================================

@@ -45,10 +45,10 @@ const (
 
 // IntercompanyTransfer represents a product transfer between companies
 type IntercompanyTransfer struct {
-	ID             uuid.UUID                  `json:"id" db:"id"`
-	TenantID       uuid.UUID                  `json:"tenant_id" db:"tenant_id"`
-	TransferNumber string                     `json:"transfer_number" db:"transfer_number"`
-	TransferType   IntercompanyTransferType   `json:"transfer_type" db:"transfer_type"`
+	ID             uuid.UUID                `json:"id" db:"id"`
+	TenantID       uuid.UUID                `json:"tenant_id" db:"tenant_id"`
+	TransferNumber string                   `json:"transfer_number" db:"transfer_number"`
+	TransferType   IntercompanyTransferType `json:"transfer_type" db:"transfer_type"`
 
 	// Organizations
 	FromOrganizationID uuid.UUID `json:"from_organization_id" db:"from_organization_id"`
@@ -82,8 +82,8 @@ type IntercompanyTransfer struct {
 	TransferOrderID *uuid.UUID `json:"transfer_order_id,omitempty" db:"transfer_order_id"`
 
 	// Invoicing
-	FromOrgSalesInvoiceID    *uuid.UUID `json:"from_org_sales_invoice_id,omitempty" db:"from_org_sales_invoice_id"`
-	ToOrgPurchaseInvoiceID   *uuid.UUID `json:"to_org_purchase_invoice_id,omitempty" db:"to_org_purchase_invoice_id"`
+	FromOrgSalesInvoiceID  *uuid.UUID `json:"from_org_sales_invoice_id,omitempty" db:"from_org_sales_invoice_id"`
+	ToOrgPurchaseInvoiceID *uuid.UUID `json:"to_org_purchase_invoice_id,omitempty" db:"to_org_purchase_invoice_id"`
 
 	// Notes
 	Reason        *string `json:"reason,omitempty" db:"reason"`
@@ -111,7 +111,7 @@ type IntercompanyTransfer struct {
 
 // IntercompanyTransferLine represents a line item in an IC transfer
 type IntercompanyTransferLine struct {
-	ID                    uuid.UUID  `json:"id" db:"id"`
+	ID                     uuid.UUID `json:"id" db:"id"`
 	IntercompanyTransferID uuid.UUID `json:"intercompany_transfer_id" db:"intercompany_transfer_id"`
 
 	// Product
@@ -222,7 +222,6 @@ type IntercompanyPayment struct {
 	CreatedAt time.Time  `json:"created_at" db:"created_at"`
 	UpdatedAt time.Time  `json:"updated_at" db:"updated_at"`
 	DeletedAt *time.Time `json:"-" db:"deleted_at"`
-
 }
 
 // =====================================================
@@ -272,18 +271,18 @@ type IntercompanyAccountTransaction struct {
 
 // CreateIntercompanyTransferInput is input for creating an IC transfer
 type CreateIntercompanyTransferInput struct {
-	FromOrganizationID string  `json:"from_organization_id" binding:"required"`
-	ToOrganizationID   string  `json:"to_organization_id" binding:"required"`
-	FromWarehouseID    string  `json:"from_warehouse_id" binding:"required"`
-	ToWarehouseID      string  `json:"to_warehouse_id" binding:"required"`
-	TransferDate       string  `json:"transfer_date" binding:"required"`
-	ExpectedDate       string  `json:"expected_date,omitempty"`
-	PricingMethod      string  `json:"pricing_method,omitempty"`
-	MarkupPercent      float64 `json:"markup_percent,omitempty"`
-	CurrencyID         string  `json:"currency_id,omitempty"`
-	Reason             string  `json:"reason,omitempty"`
-	Notes              string  `json:"notes,omitempty"`
-	Lines              []CreateIntercompanyTransferLineInput `json:"lines" binding:"required,min=1"`
+	FromOrganizationID string                                `json:"from_organization_id" binding:"required"`
+	ToOrganizationID   string                                `json:"to_organization_id" binding:"required"`
+	FromWarehouseID    string                                `json:"from_warehouse_id" binding:"required"`
+	ToWarehouseID      string                                `json:"to_warehouse_id" binding:"required"`
+	TransferDate       string                                `json:"transfer_date" binding:"required"`
+	ExpectedDate       string                                `json:"expected_date,omitempty"`
+	PricingMethod      string                                `json:"pricing_method,omitempty"`
+	MarkupPercent      float64                               `json:"markup_percent,omitempty"`
+	CurrencyID         string                                `json:"currency_id,omitempty"`
+	Reason             string                                `json:"reason,omitempty"`
+	Notes              string                                `json:"notes,omitempty"`
+	Lines              []CreateIntercompanyTransferLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 // CreateIntercompanyTransferLineInput is input for creating an IC transfer line
@@ -367,78 +366,78 @@ type IntercompanyPaymentListFilter struct {
 
 // IntercompanyTransferResponse is the API response format
 type IntercompanyTransferResponse struct {
-	ID                   uuid.UUID                    `json:"id"`
-	TransferNumber       string                       `json:"transfer_number"`
-	TransferType         string                       `json:"transfer_type"`
-	FromOrganizationID   uuid.UUID                    `json:"from_organization_id"`
-	FromOrganizationName string                       `json:"from_organization_name,omitempty"`
-	ToOrganizationID     uuid.UUID                    `json:"to_organization_id"`
-	ToOrganizationName   string                       `json:"to_organization_name,omitempty"`
-	FromWarehouseID      *uuid.UUID                   `json:"from_warehouse_id,omitempty"`
-	FromWarehouseName    string                       `json:"from_warehouse_name,omitempty"`
-	ToWarehouseID        *uuid.UUID                   `json:"to_warehouse_id,omitempty"`
-	ToWarehouseName      string                       `json:"to_warehouse_name,omitempty"`
-	TransferDate         string                       `json:"transfer_date"`
-	ExpectedDate         *string                      `json:"expected_date,omitempty"`
-	ReceivedDate         *string                      `json:"received_date,omitempty"`
-	Status               string                       `json:"status"`
-	PricingMethod        string                       `json:"pricing_method"`
-	MarkupPercent        float64                      `json:"markup_percent"`
-	TotalAmount          float64                      `json:"total_amount"`
-	TotalQuantity        float64                      `json:"total_quantity"`
-	Reason               *string                      `json:"reason,omitempty"`
-	Notes                *string                      `json:"notes,omitempty"`
+	ID                   uuid.UUID                          `json:"id"`
+	TransferNumber       string                             `json:"transfer_number"`
+	TransferType         string                             `json:"transfer_type"`
+	FromOrganizationID   uuid.UUID                          `json:"from_organization_id"`
+	FromOrganizationName string                             `json:"from_organization_name,omitempty"`
+	ToOrganizationID     uuid.UUID                          `json:"to_organization_id"`
+	ToOrganizationName   string                             `json:"to_organization_name,omitempty"`
+	FromWarehouseID      *uuid.UUID                         `json:"from_warehouse_id,omitempty"`
+	FromWarehouseName    string                             `json:"from_warehouse_name,omitempty"`
+	ToWarehouseID        *uuid.UUID                         `json:"to_warehouse_id,omitempty"`
+	ToWarehouseName      string                             `json:"to_warehouse_name,omitempty"`
+	TransferDate         string                             `json:"transfer_date"`
+	ExpectedDate         *string                            `json:"expected_date,omitempty"`
+	ReceivedDate         *string                            `json:"received_date,omitempty"`
+	Status               string                             `json:"status"`
+	PricingMethod        string                             `json:"pricing_method"`
+	MarkupPercent        float64                            `json:"markup_percent"`
+	TotalAmount          float64                            `json:"total_amount"`
+	TotalQuantity        float64                            `json:"total_quantity"`
+	Reason               *string                            `json:"reason,omitempty"`
+	Notes                *string                            `json:"notes,omitempty"`
 	Lines                []IntercompanyTransferLineResponse `json:"lines,omitempty"`
-	CreatedAt            time.Time                    `json:"created_at"`
+	CreatedAt            time.Time                          `json:"created_at"`
 }
 
 // IntercompanyTransferLineResponse is the API response for a line
 type IntercompanyTransferLineResponse struct {
-	ID                uuid.UUID  `json:"id"`
-	ProductID         uuid.UUID  `json:"product_id"`
-	ProductCode       string     `json:"product_code,omitempty"`
-	ProductName       string     `json:"product_name,omitempty"`
-	LotNumber         *string    `json:"lot_number,omitempty"`
-	QuantityRequested float64    `json:"quantity_requested"`
-	QuantityShipped   float64    `json:"quantity_shipped"`
-	QuantityReceived  float64    `json:"quantity_received"`
-	UnitCost          float64    `json:"unit_cost"`
-	TransferPrice     float64    `json:"transfer_price"`
-	LineTotal         float64    `json:"line_total"`
-	Notes             *string    `json:"notes,omitempty"`
+	ID                uuid.UUID `json:"id"`
+	ProductID         uuid.UUID `json:"product_id"`
+	ProductCode       string    `json:"product_code,omitempty"`
+	ProductName       string    `json:"product_name,omitempty"`
+	LotNumber         *string   `json:"lot_number,omitempty"`
+	QuantityRequested float64   `json:"quantity_requested"`
+	QuantityShipped   float64   `json:"quantity_shipped"`
+	QuantityReceived  float64   `json:"quantity_received"`
+	UnitCost          float64   `json:"unit_cost"`
+	TransferPrice     float64   `json:"transfer_price"`
+	LineTotal         float64   `json:"line_total"`
+	Notes             *string   `json:"notes,omitempty"`
 }
 
 // IntercompanyPaymentResponse is the API response format
 type IntercompanyPaymentResponse struct {
-	ID                   uuid.UUID `json:"id"`
-	PaymentNumber        string    `json:"payment_number"`
-	PaymentType          string    `json:"payment_type"`
-	FromOrganizationID   uuid.UUID `json:"from_organization_id"`
-	FromOrganizationName string    `json:"from_organization_name,omitempty"`
-	ToOrganizationID     uuid.UUID `json:"to_organization_id"`
-	ToOrganizationName   string    `json:"to_organization_name,omitempty"`
-	Amount               float64   `json:"amount"`
+	ID                   uuid.UUID  `json:"id"`
+	PaymentNumber        string     `json:"payment_number"`
+	PaymentType          string     `json:"payment_type"`
+	FromOrganizationID   uuid.UUID  `json:"from_organization_id"`
+	FromOrganizationName string     `json:"from_organization_name,omitempty"`
+	ToOrganizationID     uuid.UUID  `json:"to_organization_id"`
+	ToOrganizationName   string     `json:"to_organization_name,omitempty"`
+	Amount               float64    `json:"amount"`
 	CurrencyID           *uuid.UUID `json:"currency_id,omitempty"`
-	CurrencyCode         string    `json:"currency_code,omitempty"`
-	PaymentDate          string    `json:"payment_date"`
-	Status               string    `json:"status"`
-	PaymentMethod        *string   `json:"payment_method,omitempty"`
-	Reference            *string   `json:"reference,omitempty"`
-	Description          *string   `json:"description,omitempty"`
-	Notes                *string   `json:"notes,omitempty"`
-	CreatedAt            time.Time `json:"created_at"`
+	CurrencyCode         string     `json:"currency_code,omitempty"`
+	PaymentDate          string     `json:"payment_date"`
+	Status               string     `json:"status"`
+	PaymentMethod        *string    `json:"payment_method,omitempty"`
+	Reference            *string    `json:"reference,omitempty"`
+	Description          *string    `json:"description,omitempty"`
+	Notes                *string    `json:"notes,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
 }
 
 // IntercompanyAccountResponse is the API response for IC accounts
 type IntercompanyAccountResponse struct {
-	ID                      uuid.UUID `json:"id"`
-	OrganizationID          uuid.UUID `json:"organization_id"`
-	OrganizationName        string    `json:"organization_name,omitempty"`
-	PartnerOrganizationID   uuid.UUID `json:"partner_organization_id"`
-	PartnerOrganizationName string    `json:"partner_organization_name,omitempty"`
-	AccountType             string    `json:"account_type"`
-	Balance                 float64   `json:"balance"`
-	CurrencyCode            string    `json:"currency_code,omitempty"`
+	ID                      uuid.UUID  `json:"id"`
+	OrganizationID          uuid.UUID  `json:"organization_id"`
+	OrganizationName        string     `json:"organization_name,omitempty"`
+	PartnerOrganizationID   uuid.UUID  `json:"partner_organization_id"`
+	PartnerOrganizationName string     `json:"partner_organization_name,omitempty"`
+	AccountType             string     `json:"account_type"`
+	Balance                 float64    `json:"balance"`
+	CurrencyCode            string     `json:"currency_code,omitempty"`
 	LastReconciledAt        *time.Time `json:"last_reconciled_at,omitempty"`
 }
 
@@ -460,39 +459,39 @@ type IntercompanyBalanceSummary struct {
 type IntercompanyRuleType string
 
 const (
-	ICRuleSaleToPurchase  IntercompanyRuleType = "sale_to_purchase"
-	ICRulePurchaseToSale  IntercompanyRuleType = "purchase_to_sale"
-	ICRuleInvoiceToBill   IntercompanyRuleType = "invoice_to_bill"
-	ICRuleBillToInvoice   IntercompanyRuleType = "bill_to_invoice"
-	ICRuleTransfer        IntercompanyRuleType = "transfer"
+	ICRuleSaleToPurchase IntercompanyRuleType = "sale_to_purchase"
+	ICRulePurchaseToSale IntercompanyRuleType = "purchase_to_sale"
+	ICRuleInvoiceToBill  IntercompanyRuleType = "invoice_to_bill"
+	ICRuleBillToInvoice  IntercompanyRuleType = "bill_to_invoice"
+	ICRuleTransfer       IntercompanyRuleType = "transfer"
 )
 
 type IntercompanyPricingMethodType string
 
 const (
-	ICPricingSourcePrice  IntercompanyPricingMethodType = "source_price"
-	ICPricingPricelist    IntercompanyPricingMethodType = "pricelist"
+	ICPricingSourcePrice    IntercompanyPricingMethodType = "source_price"
+	ICPricingPricelist      IntercompanyPricingMethodType = "pricelist"
 	ICPricingCostPlusMarkup IntercompanyPricingMethodType = "cost_plus_markup"
 )
 
 // IntercompanyRule defines automatic document sync rules between companies
 type IntercompanyRule struct {
-	ID                     uuid.UUID                     `json:"id" db:"id"`
-	TenantID               uuid.UUID                     `json:"tenant_id" db:"tenant_id"`
-	SourceOrganizationID   uuid.UUID                     `json:"source_organization_id" db:"source_organization_id"`
-	TargetOrganizationID   uuid.UUID                     `json:"target_organization_id" db:"target_organization_id"`
-	RuleType               IntercompanyRuleType          `json:"rule_type" db:"rule_type"`
-	IsActive               bool                          `json:"is_active" db:"is_active"`
-	AutoValidate           bool                          `json:"auto_validate" db:"auto_validate"`
-	SyncPrices             bool                          `json:"sync_prices" db:"sync_prices"`
-	DefaultWarehouseID     *uuid.UUID                    `json:"default_warehouse_id,omitempty" db:"default_warehouse_id"`
-	PricingMethod          IntercompanyPricingMethodType `json:"pricing_method" db:"pricing_method"`
-	MarkupPercent          float64                       `json:"markup_percent" db:"markup_percent"`
-	PricelistID            *uuid.UUID                    `json:"pricelist_id,omitempty" db:"pricelist_id"`
-	Notes                  *string                       `json:"notes,omitempty" db:"notes"`
-	CreatedBy              *uuid.UUID                    `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt              time.Time                     `json:"created_at" db:"created_at"`
-	UpdatedAt              time.Time                     `json:"updated_at" db:"updated_at"`
+	ID                   uuid.UUID                     `json:"id" db:"id"`
+	TenantID             uuid.UUID                     `json:"tenant_id" db:"tenant_id"`
+	SourceOrganizationID uuid.UUID                     `json:"source_organization_id" db:"source_organization_id"`
+	TargetOrganizationID uuid.UUID                     `json:"target_organization_id" db:"target_organization_id"`
+	RuleType             IntercompanyRuleType          `json:"rule_type" db:"rule_type"`
+	IsActive             bool                          `json:"is_active" db:"is_active"`
+	AutoValidate         bool                          `json:"auto_validate" db:"auto_validate"`
+	SyncPrices           bool                          `json:"sync_prices" db:"sync_prices"`
+	DefaultWarehouseID   *uuid.UUID                    `json:"default_warehouse_id,omitempty" db:"default_warehouse_id"`
+	PricingMethod        IntercompanyPricingMethodType `json:"pricing_method" db:"pricing_method"`
+	MarkupPercent        float64                       `json:"markup_percent" db:"markup_percent"`
+	PricelistID          *uuid.UUID                    `json:"pricelist_id,omitempty" db:"pricelist_id"`
+	Notes                *string                       `json:"notes,omitempty" db:"notes"`
+	CreatedBy            *uuid.UUID                    `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt            time.Time                     `json:"created_at" db:"created_at"`
+	UpdatedAt            time.Time                     `json:"updated_at" db:"updated_at"`
 
 	// Relationships (for display)
 	SourceOrganizationName string `json:"source_organization_name,omitempty"`
@@ -512,24 +511,24 @@ const (
 
 // IntercompanyTransactionLog tracks automatic IC transactions
 type IntercompanyTransactionLog struct {
-	ID                     uuid.UUID                        `json:"id" db:"id"`
-	TenantID               uuid.UUID                        `json:"tenant_id" db:"tenant_id"`
-	RuleID                 *uuid.UUID                       `json:"rule_id,omitempty" db:"rule_id"`
-	SourceOrganizationID   uuid.UUID                        `json:"source_organization_id" db:"source_organization_id"`
-	SourceDocumentType     string                           `json:"source_document_type" db:"source_document_type"`
-	SourceDocumentID       uuid.UUID                        `json:"source_document_id" db:"source_document_id"`
-	SourceDocumentNumber   *string                          `json:"source_document_number,omitempty" db:"source_document_number"`
-	TargetOrganizationID   uuid.UUID                        `json:"target_organization_id" db:"target_organization_id"`
-	TargetDocumentType     string                           `json:"target_document_type" db:"target_document_type"`
-	TargetDocumentID       *uuid.UUID                       `json:"target_document_id,omitempty" db:"target_document_id"`
-	TargetDocumentNumber   *string                          `json:"target_document_number,omitempty" db:"target_document_number"`
-	Status                 IntercompanyTransactionLogStatus `json:"status" db:"status"`
-	ErrorMessage           *string                          `json:"error_message,omitempty" db:"error_message"`
-	SourceAmount           *float64                         `json:"source_amount,omitempty" db:"source_amount"`
-	TargetAmount           *float64                         `json:"target_amount,omitempty" db:"target_amount"`
-	CurrencyID             *uuid.UUID                       `json:"currency_id,omitempty" db:"currency_id"`
-	ProcessedAt            *time.Time                       `json:"processed_at,omitempty" db:"processed_at"`
-	CreatedAt              time.Time                        `json:"created_at" db:"created_at"`
+	ID                   uuid.UUID                        `json:"id" db:"id"`
+	TenantID             uuid.UUID                        `json:"tenant_id" db:"tenant_id"`
+	RuleID               *uuid.UUID                       `json:"rule_id,omitempty" db:"rule_id"`
+	SourceOrganizationID uuid.UUID                        `json:"source_organization_id" db:"source_organization_id"`
+	SourceDocumentType   string                           `json:"source_document_type" db:"source_document_type"`
+	SourceDocumentID     uuid.UUID                        `json:"source_document_id" db:"source_document_id"`
+	SourceDocumentNumber *string                          `json:"source_document_number,omitempty" db:"source_document_number"`
+	TargetOrganizationID uuid.UUID                        `json:"target_organization_id" db:"target_organization_id"`
+	TargetDocumentType   string                           `json:"target_document_type" db:"target_document_type"`
+	TargetDocumentID     *uuid.UUID                       `json:"target_document_id,omitempty" db:"target_document_id"`
+	TargetDocumentNumber *string                          `json:"target_document_number,omitempty" db:"target_document_number"`
+	Status               IntercompanyTransactionLogStatus `json:"status" db:"status"`
+	ErrorMessage         *string                          `json:"error_message,omitempty" db:"error_message"`
+	SourceAmount         *float64                         `json:"source_amount,omitempty" db:"source_amount"`
+	TargetAmount         *float64                         `json:"target_amount,omitempty" db:"target_amount"`
+	CurrencyID           *uuid.UUID                       `json:"currency_id,omitempty" db:"currency_id"`
+	ProcessedAt          *time.Time                       `json:"processed_at,omitempty" db:"processed_at"`
+	CreatedAt            time.Time                        `json:"created_at" db:"created_at"`
 
 	// Relationships (for display)
 	SourceOrganizationName string `json:"source_organization_name,omitempty"`
@@ -538,16 +537,16 @@ type IntercompanyTransactionLog struct {
 
 // IntercompanyDocumentLink tracks linked documents between companies
 type IntercompanyDocumentLink struct {
-	ID                     uuid.UUID `json:"id" db:"id"`
-	TenantID               uuid.UUID `json:"tenant_id" db:"tenant_id"`
-	SourceOrganizationID   uuid.UUID `json:"source_organization_id" db:"source_organization_id"`
-	SourceDocumentType     string    `json:"source_document_type" db:"source_document_type"`
-	SourceDocumentID       uuid.UUID `json:"source_document_id" db:"source_document_id"`
-	LinkedOrganizationID   uuid.UUID `json:"linked_organization_id" db:"linked_organization_id"`
-	LinkedDocumentType     string    `json:"linked_document_type" db:"linked_document_type"`
-	LinkedDocumentID       uuid.UUID `json:"linked_document_id" db:"linked_document_id"`
-	LinkType               string    `json:"link_type" db:"link_type"` // auto_created, manual, settlement
-	CreatedAt              time.Time `json:"created_at" db:"created_at"`
+	ID                   uuid.UUID `json:"id" db:"id"`
+	TenantID             uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	SourceOrganizationID uuid.UUID `json:"source_organization_id" db:"source_organization_id"`
+	SourceDocumentType   string    `json:"source_document_type" db:"source_document_type"`
+	SourceDocumentID     uuid.UUID `json:"source_document_id" db:"source_document_id"`
+	LinkedOrganizationID uuid.UUID `json:"linked_organization_id" db:"linked_organization_id"`
+	LinkedDocumentType   string    `json:"linked_document_type" db:"linked_document_type"`
+	LinkedDocumentID     uuid.UUID `json:"linked_document_id" db:"linked_document_id"`
+	LinkType             string    `json:"link_type" db:"link_type"` // auto_created, manual, settlement
+	CreatedAt            time.Time `json:"created_at" db:"created_at"`
 }
 
 // =====================================================
@@ -601,23 +600,23 @@ type IntercompanyTransactionLogFilter struct {
 
 // IntercompanyRuleResponse for API responses
 type IntercompanyRuleResponse struct {
-	ID                     uuid.UUID `json:"id"`
-	SourceOrganizationID   uuid.UUID `json:"source_organization_id"`
-	SourceOrganizationName string    `json:"source_organization_name"`
-	TargetOrganizationID   uuid.UUID `json:"target_organization_id"`
-	TargetOrganizationName string    `json:"target_organization_name"`
-	RuleType               string    `json:"rule_type"`
-	RuleTypeLabel          string    `json:"rule_type_label"`
-	IsActive               bool      `json:"is_active"`
-	AutoValidate           bool      `json:"auto_validate"`
-	SyncPrices             bool      `json:"sync_prices"`
+	ID                     uuid.UUID  `json:"id"`
+	SourceOrganizationID   uuid.UUID  `json:"source_organization_id"`
+	SourceOrganizationName string     `json:"source_organization_name"`
+	TargetOrganizationID   uuid.UUID  `json:"target_organization_id"`
+	TargetOrganizationName string     `json:"target_organization_name"`
+	RuleType               string     `json:"rule_type"`
+	RuleTypeLabel          string     `json:"rule_type_label"`
+	IsActive               bool       `json:"is_active"`
+	AutoValidate           bool       `json:"auto_validate"`
+	SyncPrices             bool       `json:"sync_prices"`
 	DefaultWarehouseID     *uuid.UUID `json:"default_warehouse_id,omitempty"`
-	DefaultWarehouseName   string    `json:"default_warehouse_name,omitempty"`
-	PricingMethod          string    `json:"pricing_method"`
-	MarkupPercent          float64   `json:"markup_percent"`
-	Notes                  *string   `json:"notes,omitempty"`
-	CreatedAt              time.Time `json:"created_at"`
-	UpdatedAt              time.Time `json:"updated_at"`
+	DefaultWarehouseName   string     `json:"default_warehouse_name,omitempty"`
+	PricingMethod          string     `json:"pricing_method"`
+	MarkupPercent          float64    `json:"markup_percent"`
+	Notes                  *string    `json:"notes,omitempty"`
+	CreatedAt              time.Time  `json:"created_at"`
+	UpdatedAt              time.Time  `json:"updated_at"`
 }
 
 // IntercompanyTransactionLogResponse for API responses

@@ -51,35 +51,35 @@ type PipelineStage struct {
 
 // Opportunity represents a sales opportunity/deal
 type Opportunity struct {
-	ID                uuid.UUID         `json:"id" db:"id"`
-	TenantID          uuid.UUID         `json:"tenant_id" db:"tenant_id"`
-	Name              string            `json:"name" db:"name"`
-	Code              *string           `json:"code,omitempty" db:"code"`
-	ContactID         *uuid.UUID        `json:"contact_id,omitempty" db:"contact_id"`
-	LeadID            *uuid.UUID        `json:"lead_id,omitempty" db:"lead_id"`
-	StageID           *uuid.UUID        `json:"stage_id,omitempty" db:"stage_id"`
-	Stage             OpportunityStage  `json:"stage" db:"stage"`
-	Probability       float64           `json:"probability" db:"probability"`
-	ExpectedRevenue   float64           `json:"expected_revenue" db:"expected_revenue"`
-	ActualRevenue     *float64          `json:"actual_revenue,omitempty" db:"actual_revenue"`
-	Currency          string            `json:"currency" db:"currency"`
-	ExpectedCloseDate *time.Time        `json:"expected_close_date,omitempty" db:"expected_close_date"`
-	ActualCloseDate   *time.Time        `json:"actual_close_date,omitempty" db:"actual_close_date"`
-	Source            *string           `json:"source,omitempty" db:"source"`
+	ID                uuid.UUID           `json:"id" db:"id"`
+	TenantID          uuid.UUID           `json:"tenant_id" db:"tenant_id"`
+	Name              string              `json:"name" db:"name"`
+	Code              *string             `json:"code,omitempty" db:"code"`
+	ContactID         *uuid.UUID          `json:"contact_id,omitempty" db:"contact_id"`
+	LeadID            *uuid.UUID          `json:"lead_id,omitempty" db:"lead_id"`
+	StageID           *uuid.UUID          `json:"stage_id,omitempty" db:"stage_id"`
+	Stage             OpportunityStage    `json:"stage" db:"stage"`
+	Probability       float64             `json:"probability" db:"probability"`
+	ExpectedRevenue   float64             `json:"expected_revenue" db:"expected_revenue"`
+	ActualRevenue     *float64            `json:"actual_revenue,omitempty" db:"actual_revenue"`
+	Currency          string              `json:"currency" db:"currency"`
+	ExpectedCloseDate *time.Time          `json:"expected_close_date,omitempty" db:"expected_close_date"`
+	ActualCloseDate   *time.Time          `json:"actual_close_date,omitempty" db:"actual_close_date"`
+	Source            *string             `json:"source,omitempty" db:"source"`
 	Priority          OpportunityPriority `json:"priority" db:"priority"`
-	AssignedTo        *uuid.UUID        `json:"assigned_to,omitempty" db:"assigned_to"`
-	TeamID            *uuid.UUID        `json:"team_id,omitempty" db:"team_id"`
-	Description       *string           `json:"description,omitempty" db:"description"`
-	NextStep          *string           `json:"next_step,omitempty" db:"next_step"`
-	NextStepDate      *time.Time        `json:"next_step_date,omitempty" db:"next_step_date"`
-	LostReason        *string           `json:"lost_reason,omitempty" db:"lost_reason"`
-	Competitor        *string           `json:"competitor,omitempty" db:"competitor"`
-	Tags              json.RawMessage   `json:"tags" db:"tags"`
-	CustomFields      json.RawMessage   `json:"custom_fields" db:"custom_fields"`
-	CreatedBy         *uuid.UUID        `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt         time.Time         `json:"created_at" db:"created_at"`
-	UpdatedAt         time.Time         `json:"updated_at" db:"updated_at"`
-	DeletedAt         sql.NullTime      `json:"-" db:"deleted_at"`
+	AssignedTo        *uuid.UUID          `json:"assigned_to,omitempty" db:"assigned_to"`
+	TeamID            *uuid.UUID          `json:"team_id,omitempty" db:"team_id"`
+	Description       *string             `json:"description,omitempty" db:"description"`
+	NextStep          *string             `json:"next_step,omitempty" db:"next_step"`
+	NextStepDate      *time.Time          `json:"next_step_date,omitempty" db:"next_step_date"`
+	LostReason        *string             `json:"lost_reason,omitempty" db:"lost_reason"`
+	Competitor        *string             `json:"competitor,omitempty" db:"competitor"`
+	Tags              json.RawMessage     `json:"tags" db:"tags"`
+	CustomFields      json.RawMessage     `json:"custom_fields" db:"custom_fields"`
+	CreatedBy         *uuid.UUID          `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt         time.Time           `json:"created_at" db:"created_at"`
+	UpdatedAt         time.Time           `json:"updated_at" db:"updated_at"`
+	DeletedAt         sql.NullTime        `json:"-" db:"deleted_at"`
 
 	// Populated from joins
 	ContactName    *string `json:"contact_name,omitempty" db:"contact_name"`
@@ -89,22 +89,22 @@ type Opportunity struct {
 
 // CreateOpportunityInput represents input for creating an opportunity
 type CreateOpportunityInput struct {
-	Name              string  `json:"name" binding:"required,min=1,max=255"`
-	Code              string  `json:"code,omitempty"`
-	ContactID         string  `json:"contact_id,omitempty"`
-	LeadID            string  `json:"lead_id,omitempty"`
-	StageID           string  `json:"stage_id,omitempty"`
-	Stage             string  `json:"stage,omitempty"`
-	Probability       float64 `json:"probability,omitempty"`
-	ExpectedRevenue   float64 `json:"expected_revenue,omitempty"`
-	Currency          string  `json:"currency,omitempty"`
-	ExpectedCloseDate string  `json:"expected_close_date,omitempty"`
-	Source            string  `json:"source,omitempty"`
-	Priority          string  `json:"priority,omitempty"`
-	AssignedTo        string  `json:"assigned_to,omitempty"`
-	Description       string  `json:"description,omitempty"`
-	NextStep          string  `json:"next_step,omitempty"`
-	NextStepDate      string  `json:"next_step_date,omitempty"`
+	Name              string   `json:"name" binding:"required,min=1,max=255"`
+	Code              string   `json:"code,omitempty"`
+	ContactID         string   `json:"contact_id,omitempty"`
+	LeadID            string   `json:"lead_id,omitempty"`
+	StageID           string   `json:"stage_id,omitempty"`
+	Stage             string   `json:"stage,omitempty"`
+	Probability       float64  `json:"probability,omitempty"`
+	ExpectedRevenue   float64  `json:"expected_revenue,omitempty"`
+	Currency          string   `json:"currency,omitempty"`
+	ExpectedCloseDate string   `json:"expected_close_date,omitempty"`
+	Source            string   `json:"source,omitempty"`
+	Priority          string   `json:"priority,omitempty"`
+	AssignedTo        string   `json:"assigned_to,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	NextStep          string   `json:"next_step,omitempty"`
+	NextStepDate      string   `json:"next_step_date,omitempty"`
 	Tags              []string `json:"tags,omitempty"`
 }
 
@@ -133,18 +133,18 @@ type UpdateOpportunityInput struct {
 
 // OpportunityListFilter represents filters for listing opportunities
 type OpportunityListFilter struct {
-	Search        string `form:"search"`
-	Stage         string `form:"stage"`
-	StageID       string `form:"stage_id"`
-	ContactID     string `form:"contact_id"`
-	AssignedTo    string `form:"assigned_to"`
-	Priority      string `form:"priority"`
-	Source        string `form:"source"`
-	DateFrom      string `form:"date_from"`
-	DateTo        string `form:"date_to"`
+	Search        string   `form:"search"`
+	Stage         string   `form:"stage"`
+	StageID       string   `form:"stage_id"`
+	ContactID     string   `form:"contact_id"`
+	AssignedTo    string   `form:"assigned_to"`
+	Priority      string   `form:"priority"`
+	Source        string   `form:"source"`
+	DateFrom      string   `form:"date_from"`
+	DateTo        string   `form:"date_to"`
 	MinRevenue    *float64 `form:"min_revenue"`
 	MaxRevenue    *float64 `form:"max_revenue"`
-	IncludeClosed bool   `form:"include_closed"`
+	IncludeClosed bool     `form:"include_closed"`
 }
 
 // OpportunityResponse represents the API response for an opportunity

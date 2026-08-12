@@ -114,13 +114,13 @@ type CreatePurchaseOrderInput struct {
 	Subtotal              float64                        `json:"subtotal,omitempty"`
 	TaxAmount             float64                        `json:"tax_amount,omitempty"`
 	TotalAmount           float64                        `json:"total_amount,omitempty"`
-	Lines                 []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1"`
+	Lines                 []CreatePurchaseOrderLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 // CreatePurchaseOrderLineInput represents input for a line item
 type CreatePurchaseOrderLineInput struct {
 	ProductID      string   `json:"product_id,omitempty"`
-	Description    string   `json:"description" binding:"required"`
+	Description    string   `json:"description"`
 	Quantity       float64  `json:"quantity" binding:"required,gt=0"`
 	UnitID         string   `json:"unit_id,omitempty"`
 	UnitPrice      float64  `json:"unit_price" binding:"required,gte=0"`
@@ -153,14 +153,14 @@ type UpdatePurchaseOrderInput struct {
 
 // ReceivePurchaseOrderInput represents input for receiving a purchase order
 type ReceivePurchaseOrderInput struct {
-	Lines []ReceiveLineInput `json:"lines" binding:"required,min=1"`
+	Lines []ReceiveLineInput `json:"lines" binding:"required,min=1,dive"`
 	Notes string             `json:"notes,omitempty"`
 }
 
 // ReceiveLineInput represents input for receiving a line
 type ReceiveLineInput struct {
 	LineID           string  `json:"line_id" binding:"required"`
-	QuantityReceived float64 `json:"quantity_received" binding:"required,gt=0"`
+	QuantityReceived float64 `json:"quantity_received" binding:"gte=0"`
 }
 
 // PurchaseOrderListFilter represents filters for listing purchase orders

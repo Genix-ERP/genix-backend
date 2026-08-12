@@ -435,19 +435,22 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		categories.GET("", h.ListProductCategories)
 		// §2.1 — whether the valuation method can still be changed, and why not.
 		categories.GET("/:id/method-lock", h.GetCategoryMethodLock)
-		categories.POST("", h.CreateProductCategory)
+		// Catalog mutations carry the same gates as /products — these three
+		// were reachable by ANY authenticated user, read-only roles included.
+		categories.POST("", h.perm.Require("inventory", "product", "create"), h.CreateProductCategory)
 		categories.GET("/:id", h.GetProductCategory)
-		categories.PUT("/:id", h.UpdateProductCategory)
-		categories.DELETE("/:id", h.DeleteProductCategory)
+		categories.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateProductCategory)
+		categories.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteProductCategory)
 	}
 
 	// Units of Measure
 	uom := rg.Group("/units-of-measure")
 	{
 		uom.GET("", h.ListUnitsOfMeasure)
-		uom.POST("", h.CreateUnitOfMeasure)
-		uom.PUT("/:id", h.UpdateUnitOfMeasure)
-		uom.DELETE("/:id", h.DeleteUnitOfMeasure)
+		// Same gates as the product catalog — units feed every document line.
+		uom.POST("", h.perm.Require("inventory", "product", "create"), h.CreateUnitOfMeasure)
+		uom.PUT("/:id", h.perm.Require("inventory", "product", "update"), h.UpdateUnitOfMeasure)
+		uom.DELETE("/:id", h.perm.Require("inventory", "product", "delete"), h.DeleteUnitOfMeasure)
 	}
 
 	// Warehouses
@@ -2105,9 +2108,11 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	companyTaxRates := rg.Group("/company-tax-rates")
 	{
 		companyTaxRates.GET("", h.ListCompanyTaxRates)
-		companyTaxRates.POST("", h.CreateCompanyTaxRate)
-		companyTaxRates.PUT("/:id", h.UpdateCompanyTaxRate)
-		companyTaxRates.DELETE("/:id", h.DeleteCompanyTaxRate)
+		// Tax configuration moves money on every posting — same gates the
+		// /tax-rates group has carried; these three had none at all.
+		companyTaxRates.POST("", h.perm.Require("finance", "tax_report", "create"), h.CreateCompanyTaxRate)
+		companyTaxRates.PUT("/:id", h.perm.Require("finance", "tax_report", "update"), h.UpdateCompanyTaxRate)
+		companyTaxRates.DELETE("/:id", h.perm.Require("finance", "tax_report", "delete"), h.DeleteCompanyTaxRate)
 	}
 
 	// ────────────── TT "Ish haqi" (payroll simple model) ──────────────

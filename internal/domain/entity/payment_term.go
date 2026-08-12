@@ -8,39 +8,39 @@ import (
 
 // PaymentTerm represents configurable payment terms
 type PaymentTerm struct {
-	ID                  uuid.UUID  `json:"id" db:"id"`
-	TenantID            uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	Code                string     `json:"code" db:"code"`
-	Name                string     `json:"name" db:"name"`
-	Description         *string    `json:"description,omitempty" db:"description"`
-	TermType            string     `json:"term_type" db:"term_type"` // fixed, end_of_month, end_of_next_month, immediate
-	DueDays             int        `json:"due_days" db:"due_days"`
-	HasEarlyDiscount    bool       `json:"has_early_discount" db:"has_early_discount"`
-	DiscountPercentage  float64    `json:"discount_percentage" db:"discount_percentage"`
-	DiscountDays        int        `json:"discount_days" db:"discount_days"`
-	EndOfMonthDay       *int       `json:"end_of_month_day,omitempty" db:"end_of_month_day"`
-	DisplayOrder        int        `json:"display_order" db:"display_order"`
-	IsDefault           bool       `json:"is_default" db:"is_default"`
-	IsActive            bool       `json:"is_active" db:"is_active"`
-	CreatedBy           *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
-	CreatedAt           time.Time  `json:"created_at" db:"created_at"`
-	UpdatedAt           time.Time  `json:"updated_at" db:"updated_at"`
+	ID                 uuid.UUID  `json:"id" db:"id"`
+	TenantID           uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	Code               string     `json:"code" db:"code"`
+	Name               string     `json:"name" db:"name"`
+	Description        *string    `json:"description,omitempty" db:"description"`
+	TermType           string     `json:"term_type" db:"term_type"` // fixed, end_of_month, end_of_next_month, immediate
+	DueDays            int        `json:"due_days" db:"due_days"`
+	HasEarlyDiscount   bool       `json:"has_early_discount" db:"has_early_discount"`
+	DiscountPercentage float64    `json:"discount_percentage" db:"discount_percentage"`
+	DiscountDays       int        `json:"discount_days" db:"discount_days"`
+	EndOfMonthDay      *int       `json:"end_of_month_day,omitempty" db:"end_of_month_day"`
+	DisplayOrder       int        `json:"display_order" db:"display_order"`
+	IsDefault          bool       `json:"is_default" db:"is_default"`
+	IsActive           bool       `json:"is_active" db:"is_active"`
+	CreatedBy          *uuid.UUID `json:"created_by,omitempty" db:"created_by"`
+	CreatedAt          time.Time  `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time  `json:"updated_at" db:"updated_at"`
 }
 
 // PaymentTermInput is used for creating/updating payment terms
 type PaymentTermInput struct {
-	Code               string   `json:"code" binding:"required,max=30"`
-	Name               string   `json:"name" binding:"required,max=100"`
-	Description        *string  `json:"description,omitempty"`
-	TermType           string   `json:"term_type" binding:"required,oneof=fixed end_of_month end_of_next_month immediate"`
-	DueDays            int      `json:"due_days" binding:"min=0,max=365"`
-	HasEarlyDiscount   bool     `json:"has_early_discount"`
-	DiscountPercentage float64  `json:"discount_percentage" binding:"min=0,max=100"`
-	DiscountDays       int      `json:"discount_days" binding:"min=0,max=365"`
-	EndOfMonthDay      *int     `json:"end_of_month_day,omitempty"`
-	DisplayOrder       int      `json:"display_order"`
-	IsDefault          bool     `json:"is_default"`
-	IsActive           bool     `json:"is_active"`
+	Code               string  `json:"code" binding:"required,max=30"`
+	Name               string  `json:"name" binding:"required,max=100"`
+	Description        *string `json:"description,omitempty"`
+	TermType           string  `json:"term_type" binding:"required,oneof=fixed end_of_month end_of_next_month immediate"`
+	DueDays            int     `json:"due_days" binding:"min=0,max=365"`
+	HasEarlyDiscount   bool    `json:"has_early_discount"`
+	DiscountPercentage float64 `json:"discount_percentage" binding:"min=0,max=100"`
+	DiscountDays       int     `json:"discount_days" binding:"min=0,max=365"`
+	EndOfMonthDay      *int    `json:"end_of_month_day,omitempty"`
+	DisplayOrder       int     `json:"display_order"`
+	IsDefault          bool    `json:"is_default"`
+	IsActive           bool    `json:"is_active"`
 }
 
 // PaymentTermListItem is a simplified view for dropdowns
@@ -62,10 +62,10 @@ type PaymentTermStats struct {
 
 // Term type constants
 const (
-	TermTypeFixed           = "fixed"
-	TermTypeEndOfMonth      = "end_of_month"
-	TermTypeEndOfNextMonth  = "end_of_next_month"
-	TermTypeImmediate       = "immediate"
+	TermTypeFixed          = "fixed"
+	TermTypeEndOfMonth     = "end_of_month"
+	TermTypeEndOfNextMonth = "end_of_next_month"
+	TermTypeImmediate      = "immediate"
 )
 
 // CalculateDueDate calculates the due date based on the payment term

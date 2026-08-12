@@ -240,6 +240,30 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Security BearerAuth
 // @Router /purchase/orders [post]
+
+// fillLineDescriptions defaults each empty line description to its product's
+// name. The binding no longer requires description (a line that names its
+// product carries all the meaning a human needs), but the column feeds every
+// list and printout, so it must not end up blank.
+func (h *Handler) fillLineDescriptions(tenantID uuid.UUID, lines []entity.CreatePurchaseOrderLineInput) {
+	for i := range lines {
+		if strings.TrimSpace(lines[i].Description) != "" || lines[i].ProductID == "" {
+			continue
+		}
+		pid, err := uuid.Parse(lines[i].ProductID)
+		if err != nil {
+			continue
+		}
+		var name string
+		if qErr := h.db.QueryRow(
+			`SELECT name FROM products WHERE id = $1 AND tenant_id = $2`,
+			pid, tenantID,
+		).Scan(&name); qErr == nil && name != "" {
+			lines[i].Description = name
+		}
+	}
+}
+
 func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -531,6 +555,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
 	`
 
+	h.fillLineDescriptions(tenantID, input.Lines)
 	lines := make([]entity.PurchaseOrderLine, 0, len(input.Lines))
 	for i, line := range input.Lines {
 		lineID := uuid.New()
@@ -1158,6 +1183,7 @@ func (h *Handler) UpdatePurchaseOrder(c *gin.Context) {
 			return
 		}
 
+		h.fillLineDescriptions(tenantID, input.Lines)
 		var newSubtotal, newTax, newTotal float64
 		for i, line := range input.Lines {
 			lineID := uuid.New()

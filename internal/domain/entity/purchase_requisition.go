@@ -78,14 +78,14 @@ type PurchaseRequisitionLine struct {
 
 // Input/Output structs
 type CreatePRInput struct {
-	RequestedBy  string                `json:"requested_by" binding:"required"`
-	Department   string                `json:"department"`
-	RequestDate  string                `json:"request_date"`
-	RequiredDate string                `json:"required_date"`
-	Priority     PRPriority            `json:"priority"`
-	Purpose      string                `json:"purpose"`
-	Notes        string                `json:"notes"`
-	Lines        []CreatePRLineInput   `json:"lines"`
+	RequestedBy  string              `json:"requested_by" binding:"required"`
+	Department   string              `json:"department"`
+	RequestDate  string              `json:"request_date"`
+	RequiredDate string              `json:"required_date"`
+	Priority     PRPriority          `json:"priority"`
+	Purpose      string              `json:"purpose"`
+	Notes        string              `json:"notes"`
+	Lines        []CreatePRLineInput `json:"lines"`
 }
 
 type CreatePRLineInput struct {
@@ -112,8 +112,8 @@ type UpdatePRInput struct {
 }
 
 type ApprovePRInput struct {
-	ApprovedBy string                  `json:"approved_by" binding:"required"`
-	Lines      []ApprovePRLineInput    `json:"lines"`
+	ApprovedBy string               `json:"approved_by" binding:"required"`
+	Lines      []ApprovePRLineInput `json:"lines"`
 }
 
 type ApprovePRLineInput struct {

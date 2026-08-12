@@ -134,7 +134,7 @@ type UpdateWBSInput struct {
 
 // ReorderWBSInput represents input for reordering WBS items
 type ReorderWBSInput struct {
-	Items []WBSOrderItem `json:"items" binding:"required"`
+	Items []WBSOrderItem `json:"items" binding:"required,dive"`
 }
 
 // WBSOrderItem represents a single WBS item reorder entry
@@ -150,10 +150,10 @@ type WBSOrderItem struct {
 
 // ConstructionActivityLog represents an activity log entry
 type ConstructionActivityLog struct {
-	ID        int64           `json:"id" db:"id"`
-	TenantID  uuid.UUID       `json:"tenant_id" db:"tenant_id"`
-	ProjectID int64           `json:"project_id" db:"project_id"`
-	UserID    uuid.NullUUID   `json:"user_id" db:"user_id"`
+	ID        int64         `json:"id" db:"id"`
+	TenantID  uuid.UUID     `json:"tenant_id" db:"tenant_id"`
+	ProjectID int64         `json:"project_id" db:"project_id"`
+	UserID    uuid.NullUUID `json:"user_id" db:"user_id"`
 
 	ActionType   string          `json:"action_type" db:"action_type"`
 	Description  string          `json:"description" db:"description"`

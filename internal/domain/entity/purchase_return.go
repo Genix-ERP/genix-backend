@@ -24,14 +24,14 @@ const (
 type ReturnReason string
 
 const (
-	ReturnReasonDefective      ReturnReason = "defective"
-	ReturnReasonWrongItem      ReturnReason = "wrong_item"
-	ReturnReasonDamaged        ReturnReason = "damaged"
-	ReturnReasonQualityIssue   ReturnReason = "quality_issue"
-	ReturnReasonOverSupply     ReturnReason = "over_supply"
-	ReturnReasonExpired        ReturnReason = "expired"
-	ReturnReasonNotAsOrdered   ReturnReason = "not_as_ordered"
-	ReturnReasonOther          ReturnReason = "other"
+	ReturnReasonDefective    ReturnReason = "defective"
+	ReturnReasonWrongItem    ReturnReason = "wrong_item"
+	ReturnReasonDamaged      ReturnReason = "damaged"
+	ReturnReasonQualityIssue ReturnReason = "quality_issue"
+	ReturnReasonOverSupply   ReturnReason = "over_supply"
+	ReturnReasonExpired      ReturnReason = "expired"
+	ReturnReasonNotAsOrdered ReturnReason = "not_as_ordered"
+	ReturnReasonOther        ReturnReason = "other"
 )
 
 // PurchaseReturn represents a purchase return/RMA document
@@ -75,42 +75,42 @@ type PurchaseReturn struct {
 
 // PurchaseReturnLine represents a line item in purchase return
 type PurchaseReturnLine struct {
-	ID              uuid.UUID    `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	ReturnID        uuid.UUID    `json:"return_id" gorm:"type:uuid;not null;index"`
-	POLineID        *uuid.UUID   `json:"po_line_id" gorm:"type:uuid"`
-	GRLineID        *uuid.UUID   `json:"gr_line_id" gorm:"type:uuid"`
-	ProductID       *uuid.UUID   `json:"product_id" gorm:"type:uuid"`
-	ProductName     string       `json:"product_name" gorm:"type:varchar(255);not null"`
-	ProductCode     string       `json:"product_code" gorm:"type:varchar(100)"`
-	ReturnQuantity  float64      `json:"return_quantity" gorm:"type:decimal(15,3);not null"`
-	Unit            string       `json:"unit" gorm:"type:varchar(20);default:'pcs'"`
-	UnitPrice       float64      `json:"unit_price" gorm:"type:decimal(15,2)"`
-	TotalPrice      float64      `json:"total_price" gorm:"type:decimal(15,2)"`
-	ReturnReason    ReturnReason `json:"return_reason" gorm:"type:varchar(50)"`
-	ReasonDetails   string       `json:"reason_details" gorm:"type:text"`
-	BatchNumber     string       `json:"batch_number" gorm:"type:varchar(100)"`
-	SerialNumbers   string       `json:"serial_numbers" gorm:"type:text"`
-	Condition       string       `json:"condition" gorm:"type:varchar(50)"` // new, used, damaged
-	Photos          string       `json:"photos" gorm:"type:text"`           // JSON array of photo URLs
-	ReceivedBack    bool         `json:"received_back" gorm:"default:false"`
-	CreditApplied   bool         `json:"credit_applied" gorm:"default:false"`
-	Notes           string       `json:"notes" gorm:"type:text"`
-	CreatedAt       time.Time    `json:"created_at" gorm:"autoCreateTime"`
-	UpdatedAt       time.Time    `json:"updated_at" gorm:"autoUpdateTime"`
+	ID             uuid.UUID    `json:"id" gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
+	ReturnID       uuid.UUID    `json:"return_id" gorm:"type:uuid;not null;index"`
+	POLineID       *uuid.UUID   `json:"po_line_id" gorm:"type:uuid"`
+	GRLineID       *uuid.UUID   `json:"gr_line_id" gorm:"type:uuid"`
+	ProductID      *uuid.UUID   `json:"product_id" gorm:"type:uuid"`
+	ProductName    string       `json:"product_name" gorm:"type:varchar(255);not null"`
+	ProductCode    string       `json:"product_code" gorm:"type:varchar(100)"`
+	ReturnQuantity float64      `json:"return_quantity" gorm:"type:decimal(15,3);not null"`
+	Unit           string       `json:"unit" gorm:"type:varchar(20);default:'pcs'"`
+	UnitPrice      float64      `json:"unit_price" gorm:"type:decimal(15,2)"`
+	TotalPrice     float64      `json:"total_price" gorm:"type:decimal(15,2)"`
+	ReturnReason   ReturnReason `json:"return_reason" gorm:"type:varchar(50)"`
+	ReasonDetails  string       `json:"reason_details" gorm:"type:text"`
+	BatchNumber    string       `json:"batch_number" gorm:"type:varchar(100)"`
+	SerialNumbers  string       `json:"serial_numbers" gorm:"type:text"`
+	Condition      string       `json:"condition" gorm:"type:varchar(50)"` // new, used, damaged
+	Photos         string       `json:"photos" gorm:"type:text"`           // JSON array of photo URLs
+	ReceivedBack   bool         `json:"received_back" gorm:"default:false"`
+	CreditApplied  bool         `json:"credit_applied" gorm:"default:false"`
+	Notes          string       `json:"notes" gorm:"type:text"`
+	CreatedAt      time.Time    `json:"created_at" gorm:"autoCreateTime"`
+	UpdatedAt      time.Time    `json:"updated_at" gorm:"autoUpdateTime"`
 }
 
 // Input/Output structs
 type CreateReturnInput struct {
-	PurchaseOrderID   string                   `json:"purchase_order_id"`
-	GoodsReceiptID    string                   `json:"goods_receipt_id"`
-	SupplierID        string                   `json:"supplier_id" binding:"required"`
-	ReturnDate        string                   `json:"return_date"`
-	RequestedBy       string                   `json:"requested_by" binding:"required"`
-	ReturnReason      ReturnReason             `json:"return_reason" binding:"required"`
-	ReasonDescription string                   `json:"reason_description"`
-	ShippingMethod    string                   `json:"shipping_method"`
-	Notes             string                   `json:"notes"`
-	Lines             []CreateReturnLineInput  `json:"lines" binding:"required,min=1"`
+	PurchaseOrderID   string                  `json:"purchase_order_id"`
+	GoodsReceiptID    string                  `json:"goods_receipt_id"`
+	SupplierID        string                  `json:"supplier_id" binding:"required"`
+	ReturnDate        string                  `json:"return_date"`
+	RequestedBy       string                  `json:"requested_by" binding:"required"`
+	ReturnReason      ReturnReason            `json:"return_reason" binding:"required"`
+	ReasonDescription string                  `json:"reason_description"`
+	ShippingMethod    string                  `json:"shipping_method"`
+	Notes             string                  `json:"notes"`
+	Lines             []CreateReturnLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 
 type CreateReturnLineInput struct {

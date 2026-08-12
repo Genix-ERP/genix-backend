@@ -42,7 +42,7 @@ type UpdateModulePermissionInput struct {
 
 // BulkUpdatePermissionsInput represents input for updating all permissions at once
 type BulkUpdatePermissionsInput struct {
-	Permissions []UpdateModulePermissionInput `json:"permissions" binding:"required"`
+	Permissions []UpdateModulePermissionInput `json:"permissions" binding:"required,dive"`
 }
 
 // GetEmployeePermissions returns all module permissions for an employee

@@ -26,9 +26,9 @@ const (
 
 // WorkOrderTimeLog tracks time spent on work orders
 type WorkOrderTimeLog struct {
-	ID          uuid.UUID  `json:"id" db:"id"`
-	TenantID    uuid.UUID  `json:"tenant_id" db:"tenant_id"`
-	WorkOrderID uuid.UUID  `json:"work_order_id" db:"work_order_id"`
+	ID          uuid.UUID `json:"id" db:"id"`
+	TenantID    uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	WorkOrderID uuid.UUID `json:"work_order_id" db:"work_order_id"`
 
 	StartTime       time.Time  `json:"start_time" db:"start_time"`
 	EndTime         *time.Time `json:"end_time,omitempty" db:"end_time"`
@@ -54,8 +54,8 @@ type WorkOrderTimeLog struct {
 type ManufacturingTransferType string
 
 const (
-	MfgTransferPickComponents   ManufacturingTransferType = "pick_components"
-	MfgTransferStoreFinished    ManufacturingTransferType = "store_finished"
+	MfgTransferPickComponents ManufacturingTransferType = "pick_components"
+	MfgTransferStoreFinished  ManufacturingTransferType = "store_finished"
 )
 
 type ManufacturingTransferStatus string
@@ -70,10 +70,10 @@ const (
 
 // ManufacturingTransfer represents an inventory transfer for manufacturing
 type ManufacturingTransfer struct {
-	ID               uuid.UUID                   `json:"id" db:"id"`
-	TenantID         uuid.UUID                   `json:"tenant_id" db:"tenant_id"`
-	OrganizationID   *uuid.UUID                  `json:"organization_id,omitempty" db:"organization_id"`
-	ProductionOrderID uuid.UUID                  `json:"production_order_id" db:"production_order_id"`
+	ID                uuid.UUID  `json:"id" db:"id"`
+	TenantID          uuid.UUID  `json:"tenant_id" db:"tenant_id"`
+	OrganizationID    *uuid.UUID `json:"organization_id,omitempty" db:"organization_id"`
+	ProductionOrderID uuid.UUID  `json:"production_order_id" db:"production_order_id"`
 
 	TransferNumber string                    `json:"transfer_number" db:"transfer_number"`
 	TransferType   ManufacturingTransferType `json:"transfer_type" db:"transfer_type"`
@@ -97,17 +97,17 @@ type ManufacturingTransfer struct {
 	DeletedAt *time.Time `json:"-" db:"deleted_at"`
 
 	// Relationships
-	Lines                     []ManufacturingTransferLine `json:"lines,omitempty"`
-	ProductionOrderNumber     string                      `json:"production_order_number,omitempty"`
-	SourceLocationName        string                      `json:"source_location_name,omitempty"`
-	DestinationLocationName   string                      `json:"destination_location_name,omitempty"`
-	WarehouseName             string                      `json:"warehouse_name,omitempty"`
+	Lines                   []ManufacturingTransferLine `json:"lines,omitempty"`
+	ProductionOrderNumber   string                      `json:"production_order_number,omitempty"`
+	SourceLocationName      string                      `json:"source_location_name,omitempty"`
+	DestinationLocationName string                      `json:"destination_location_name,omitempty"`
+	WarehouseName           string                      `json:"warehouse_name,omitempty"`
 }
 
 // ManufacturingTransferLine represents a line in a manufacturing transfer
 type ManufacturingTransferLine struct {
-	ID                      uuid.UUID  `json:"id" db:"id"`
-	ManufacturingTransferID uuid.UUID  `json:"manufacturing_transfer_id" db:"manufacturing_transfer_id"`
+	ID                      uuid.UUID `json:"id" db:"id"`
+	ManufacturingTransferID uuid.UUID `json:"manufacturing_transfer_id" db:"manufacturing_transfer_id"`
 
 	ProductID        uuid.UUID  `json:"product_id" db:"product_id"`
 	ProductVariantID *uuid.UUID `json:"product_variant_id,omitempty" db:"product_variant_id"`
@@ -129,8 +129,8 @@ type ManufacturingTransferLine struct {
 	UpdatedAt time.Time `json:"updated_at" db:"updated_at"`
 
 	// Relationships for display
-	ProductName   string `json:"product_name,omitempty"`
-	ProductCode   string `json:"product_code,omitempty"`
+	ProductName string `json:"product_name,omitempty"`
+	ProductCode string `json:"product_code,omitempty"`
 }
 
 // =====================================================
@@ -276,38 +276,38 @@ type WorkOrderResponse struct {
 
 // ManufacturingTransferResponse for API responses
 type ManufacturingTransferResponse struct {
-	ID                      uuid.UUID                          `json:"id"`
-	TransferNumber          string                             `json:"transfer_number"`
-	TransferType            string                             `json:"transfer_type"`
-	TransferTypeLabel       string                             `json:"transfer_type_label"`
-	ProductionOrderID       uuid.UUID                          `json:"production_order_id"`
-	ProductionOrderNumber   string                             `json:"production_order_number,omitempty"`
-	SourceLocationID        *uuid.UUID                         `json:"source_location_id,omitempty"`
-	SourceLocationName      string                             `json:"source_location_name,omitempty"`
-	DestinationLocationID   *uuid.UUID                         `json:"destination_location_id,omitempty"`
-	DestinationLocationName string                             `json:"destination_location_name,omitempty"`
-	WarehouseID             *uuid.UUID                         `json:"warehouse_id,omitempty"`
-	WarehouseName           string                             `json:"warehouse_name,omitempty"`
-	Status                  string                             `json:"status"`
-	StatusLabel             string                             `json:"status_label"`
-	ScheduledDate           *time.Time                         `json:"scheduled_date,omitempty"`
-	DoneDate                *time.Time                         `json:"done_date,omitempty"`
+	ID                      uuid.UUID                           `json:"id"`
+	TransferNumber          string                              `json:"transfer_number"`
+	TransferType            string                              `json:"transfer_type"`
+	TransferTypeLabel       string                              `json:"transfer_type_label"`
+	ProductionOrderID       uuid.UUID                           `json:"production_order_id"`
+	ProductionOrderNumber   string                              `json:"production_order_number,omitempty"`
+	SourceLocationID        *uuid.UUID                          `json:"source_location_id,omitempty"`
+	SourceLocationName      string                              `json:"source_location_name,omitempty"`
+	DestinationLocationID   *uuid.UUID                          `json:"destination_location_id,omitempty"`
+	DestinationLocationName string                              `json:"destination_location_name,omitempty"`
+	WarehouseID             *uuid.UUID                          `json:"warehouse_id,omitempty"`
+	WarehouseName           string                              `json:"warehouse_name,omitempty"`
+	Status                  string                              `json:"status"`
+	StatusLabel             string                              `json:"status_label"`
+	ScheduledDate           *time.Time                          `json:"scheduled_date,omitempty"`
+	DoneDate                *time.Time                          `json:"done_date,omitempty"`
 	Lines                   []ManufacturingTransferLineResponse `json:"lines,omitempty"`
-	CreatedAt               time.Time                          `json:"created_at"`
+	CreatedAt               time.Time                           `json:"created_at"`
 }
 
 type ManufacturingTransferLineResponse struct {
-	ID                      uuid.UUID  `json:"id"`
-	ProductID               uuid.UUID  `json:"product_id"`
-	ProductName             string     `json:"product_name"`
-	ProductCode             string     `json:"product_code,omitempty"`
-	QuantityDemanded        float64    `json:"quantity_demanded"`
-	QuantityDone            float64    `json:"quantity_done"`
-	UOM                     string     `json:"uom,omitempty"`
-	LotNumber               *string    `json:"lot_number,omitempty"`
-	SerialNumber            *string    `json:"serial_number,omitempty"`
-	SourceLocationName      string     `json:"source_location_name,omitempty"`
-	DestinationLocationName string     `json:"destination_location_name,omitempty"`
+	ID                      uuid.UUID `json:"id"`
+	ProductID               uuid.UUID `json:"product_id"`
+	ProductName             string    `json:"product_name"`
+	ProductCode             string    `json:"product_code,omitempty"`
+	QuantityDemanded        float64   `json:"quantity_demanded"`
+	QuantityDone            float64   `json:"quantity_done"`
+	UOM                     string    `json:"uom,omitempty"`
+	LotNumber               *string   `json:"lot_number,omitempty"`
+	SerialNumber            *string   `json:"serial_number,omitempty"`
+	SourceLocationName      string    `json:"source_location_name,omitempty"`
+	DestinationLocationName string    `json:"destination_location_name,omitempty"`
 }
 
 // =====================================================

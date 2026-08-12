@@ -19,13 +19,13 @@ type EmployeeContract struct {
 	StartDate       time.Time    `json:"start_date" db:"start_date"`
 	EndDate         *time.Time   `json:"end_date,omitempty" db:"end_date"`
 	Salary          float64      `json:"salary" db:"salary"`
-	Currency        string       `json:"currency" db:"currency"` // UZS, USD, etc.
-	WorkingHours    int          `json:"working_hours" db:"working_hours"` // hours per week
+	Currency        string       `json:"currency" db:"currency"`                 // UZS, USD, etc.
+	WorkingHours    int          `json:"working_hours" db:"working_hours"`       // hours per week
 	ProbationPeriod int          `json:"probation_period" db:"probation_period"` // months
-	NoticePeriod    int          `json:"notice_period" db:"notice_period"` // days
-	Benefits        *string      `json:"benefits,omitempty" db:"benefits"` // JSON or text
-	Terms           *string      `json:"terms,omitempty" db:"terms"` // Contract terms
-	Status          string       `json:"status" db:"status"` // active, draft, terminated, expired
+	NoticePeriod    int          `json:"notice_period" db:"notice_period"`       // days
+	Benefits        *string      `json:"benefits,omitempty" db:"benefits"`       // JSON or text
+	Terms           *string      `json:"terms,omitempty" db:"terms"`             // Contract terms
+	Status          string       `json:"status" db:"status"`                     // active, draft, terminated, expired
 	SignedDate      *time.Time   `json:"signed_date,omitempty" db:"signed_date"`
 	TerminationDate *time.Time   `json:"termination_date,omitempty" db:"termination_date"`
 	TerminationNote *string      `json:"termination_note,omitempty" db:"termination_note"`
@@ -56,23 +56,23 @@ type CreateEmployeeContractInput struct {
 
 // UpdateEmployeeContractInput represents input for updating an employee contract
 type UpdateEmployeeContractInput struct {
-	EmployeeName      *string  `json:"employee_name,omitempty"`
-	JobTitle          *string  `json:"job_title,omitempty"`
-	Department        *string  `json:"department,omitempty"`
-	ContractType      *string  `json:"contract_type,omitempty"`
-	StartDate         *string  `json:"start_date,omitempty"`
-	EndDate           *string  `json:"end_date,omitempty"`
-	Salary            *float64 `json:"salary,omitempty"`
-	Currency          *string  `json:"currency,omitempty"`
-	WorkingHours      *int     `json:"working_hours,omitempty"`
-	ProbationPeriod   *int     `json:"probation_period,omitempty"`
-	NoticePeriod      *int     `json:"notice_period,omitempty"`
-	Benefits          *string  `json:"benefits,omitempty"`
-	Terms             *string  `json:"terms,omitempty"`
-	Status            *string  `json:"status,omitempty"`
-	SignedDate        *string  `json:"signed_date,omitempty"`
-	TerminationDate   *string  `json:"termination_date,omitempty"`
-	TerminationNote   *string  `json:"termination_note,omitempty"`
+	EmployeeName    *string  `json:"employee_name,omitempty"`
+	JobTitle        *string  `json:"job_title,omitempty"`
+	Department      *string  `json:"department,omitempty"`
+	ContractType    *string  `json:"contract_type,omitempty"`
+	StartDate       *string  `json:"start_date,omitempty"`
+	EndDate         *string  `json:"end_date,omitempty"`
+	Salary          *float64 `json:"salary,omitempty"`
+	Currency        *string  `json:"currency,omitempty"`
+	WorkingHours    *int     `json:"working_hours,omitempty"`
+	ProbationPeriod *int     `json:"probation_period,omitempty"`
+	NoticePeriod    *int     `json:"notice_period,omitempty"`
+	Benefits        *string  `json:"benefits,omitempty"`
+	Terms           *string  `json:"terms,omitempty"`
+	Status          *string  `json:"status,omitempty"`
+	SignedDate      *string  `json:"signed_date,omitempty"`
+	TerminationDate *string  `json:"termination_date,omitempty"`
+	TerminationNote *string  `json:"termination_note,omitempty"`
 }
 
 // EmployeeContractResponse represents the API response for an employee contract

@@ -54,28 +54,28 @@ type QuotationItem struct {
 
 // CreateQuotationInput represents input for creating a quotation
 type CreateQuotationInput struct {
-	CustomerID      string              `json:"customer_id,omitempty"`
-	CustomerName    string              `json:"customer_name"`
-	ContactPerson   string              `json:"contact_person,omitempty"`
-	Email           string              `json:"email,omitempty"`
-	ValidUntil      string              `json:"valid_until,omitempty"`
-	DiscountPercent float64             `json:"discount_percent"`
-	TaxPercent      float64             `json:"tax_percent"`
-	Notes           string              `json:"notes,omitempty"`
+	CustomerID      string               `json:"customer_id,omitempty"`
+	CustomerName    string               `json:"customer_name"`
+	ContactPerson   string               `json:"contact_person,omitempty"`
+	Email           string               `json:"email,omitempty"`
+	ValidUntil      string               `json:"valid_until,omitempty"`
+	DiscountPercent float64              `json:"discount_percent"`
+	TaxPercent      float64              `json:"tax_percent"`
+	Notes           string               `json:"notes,omitempty"`
 	Items           []QuotationItemInput `json:"items"`
 }
 
 // UpdateQuotationInput represents input for updating a quotation
 type UpdateQuotationInput struct {
-	CustomerID      *string              `json:"customer_id,omitempty"`
-	CustomerName    *string              `json:"customer_name,omitempty"`
-	ContactPerson   *string              `json:"contact_person,omitempty"`
-	Email           *string              `json:"email,omitempty"`
-	ValidUntil      *string              `json:"valid_until,omitempty"`
-	DiscountPercent *float64             `json:"discount_percent,omitempty"`
-	TaxPercent      *float64             `json:"tax_percent,omitempty"`
-	Status          *string              `json:"status,omitempty"`
-	Notes           *string              `json:"notes,omitempty"`
+	CustomerID      *string               `json:"customer_id,omitempty"`
+	CustomerName    *string               `json:"customer_name,omitempty"`
+	ContactPerson   *string               `json:"contact_person,omitempty"`
+	Email           *string               `json:"email,omitempty"`
+	ValidUntil      *string               `json:"valid_until,omitempty"`
+	DiscountPercent *float64              `json:"discount_percent,omitempty"`
+	TaxPercent      *float64              `json:"tax_percent,omitempty"`
+	Status          *string               `json:"status,omitempty"`
+	Notes           *string               `json:"notes,omitempty"`
 	Items           *[]QuotationItemInput `json:"items,omitempty"`
 }
 
@@ -89,25 +89,25 @@ type QuotationItemInput struct {
 
 // QuotationResponse represents the API response for a quotation
 type QuotationResponse struct {
-	ID              uuid.UUID              `json:"id"`
-	QuotationNumber string                 `json:"quotation_number"`
-	CustomerID      string                 `json:"customer_id,omitempty"`
-	CustomerName    string                 `json:"customer_name"`
-	ContactPerson   string                 `json:"contact_person,omitempty"`
-	Email           string                 `json:"email,omitempty"`
-	ValidUntil      string                 `json:"valid_until,omitempty"`
-	Subtotal        float64                `json:"subtotal"`
-	DiscountPercent float64                `json:"discount_percent"`
-	DiscountAmount  float64                `json:"discount_amount"`
-	TaxPercent      float64                `json:"tax_percent"`
-	TaxAmount       float64                `json:"tax_amount"`
-	TotalAmount     float64                `json:"total_amount"`
-	Status          string                 `json:"status"`
-	ConvertedToOrder string                `json:"converted_to_order,omitempty"`
-	Notes           string                 `json:"notes,omitempty"`
-	Items           []QuotationItemResponse `json:"items"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
+	ID               uuid.UUID               `json:"id"`
+	QuotationNumber  string                  `json:"quotation_number"`
+	CustomerID       string                  `json:"customer_id,omitempty"`
+	CustomerName     string                  `json:"customer_name"`
+	ContactPerson    string                  `json:"contact_person,omitempty"`
+	Email            string                  `json:"email,omitempty"`
+	ValidUntil       string                  `json:"valid_until,omitempty"`
+	Subtotal         float64                 `json:"subtotal"`
+	DiscountPercent  float64                 `json:"discount_percent"`
+	DiscountAmount   float64                 `json:"discount_amount"`
+	TaxPercent       float64                 `json:"tax_percent"`
+	TaxAmount        float64                 `json:"tax_amount"`
+	TotalAmount      float64                 `json:"total_amount"`
+	Status           string                  `json:"status"`
+	ConvertedToOrder string                  `json:"converted_to_order,omitempty"`
+	Notes            string                  `json:"notes,omitempty"`
+	Items            []QuotationItemResponse `json:"items"`
+	CreatedAt        time.Time               `json:"created_at"`
+	UpdatedAt        time.Time               `json:"updated_at"`
 }
 
 // QuotationItemResponse represents the API response for a quotation item

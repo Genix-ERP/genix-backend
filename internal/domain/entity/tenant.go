@@ -30,11 +30,11 @@ type Tenant struct {
 // TenantSettings represents tenant configuration
 type TenantSettings struct {
 	Locale struct {
-		Language      string `json:"language"`
-		Timezone      string `json:"timezone"`
-		DateFormat    string `json:"date_format"`
-		TimeFormat    string `json:"time_format"`
-		NumberFormat  string `json:"number_format"`
+		Language        string `json:"language"`
+		Timezone        string `json:"timezone"`
+		DateFormat      string `json:"date_format"`
+		TimeFormat      string `json:"time_format"`
+		NumberFormat    string `json:"number_format"`
 		DefaultCurrency string `json:"default_currency"`
 	} `json:"locale"`
 	Branding struct {
@@ -44,13 +44,13 @@ type TenantSettings struct {
 		FaviconURL     string `json:"favicon_url"`
 	} `json:"branding"`
 	Security struct {
-		PasswordMinLength       int  `json:"password_min_length"`
+		PasswordMinLength        int  `json:"password_min_length"`
 		PasswordRequireUppercase bool `json:"password_require_uppercase"`
 		PasswordRequireNumbers   bool `json:"password_require_numbers"`
 		PasswordRequireSpecial   bool `json:"password_require_special"`
-		SessionTimeout          int  `json:"session_timeout"`
-		MaxLoginAttempts        int  `json:"max_login_attempts"`
-		TwoFactorRequired       bool `json:"two_factor_required"`
+		SessionTimeout           int  `json:"session_timeout"`
+		MaxLoginAttempts         int  `json:"max_login_attempts"`
+		TwoFactorRequired        bool `json:"two_factor_required"`
 	} `json:"security"`
 	Notifications struct {
 		EmailEnabled bool `json:"email_enabled"`
@@ -58,13 +58,13 @@ type TenantSettings struct {
 		PushEnabled  bool `json:"push_enabled"`
 	} `json:"notifications"`
 	Modules struct {
-		Finance    bool `json:"finance"`
-		Inventory  bool `json:"inventory"`
-		Sales      bool `json:"sales"`
-		Purchase   bool `json:"purchase"`
-		HR         bool `json:"hr"`
-		CRM        bool `json:"crm"`
-		AI         bool `json:"ai"`
+		Finance   bool `json:"finance"`
+		Inventory bool `json:"inventory"`
+		Sales     bool `json:"sales"`
+		Purchase  bool `json:"purchase"`
+		HR        bool `json:"hr"`
+		CRM       bool `json:"crm"`
+		AI        bool `json:"ai"`
 	} `json:"modules"`
 }
 
@@ -72,10 +72,10 @@ type TenantSettings struct {
 type SubscriptionPlan string
 
 const (
-	PlanFree       SubscriptionPlan = "free"
-	PlanStarter    SubscriptionPlan = "starter"
+	PlanFree         SubscriptionPlan = "free"
+	PlanStarter      SubscriptionPlan = "starter"
 	PlanProfessional SubscriptionPlan = "professional"
-	PlanEnterprise SubscriptionPlan = "enterprise"
+	PlanEnterprise   SubscriptionPlan = "enterprise"
 )
 
 // SubscriptionStatus represents subscription statuses
@@ -103,15 +103,15 @@ type CreateTenantInput struct {
 
 // UpdateTenantInput represents input for updating a tenant
 type UpdateTenantInput struct {
-	Name             *string                 `json:"name,omitempty"`
-	Domain           *string                 `json:"domain,omitempty"`
-	LogoURL          *string                 `json:"logo_url,omitempty"`
-	Settings         map[string]interface{}  `json:"settings,omitempty"`
-	SubscriptionPlan *SubscriptionPlan       `json:"subscription_plan,omitempty"`
-	MaxUsers         *int                    `json:"max_users,omitempty"`
-	MaxStorageGB     *int                    `json:"max_storage_gb,omitempty"`
-	Features         []string                `json:"features,omitempty"`
-	IsActive         *bool                   `json:"is_active,omitempty"`
+	Name             *string                `json:"name,omitempty"`
+	Domain           *string                `json:"domain,omitempty"`
+	LogoURL          *string                `json:"logo_url,omitempty"`
+	Settings         map[string]interface{} `json:"settings,omitempty"`
+	SubscriptionPlan *SubscriptionPlan      `json:"subscription_plan,omitempty"`
+	MaxUsers         *int                   `json:"max_users,omitempty"`
+	MaxStorageGB     *int                   `json:"max_storage_gb,omitempty"`
+	Features         []string               `json:"features,omitempty"`
+	IsActive         *bool                  `json:"is_active,omitempty"`
 }
 
 // TenantStats represents tenant statistics

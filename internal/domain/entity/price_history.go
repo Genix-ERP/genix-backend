@@ -49,28 +49,28 @@ type PriceHistoryListFilter struct {
 
 // PriceHistoryResponse represents the API response for price history
 type PriceHistoryResponse struct {
-	ID            uuid.UUID  `json:"id"`
-	ProductID     uuid.UUID  `json:"product_id"`
-	ProductName   string     `json:"product_name"`
-	VendorID      uuid.UUID  `json:"vendor_id"`
-	VendorName    string     `json:"vendor_name"`
-	UnitPrice     float64    `json:"unit_price"`
-	Currency      string     `json:"currency"`
-	EffectiveDate time.Time  `json:"effective_date"`
-	MinQuantity   float64    `json:"min_quantity"`
-	Notes         *string    `json:"notes,omitempty"`
-	Source        *string    `json:"source,omitempty"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID            uuid.UUID `json:"id"`
+	ProductID     uuid.UUID `json:"product_id"`
+	ProductName   string    `json:"product_name"`
+	VendorID      uuid.UUID `json:"vendor_id"`
+	VendorName    string    `json:"vendor_name"`
+	UnitPrice     float64   `json:"unit_price"`
+	Currency      string    `json:"currency"`
+	EffectiveDate time.Time `json:"effective_date"`
+	MinQuantity   float64   `json:"min_quantity"`
+	Notes         *string   `json:"notes,omitempty"`
+	Source        *string   `json:"source,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
 }
 
 // PriceHistoryGroupedResponse represents price history grouped by product and supplier
 type PriceHistoryGroupedResponse struct {
-	ID           string                `json:"id"`
-	ProductID    uuid.UUID             `json:"product_id"`
-	ProductName  string                `json:"product_name"`
-	SupplierID   uuid.UUID             `json:"supplier_id"`
-	SupplierName string                `json:"supplier_name"`
-	Prices       []PriceHistoryEntry   `json:"prices"`
+	ID           string              `json:"id"`
+	ProductID    uuid.UUID           `json:"product_id"`
+	ProductName  string              `json:"product_name"`
+	SupplierID   uuid.UUID           `json:"supplier_id"`
+	SupplierName string              `json:"supplier_name"`
+	Prices       []PriceHistoryEntry `json:"prices"`
 }
 
 // PriceHistoryEntry represents a single price entry with date

@@ -119,35 +119,35 @@ type CustomerPricelist struct {
 
 // CreatePricelistInput represents input for creating a pricelist
 type CreatePricelistInput struct {
-	Name         string              `json:"name" binding:"required"`
-	Code         string              `json:"code,omitempty"`
-	Description  string              `json:"description,omitempty"`
-	CurrencyID   string              `json:"currency_id,omitempty"`
-	Type         string              `json:"pricelist_type,omitempty"`
-	StartDate    string              `json:"start_date,omitempty"`
-	EndDate      string              `json:"end_date,omitempty"`
-	Priority     int                 `json:"priority,omitempty"`
-	ShowDiscount *bool               `json:"show_discount,omitempty"`
-	CountryCodes []string            `json:"country_codes,omitempty"`
-	IsActive     *bool               `json:"is_active,omitempty"`
-	IsDefault    bool                `json:"is_default,omitempty"`
+	Name         string               `json:"name" binding:"required"`
+	Code         string               `json:"code,omitempty"`
+	Description  string               `json:"description,omitempty"`
+	CurrencyID   string               `json:"currency_id,omitempty"`
+	Type         string               `json:"pricelist_type,omitempty"`
+	StartDate    string               `json:"start_date,omitempty"`
+	EndDate      string               `json:"end_date,omitempty"`
+	Priority     int                  `json:"priority,omitempty"`
+	ShowDiscount *bool                `json:"show_discount,omitempty"`
+	CountryCodes []string             `json:"country_codes,omitempty"`
+	IsActive     *bool                `json:"is_active,omitempty"`
+	IsDefault    bool                 `json:"is_default,omitempty"`
 	Items        []PricelistItemInput `json:"items,omitempty"`
 }
 
 // UpdatePricelistInput represents input for updating a pricelist
 type UpdatePricelistInput struct {
-	Name         *string             `json:"name,omitempty"`
-	Code         *string             `json:"code,omitempty"`
-	Description  *string             `json:"description,omitempty"`
-	CurrencyID   *string             `json:"currency_id,omitempty"`
-	Type         *string             `json:"pricelist_type,omitempty"`
-	StartDate    *string             `json:"start_date,omitempty"`
-	EndDate      *string             `json:"end_date,omitempty"`
-	Priority     *int                `json:"priority,omitempty"`
-	ShowDiscount *bool               `json:"show_discount,omitempty"`
-	CountryCodes []string            `json:"country_codes,omitempty"`
-	IsActive     *bool               `json:"is_active,omitempty"`
-	IsDefault    *bool               `json:"is_default,omitempty"`
+	Name         *string              `json:"name,omitempty"`
+	Code         *string              `json:"code,omitempty"`
+	Description  *string              `json:"description,omitempty"`
+	CurrencyID   *string              `json:"currency_id,omitempty"`
+	Type         *string              `json:"pricelist_type,omitempty"`
+	StartDate    *string              `json:"start_date,omitempty"`
+	EndDate      *string              `json:"end_date,omitempty"`
+	Priority     *int                 `json:"priority,omitempty"`
+	ShowDiscount *bool                `json:"show_discount,omitempty"`
+	CountryCodes []string             `json:"country_codes,omitempty"`
+	IsActive     *bool                `json:"is_active,omitempty"`
+	IsDefault    *bool                `json:"is_default,omitempty"`
 	Items        []PricelistItemInput `json:"items,omitempty"`
 }
 

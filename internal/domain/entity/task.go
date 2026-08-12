@@ -127,18 +127,18 @@ type UpdateTaskInput struct {
 
 // TaskListFilter represents filters for listing tasks
 type TaskListFilter struct {
-	Search        string `form:"search"`
-	TaskType      string `form:"task_type"`
-	Status        string `form:"status"`
-	Priority      string `form:"priority"`
-	LeadID        string `form:"lead_id"`
-	ContactID     string `form:"contact_id"`
-	OpportunityID string `form:"opportunity_id"`
-	AssignedTo    string `form:"assigned_to"`
-	DueDateFrom   string `form:"due_date_from"`
-	DueDateTo     string `form:"due_date_to"`
-	IncludeCompleted bool `form:"include_completed"`
-	OverdueOnly   bool   `form:"overdue_only"`
+	Search           string `form:"search"`
+	TaskType         string `form:"task_type"`
+	Status           string `form:"status"`
+	Priority         string `form:"priority"`
+	LeadID           string `form:"lead_id"`
+	ContactID        string `form:"contact_id"`
+	OpportunityID    string `form:"opportunity_id"`
+	AssignedTo       string `form:"assigned_to"`
+	DueDateFrom      string `form:"due_date_from"`
+	DueDateTo        string `form:"due_date_to"`
+	IncludeCompleted bool   `form:"include_completed"`
+	OverdueOnly      bool   `form:"overdue_only"`
 }
 
 // TaskResponse represents the API response for a task

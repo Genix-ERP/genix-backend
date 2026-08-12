@@ -38,34 +38,34 @@ type PayrollEntry struct {
 	EmployeeID      uuid.UUID `json:"employee_id" db:"employee_id"`
 	EmployeeName    string    `json:"employee_name" db:"employee_name"`
 	// TT §2.1 immutability: job title snapshot at entry-creation time
-	PositionSnapshot string `json:"position_snapshot" db:"position_snapshot"`
-	BaseSalary      float64   `json:"base_salary" db:"base_salary"`
-	OvertimeHours   float64   `json:"overtime_hours" db:"overtime_hours"`
-	OvertimeAmount  float64   `json:"overtime_amount" db:"overtime_amount"`
-	Bonus           float64   `json:"bonus" db:"bonus"`
-	Allowances      float64   `json:"allowances" db:"allowances"`
-	GrossSalary     float64   `json:"gross_salary" db:"gross_salary"`
-	IncomeTax       float64   `json:"income_tax" db:"income_tax"`
-	SocialSecurity  float64   `json:"social_security" db:"social_security"`
-	Pension         float64   `json:"pension" db:"pension"`
-	OtherDeductions float64   `json:"other_deductions" db:"other_deductions"`
-	TotalDeductions float64   `json:"total_deductions" db:"total_deductions"`
-	NetSalary       float64   `json:"net_salary" db:"net_salary"`
+	PositionSnapshot string  `json:"position_snapshot" db:"position_snapshot"`
+	BaseSalary       float64 `json:"base_salary" db:"base_salary"`
+	OvertimeHours    float64 `json:"overtime_hours" db:"overtime_hours"`
+	OvertimeAmount   float64 `json:"overtime_amount" db:"overtime_amount"`
+	Bonus            float64 `json:"bonus" db:"bonus"`
+	Allowances       float64 `json:"allowances" db:"allowances"`
+	GrossSalary      float64 `json:"gross_salary" db:"gross_salary"`
+	IncomeTax        float64 `json:"income_tax" db:"income_tax"`
+	SocialSecurity   float64 `json:"social_security" db:"social_security"`
+	Pension          float64 `json:"pension" db:"pension"`
+	OtherDeductions  float64 `json:"other_deductions" db:"other_deductions"`
+	TotalDeductions  float64 `json:"total_deductions" db:"total_deductions"`
+	NetSalary        float64 `json:"net_salary" db:"net_salary"`
 	// TT §2.3.2 / §2.4: simple advance + remainder model with day-of-month tracking.
 	// Coexists with the richer gross/tax/net fields above.
-	AdvanceAmount      float64 `json:"advance_amount" db:"advance_amount"`
-	RemainderAmount    float64 `json:"remainder_amount" db:"remainder_amount"`
-	AdvancePaid        bool    `json:"advance_paid" db:"advance_paid"`
-	AdvancePaidDay     *int    `json:"advance_paid_day,omitempty" db:"advance_paid_day"`
-	RemainderPaid      bool    `json:"remainder_paid" db:"remainder_paid"`
-	RemainderPaidDay   *int    `json:"remainder_paid_day,omitempty" db:"remainder_paid_day"`
-	AdvancePercentUsed float64 `json:"advance_percent_used" db:"advance_percent_used"`
-	PaymentMethod   string    `json:"payment_method" db:"payment_method"`
-	BankAccount     *string   `json:"bank_account,omitempty" db:"bank_account"`
-	Status          string    `json:"status" db:"status"`
-	Notes           *string   `json:"notes,omitempty" db:"notes"`
-	CreatedAt       time.Time `json:"created_at" db:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at" db:"updated_at"`
+	AdvanceAmount      float64   `json:"advance_amount" db:"advance_amount"`
+	RemainderAmount    float64   `json:"remainder_amount" db:"remainder_amount"`
+	AdvancePaid        bool      `json:"advance_paid" db:"advance_paid"`
+	AdvancePaidDay     *int      `json:"advance_paid_day,omitempty" db:"advance_paid_day"`
+	RemainderPaid      bool      `json:"remainder_paid" db:"remainder_paid"`
+	RemainderPaidDay   *int      `json:"remainder_paid_day,omitempty" db:"remainder_paid_day"`
+	AdvancePercentUsed float64   `json:"advance_percent_used" db:"advance_percent_used"`
+	PaymentMethod      string    `json:"payment_method" db:"payment_method"`
+	BankAccount        *string   `json:"bank_account,omitempty" db:"bank_account"`
+	Status             string    `json:"status" db:"status"`
+	Notes              *string   `json:"notes,omitempty" db:"notes"`
+	CreatedAt          time.Time `json:"created_at" db:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at" db:"updated_at"`
 }
 
 // PayrollSettings — TT §2.2 global payroll configuration.
@@ -235,18 +235,18 @@ type PayrollEntryResponse struct {
 	TotalDeductions  float64   `json:"total_deductions"`
 	NetSalary        float64   `json:"net_salary"`
 	// TT advance/remainder + day-of-month tracking
-	AdvanceAmount      float64 `json:"advance_amount"`
-	RemainderAmount    float64 `json:"remainder_amount"`
-	AdvancePaid        bool    `json:"advance_paid"`
-	AdvancePaidDay     *int    `json:"advance_paid_day,omitempty"`
-	RemainderPaid      bool    `json:"remainder_paid"`
-	RemainderPaidDay   *int    `json:"remainder_paid_day,omitempty"`
-	AdvancePercentUsed float64 `json:"advance_percent_used"`
-	PaymentMethod    string    `json:"payment_method"`
-	BankAccount      string    `json:"bank_account,omitempty"`
-	Status           string    `json:"status"`
-	Notes            string    `json:"notes,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	AdvanceAmount      float64   `json:"advance_amount"`
+	RemainderAmount    float64   `json:"remainder_amount"`
+	AdvancePaid        bool      `json:"advance_paid"`
+	AdvancePaidDay     *int      `json:"advance_paid_day,omitempty"`
+	RemainderPaid      bool      `json:"remainder_paid"`
+	RemainderPaidDay   *int      `json:"remainder_paid_day,omitempty"`
+	AdvancePercentUsed float64   `json:"advance_percent_used"`
+	PaymentMethod      string    `json:"payment_method"`
+	BankAccount        string    `json:"bank_account,omitempty"`
+	Status             string    `json:"status"`
+	Notes              string    `json:"notes,omitempty"`
+	CreatedAt          time.Time `json:"created_at"`
 }
 
 // ToResponse converts PayrollEntry to PayrollEntryResponse

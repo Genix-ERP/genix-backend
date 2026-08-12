@@ -9,31 +9,31 @@ import (
 
 // LeaveRequest represents an employee leave request
 type LeaveRequest struct {
-	ID             uuid.UUID    `json:"id" db:"id"`
-	TenantID       uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	EmployeeID     uuid.UUID    `json:"employee_id" db:"employee_id"`
-	EmployeeName   *string      `json:"employee_name,omitempty" db:"employee_name"`
-	LeaveType      string       `json:"leave_type" db:"leave_type"` // annual, sick, personal, unpaid, etc.
-	StartDate      time.Time    `json:"start_date" db:"start_date"`
-	EndDate        time.Time    `json:"end_date" db:"end_date"`
-	Days           float64      `json:"days" db:"days"` // Can be 0.5 for half day
-	Reason         string       `json:"reason" db:"reason"`
-	Status         string       `json:"status" db:"status"` // pending, approved, rejected
-	HalfDay        bool         `json:"half_day" db:"half_day"`
-	HalfDayPeriod  *string      `json:"half_day_period,omitempty" db:"half_day_period"` // morning, afternoon
-	ApprovedBy     *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
-	ApprovedAt     *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
-	RejectionNote  *string      `json:"rejection_note,omitempty" db:"rejection_note"`
-	CreatedAt      time.Time    `json:"created_at" db:"created_at"`
-	UpdatedAt      time.Time    `json:"updated_at" db:"updated_at"`
-	DeletedAt      sql.NullTime `json:"-" db:"deleted_at"`
+	ID            uuid.UUID    `json:"id" db:"id"`
+	TenantID      uuid.UUID    `json:"tenant_id" db:"tenant_id"`
+	EmployeeID    uuid.UUID    `json:"employee_id" db:"employee_id"`
+	EmployeeName  *string      `json:"employee_name,omitempty" db:"employee_name"`
+	LeaveType     string       `json:"leave_type" db:"leave_type"` // annual, sick, personal, unpaid, etc.
+	StartDate     time.Time    `json:"start_date" db:"start_date"`
+	EndDate       time.Time    `json:"end_date" db:"end_date"`
+	Days          float64      `json:"days" db:"days"` // Can be 0.5 for half day
+	Reason        string       `json:"reason" db:"reason"`
+	Status        string       `json:"status" db:"status"` // pending, approved, rejected
+	HalfDay       bool         `json:"half_day" db:"half_day"`
+	HalfDayPeriod *string      `json:"half_day_period,omitempty" db:"half_day_period"` // morning, afternoon
+	ApprovedBy    *uuid.UUID   `json:"approved_by,omitempty" db:"approved_by"`
+	ApprovedAt    *time.Time   `json:"approved_at,omitempty" db:"approved_at"`
+	RejectionNote *string      `json:"rejection_note,omitempty" db:"rejection_note"`
+	CreatedAt     time.Time    `json:"created_at" db:"created_at"`
+	UpdatedAt     time.Time    `json:"updated_at" db:"updated_at"`
+	DeletedAt     sql.NullTime `json:"-" db:"deleted_at"`
 }
 
 // LeaveBalance represents an employee's leave balance
 type LeaveBalance struct {
-	ID         uuid.UUID    `json:"id" db:"id"`
-	TenantID   uuid.UUID    `json:"tenant_id" db:"tenant_id"`
-	EmployeeID uuid.UUID    `json:"employee_id" db:"employee_id"`
+	ID         uuid.UUID `json:"id" db:"id"`
+	TenantID   uuid.UUID `json:"tenant_id" db:"tenant_id"`
+	EmployeeID uuid.UUID `json:"employee_id" db:"employee_id"`
 
 	// Annual leave
 	AnnualTotal     float64 `json:"annual_total" db:"annual_total"`
@@ -77,24 +77,24 @@ type CreateLeaveRequestInput struct {
 
 // UpdateLeaveRequestInput represents input for updating a leave request
 type UpdateLeaveRequestInput struct {
-	LeaveType      *string  `json:"leave_type,omitempty"`
-	StartDate      *string  `json:"start_date,omitempty"`
-	EndDate        *string  `json:"end_date,omitempty"`
-	Days           *float64 `json:"days,omitempty"`
-	Reason         *string  `json:"reason,omitempty"`
-	Status         *string  `json:"status,omitempty"`
-	HalfDay        *bool    `json:"half_day,omitempty"`
-	HalfDayPeriod  *string  `json:"half_day_period,omitempty"`
-	RejectionNote  *string  `json:"rejection_note,omitempty"`
+	LeaveType     *string  `json:"leave_type,omitempty"`
+	StartDate     *string  `json:"start_date,omitempty"`
+	EndDate       *string  `json:"end_date,omitempty"`
+	Days          *float64 `json:"days,omitempty"`
+	Reason        *string  `json:"reason,omitempty"`
+	Status        *string  `json:"status,omitempty"`
+	HalfDay       *bool    `json:"half_day,omitempty"`
+	HalfDayPeriod *string  `json:"half_day_period,omitempty"`
+	RejectionNote *string  `json:"rejection_note,omitempty"`
 }
 
 // CreateLeaveBalanceInput represents input for creating a leave balance
 type CreateLeaveBalanceInput struct {
-	EmployeeID      string  `json:"employee_id" binding:"required"`
-	AnnualTotal     float64 `json:"annual_total"`
-	SickTotal       float64 `json:"sick_total"`
-	PersonalTotal   float64 `json:"personal_total"`
-	Year            int     `json:"year"`
+	EmployeeID    string  `json:"employee_id" binding:"required"`
+	AnnualTotal   float64 `json:"annual_total"`
+	SickTotal     float64 `json:"sick_total"`
+	PersonalTotal float64 `json:"personal_total"`
+	Year          int     `json:"year"`
 }
 
 // UpdateLeaveBalanceInput represents input for updating a leave balance
@@ -116,35 +116,35 @@ type UpdateLeaveBalanceInput struct {
 
 // LeaveRequestResponse represents the API response for a leave request
 type LeaveRequestResponse struct {
-	ID             string  `json:"id"`
-	EmployeeID     string  `json:"employee_id"`
-	EmployeeName   *string `json:"employee_name,omitempty"`
-	LeaveType      string  `json:"leave_type"`
-	StartDate      string  `json:"start_date"`
-	EndDate        string  `json:"end_date"`
-	Days           float64 `json:"days"`
-	Reason         string  `json:"reason"`
-	Status         string  `json:"status"`
-	HalfDay        bool    `json:"half_day"`
-	HalfDayPeriod  *string `json:"half_day_period,omitempty"`
-	ApprovedBy     *string `json:"approved_by,omitempty"`
-	ApprovedAt     *string `json:"approved_at,omitempty"`
-	RejectionNote  *string `json:"rejection_note,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
+	ID            string  `json:"id"`
+	EmployeeID    string  `json:"employee_id"`
+	EmployeeName  *string `json:"employee_name,omitempty"`
+	LeaveType     string  `json:"leave_type"`
+	StartDate     string  `json:"start_date"`
+	EndDate       string  `json:"end_date"`
+	Days          float64 `json:"days"`
+	Reason        string  `json:"reason"`
+	Status        string  `json:"status"`
+	HalfDay       bool    `json:"half_day"`
+	HalfDayPeriod *string `json:"half_day_period,omitempty"`
+	ApprovedBy    *string `json:"approved_by,omitempty"`
+	ApprovedAt    *string `json:"approved_at,omitempty"`
+	RejectionNote *string `json:"rejection_note,omitempty"`
+	CreatedAt     string  `json:"created_at"`
+	UpdatedAt     string  `json:"updated_at"`
 }
 
 // LeaveBalanceResponse represents the API response for leave balance
 type LeaveBalanceResponse struct {
-	ID                string                        `json:"id"`
-	EmployeeID        string                        `json:"employee_id"`
-	Annual            LeaveBalanceTypeResponse      `json:"annual"`
-	Sick              LeaveBalanceTypeResponse      `json:"sick"`
-	Personal          LeaveBalanceTypeResponse      `json:"personal"`
-	UnpaidUsed        float64                       `json:"unpaid_used"`
-	Year              int                           `json:"year"`
-	CreatedAt         string                        `json:"created_at"`
-	UpdatedAt         string                        `json:"updated_at"`
+	ID         string                   `json:"id"`
+	EmployeeID string                   `json:"employee_id"`
+	Annual     LeaveBalanceTypeResponse `json:"annual"`
+	Sick       LeaveBalanceTypeResponse `json:"sick"`
+	Personal   LeaveBalanceTypeResponse `json:"personal"`
+	UnpaidUsed float64                  `json:"unpaid_used"`
+	Year       int                      `json:"year"`
+	CreatedAt  string                   `json:"created_at"`
+	UpdatedAt  string                   `json:"updated_at"`
 }
 
 // LeaveBalanceTypeResponse represents balance for a specific leave type

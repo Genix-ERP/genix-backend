@@ -1745,7 +1745,7 @@ func (h *Handler) createIntercompanyContacts(tenantID, newOrgID uuid.UUID, newOr
 
 // ImportOrganizationsInput represents the input for bulk importing organizations
 type ImportOrganizationsInput struct {
-	Organizations []CreateOrganizationInput `json:"organizations" binding:"required"`
+	Organizations []CreateOrganizationInput `json:"organizations" binding:"required,dive"`
 }
 
 // ImportOrganizations bulk imports organizations from JSON

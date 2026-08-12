@@ -29,10 +29,10 @@ type NotificationResponse struct {
 }
 
 const (
-	NotifNewBid           = "new_bid"
-	NotifBidAccepted      = "bid_accepted"
-	NotifBidRejected      = "bid_rejected"
-	NotifTenderDeadline   = "tender_deadline"
-	NotifNewTender        = "new_tender"
-	NotifTenderCompleted  = "tender_completed"
+	NotifNewBid          = "new_bid"
+	NotifBidAccepted     = "bid_accepted"
+	NotifBidRejected     = "bid_rejected"
+	NotifTenderDeadline  = "tender_deadline"
+	NotifNewTender       = "new_tender"
+	NotifTenderCompleted = "tender_completed"
 )

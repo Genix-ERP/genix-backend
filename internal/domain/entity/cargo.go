@@ -90,13 +90,13 @@ type CargoDistribution struct {
 
 // CargoDistributionItem represents an item in a distribution
 type CargoDistributionItem struct {
-	ID              int64     `json:"id" db:"id"`
-	DistributionID  int64     `json:"distribution_id" db:"distribution_id"`
-	ShipmentItemID  int64     `json:"shipment_item_id" db:"shipment_item_id"`
-	Quantity        float64   `json:"quantity" db:"quantity"`
-	UnitCost        float64   `json:"unit_cost" db:"unit_cost"`
-	TotalCost       float64   `json:"total_cost" db:"total_cost"`
-	CreatedDate     time.Time `json:"created_date" db:"created_date"`
+	ID             int64     `json:"id" db:"id"`
+	DistributionID int64     `json:"distribution_id" db:"distribution_id"`
+	ShipmentItemID int64     `json:"shipment_item_id" db:"shipment_item_id"`
+	Quantity       float64   `json:"quantity" db:"quantity"`
+	UnitCost       float64   `json:"unit_cost" db:"unit_cost"`
+	TotalCost      float64   `json:"total_cost" db:"total_cost"`
+	CreatedDate    time.Time `json:"created_date" db:"created_date"`
 }
 
 // =====================================================
@@ -105,35 +105,35 @@ type CargoDistributionItem struct {
 
 // CargoCashTransaction represents a cash transaction
 type CargoCashTransaction struct {
-	ID               int64          `json:"id" db:"id"`
-	TenantID         uuid.UUID      `json:"tenant_id" db:"tenant_id"`
-	TransactionType  string         `json:"transaction_type" db:"transaction_type"` // income, expense
-	Amount           float64        `json:"amount" db:"amount"`
-	Currency         string         `json:"currency" db:"currency"` // USD, UZS, EUR
-	Category         string         `json:"category" db:"category"`  // transport, customs, insurance, payment_from_b2b, etc.
-	ShipmentID       sql.NullInt64  `json:"shipment_id" db:"shipment_id"`
-	DistributionID   sql.NullInt64  `json:"distribution_id" db:"distribution_id"`
-	RelatedTenantID  uuid.NullUUID  `json:"related_tenant_id" db:"related_tenant_id"`
-	Description      sql.NullString `json:"description" db:"description"`
-	ReferenceNumber  sql.NullString `json:"reference_number" db:"reference_number"`
-	TransactionDate  time.Time      `json:"transaction_date" db:"transaction_date"`
-	CreatedBy        uuid.NullUUID  `json:"created_by" db:"created_by"`
-	CreatedDate      time.Time      `json:"created_date" db:"created_date"`
+	ID              int64          `json:"id" db:"id"`
+	TenantID        uuid.UUID      `json:"tenant_id" db:"tenant_id"`
+	TransactionType string         `json:"transaction_type" db:"transaction_type"` // income, expense
+	Amount          float64        `json:"amount" db:"amount"`
+	Currency        string         `json:"currency" db:"currency"` // USD, UZS, EUR
+	Category        string         `json:"category" db:"category"` // transport, customs, insurance, payment_from_b2b, etc.
+	ShipmentID      sql.NullInt64  `json:"shipment_id" db:"shipment_id"`
+	DistributionID  sql.NullInt64  `json:"distribution_id" db:"distribution_id"`
+	RelatedTenantID uuid.NullUUID  `json:"related_tenant_id" db:"related_tenant_id"`
+	Description     sql.NullString `json:"description" db:"description"`
+	ReferenceNumber sql.NullString `json:"reference_number" db:"reference_number"`
+	TransactionDate time.Time      `json:"transaction_date" db:"transaction_date"`
+	CreatedBy       uuid.NullUUID  `json:"created_by" db:"created_by"`
+	CreatedDate     time.Time      `json:"created_date" db:"created_date"`
 }
 
 // CargoCompanyAccount represents B2B/B2C company account balances
 type CargoCompanyAccount struct {
-	ID                  int64          `json:"id" db:"id"`
-	CargoCompanyID      int64          `json:"cargo_company_id" db:"cargo_company_id"`
-	RelatedCompanyID    int64          `json:"related_company_id" db:"related_company_id"`
-	CompanyType         string         `json:"company_type" db:"company_type"` // B2B, B2C
-	TotalDebt           float64        `json:"total_debt" db:"total_debt"`
-	TotalCredit         float64        `json:"total_credit" db:"total_credit"`
-	Balance             float64        `json:"balance" db:"balance"`
-	Currency            string         `json:"currency" db:"currency"`
-	LastTransactionDate sql.NullTime   `json:"last_transaction_date" db:"last_transaction_date"`
-	CreatedDate         time.Time      `json:"created_date" db:"created_date"`
-	UpdatedDate         time.Time      `json:"updated_date" db:"updated_date"`
+	ID                  int64        `json:"id" db:"id"`
+	CargoCompanyID      int64        `json:"cargo_company_id" db:"cargo_company_id"`
+	RelatedCompanyID    int64        `json:"related_company_id" db:"related_company_id"`
+	CompanyType         string       `json:"company_type" db:"company_type"` // B2B, B2C
+	TotalDebt           float64      `json:"total_debt" db:"total_debt"`
+	TotalCredit         float64      `json:"total_credit" db:"total_credit"`
+	Balance             float64      `json:"balance" db:"balance"`
+	Currency            string       `json:"currency" db:"currency"`
+	LastTransactionDate sql.NullTime `json:"last_transaction_date" db:"last_transaction_date"`
+	CreatedDate         time.Time    `json:"created_date" db:"created_date"`
+	UpdatedDate         time.Time    `json:"updated_date" db:"updated_date"`
 }
 
 // =====================================================
@@ -142,15 +142,15 @@ type CargoCompanyAccount struct {
 
 // CreateCargoShipmentRequest represents request to create a shipment
 type CreateCargoShipmentRequest struct {
-	TrackingNumber  string                      `json:"tracking_number"`
-	SupplierCountry string                      `json:"supplier_country"`
-	SupplierCompany string                      `json:"supplier_company"`
-	ExpectedDate    *time.Time                  `json:"expected_date"`
-	TransportCost   float64                     `json:"transport_cost"`
-	CustomsCost     float64                     `json:"customs_cost"`
-	InsuranceCost   float64                     `json:"insurance_cost"`
-	OtherCost       float64                     `json:"other_cost"`
-	Notes           string                      `json:"notes"`
+	TrackingNumber  string     `json:"tracking_number"`
+	SupplierCountry string     `json:"supplier_country"`
+	SupplierCompany string     `json:"supplier_company"`
+	ExpectedDate    *time.Time `json:"expected_date"`
+	TransportCost   float64    `json:"transport_cost"`
+	CustomsCost     float64    `json:"customs_cost"`
+	InsuranceCost   float64    `json:"insurance_cost"`
+	OtherCost       float64    `json:"other_cost"`
+	Notes           string     `json:"notes"`
 	// `dive` matters: without it the validator never enters the slice, so the
 	// per-item `required` tags below were decorative — a shipment whose items
 	// carried no name and no price was accepted and stored as zeros, which is
@@ -183,7 +183,7 @@ type CreateDistributionRequest struct {
 	InvoiceNumber        string                          `json:"invoice_number"`
 	WaybillNumber        string                          `json:"waybill_number"`
 	Notes                string                          `json:"notes"`
-	Items                []CreateDistributionItemRequest `json:"items" binding:"required,min=1"`
+	Items                []CreateDistributionItemRequest `json:"items" binding:"required,min=1,dive"`
 }
 
 // CreateDistributionItemRequest represents request to create a distribution item
