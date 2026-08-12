@@ -270,14 +270,15 @@ func (h *Handler) Register(c *gin.Context) {
 	now := time.Now()
 	defaultUserSettings, _ := json.Marshal(map[string]interface{}{})
 
+	// NOTE: an unresolved merge-conflict marker lived INSIDE this backtick SQL
+	// string (commit 25fd5f4 side vs HEAD side of the same INSERT) — Go
+	// compiled it happily and postgres answered `syntax error at or near
+	// "<<<<<<<"`, which broke every registration on this branch. Conflict
+	// markers inside raw strings are invisible to the compiler; both sides
+	// were the same statement with a different column order.
 	_, err = tx.Exec(`
-<<<<<<< HEAD
 		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, role, settings, is_active, is_verified, is_system_admin, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, 'owner', $7, true, false, false, $8, $8)
-=======
-		INSERT INTO users (id, tenant_id, email, password_hash, first_name, last_name, settings, is_active, is_verified, is_system_admin, role, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, false, false, 'owner', $8, $8)
->>>>>>> 25fd5f4f5ed9dd93945e5fd014b5d80eb5090b2d
 	`, userID, tenantID, input.Email, passwordHash, input.FirstName, input.LastName, defaultUserSettings, now)
 	if err != nil {
 		h.log.Error("Failed to create user", "error", err)
@@ -2678,12 +2679,16 @@ func (h *Handler) seedDefaultProjectWorkflowRules(tx *sql.Tx, tenantID uuid.UUID
 		},
 	}
 	for _, r := range rules {
+		// $6 appears both in the SELECT list (type inferred from the INSERT
+		// target) and in the NOT EXISTS comparison — postgres refused with
+		// "inconsistent types deduced for parameter $6", which poisoned the
+		// whole registration transaction. Explicit casts settle the types.
 		_, err := tx.Exec(`
 			INSERT INTO workflow_rules (id, tenant_id, name, description, category, trigger_type, trigger_event, conditions, actions, is_active, priority, created_at, updated_at)
-			SELECT $1, $2, $3, $4, 'project', $5, $6, '{}'::jsonb, $7::jsonb, true, 0, NOW(), NOW()
+			SELECT $1, $2, $3::varchar, $4::text, 'project', $5::varchar, $6::varchar, '{}'::jsonb, $7::jsonb, true, 0, NOW(), NOW()
 			WHERE NOT EXISTS (
 				SELECT 1 FROM workflow_rules wr
-				WHERE wr.tenant_id = $2 AND wr.trigger_event = $6 AND wr.deleted_at IS NULL
+				WHERE wr.tenant_id = $2 AND wr.trigger_event = $6::varchar AND wr.deleted_at IS NULL
 			)
 		`, uuid.New(), tenantID, r.name, r.description, r.triggerType, r.event, r.actions)
 		if err != nil {
