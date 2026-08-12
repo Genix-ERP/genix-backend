@@ -406,6 +406,18 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 		orderBy = " ORDER BY p.name, pv.variant_name, pv.id ASC"
 	}
 
+	// Search server-side: the clients used to filter what they had already
+	// loaded, so a paginated list only ever searched the rows on the current
+	// page and the same query gave different answers on web and mobile.
+	// Appended to whereExtra before filterArgCount is taken, so the count query
+	// below counts the same filtered set.
+	if search := strings.TrimSpace(c.Query("search")); search != "" {
+		args = append(args, "%"+search+"%")
+		whereExtra += fmt.Sprintf(
+			` AND (pv.display_name ILIKE $%d OR pv.sku ILIKE $%d OR pv.barcode ILIKE $%d)`,
+			len(args), len(args), len(args))
+	}
+
 	baseQuery += whereExtra
 	baseQuery += orderBy
 
@@ -477,6 +489,58 @@ func (h *Handler) ListProductVariants(c *gin.Context) {
 	response.Paginated(c, variants, page, pageSize, total)
 }
 
+// GetProductVariantStats returns the counters behind the Variants tab cards.
+// They were derived client-side from the variants already loaded, so against a
+// paginated list "products with variants" only ever counted the first page —
+// any tenant past 20 variants saw a number that was simply wrong.
+func (h *Handler) GetProductVariantStats(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok {
+		response.Unauthorized(c, "Unauthorized")
+		return
+	}
+
+	query := `
+		SELECT COUNT(*) AS total_variants,
+		       COUNT(DISTINCT pv.product_id) AS products_with_variants
+		FROM product_variants pv
+		JOIN products p ON p.id = pv.product_id
+		WHERE pv.tenant_id = $1 AND pv.deleted_at IS NULL AND p.deleted_at IS NULL
+	`
+	args := []interface{}{tenantID}
+
+	// Same org scoping as ListProductVariants applies without product_id, so
+	// the cards agree with the list they sit above.
+	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
+		args = append(args, orgID)
+		query += fmt.Sprintf(" AND p.origin_organization_id = $%d", len(args))
+	}
+
+	var totalVariants, productsWithVariants int
+	if err := h.db.QueryRow(query, args...).Scan(&totalVariants, &productsWithVariants); err != nil {
+		h.log.Error("Failed to load product variant stats", "error", err)
+		response.InternalError(c, "Failed to load product variant stats")
+		return
+	}
+
+	// Attributes are tenant-wide, not org-scoped — matching ListProductAttributes.
+	var totalAttributes int
+	if err := h.db.QueryRow(`
+		SELECT COUNT(*) FROM product_attributes
+		WHERE tenant_id = $1 AND deleted_at IS NULL
+	`, tenantID).Scan(&totalAttributes); err != nil {
+		h.log.Error("Failed to count product attributes", "error", err)
+		response.InternalError(c, "Failed to load product variant stats")
+		return
+	}
+
+	response.Success(c, map[string]interface{}{
+		"total_variants":         totalVariants,
+		"products_with_variants": productsWithVariants,
+		"total_attributes":       totalAttributes,
+	})
+}
+
 // GetProductVariant returns a single variant
 func (h *Handler) GetProductVariant(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -511,6 +575,29 @@ func (h *Handler) GetProductVariant(c *gin.Context) {
 	}
 
 	response.Success(c, v)
+}
+
+// refreshProductHasVariants recomputes products.has_variants from
+// product_variants. Create and generate used to write a literal `true` and
+// delete wrote nothing at all, so the flag drifted from the table in both
+// directions — and AdjustInventory (inventory.go) reads it to decide whether a
+// variant_id is required, which left products with no variants left
+// un-adjustable. Deriving it from the table keeps all three call sites on one
+// source of truth.
+//
+// Still outside the caller's transaction, so a failure here is logged rather
+// than surfaced: the variant write itself has already succeeded and must not be
+// reported as failed. Migration 492 repairs any flag that drifts this way.
+func (h *Handler) refreshProductHasVariants(productID, tenantID uuid.UUID) {
+	if _, err := h.db.Exec(`
+		UPDATE products p SET has_variants = EXISTS (
+			SELECT 1 FROM product_variants pv
+			WHERE pv.product_id = p.id AND pv.deleted_at IS NULL
+		)
+		WHERE p.id = $1 AND p.tenant_id = $2
+	`, productID, tenantID); err != nil {
+		h.log.Error("Failed to refresh has_variants", "product_id", productID, "error", err)
+	}
 }
 
 // CreateProductVariant creates a new product variant
@@ -607,10 +694,7 @@ func (h *Handler) CreateProductVariant(c *gin.Context) {
 		}
 	}
 
-	// Update product to has_variants = true
-	if _, execErr := h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID); execErr != nil {
-		h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
-	}
+	h.refreshProductHasVariants(productID, tenantID)
 
 	response.Success(c, map[string]interface{}{
 		"id":           variantID,
@@ -688,13 +772,26 @@ func (h *Handler) DeleteProductVariant(c *gin.Context) {
 		return
 	}
 
+	// RETURNING gives us the owning product without a second lookup, so the
+	// flag can be recomputed below.
 	now := time.Now()
-	_, err = h.db.Exec(`
+	var productID uuid.UUID
+	err = h.db.QueryRow(`
 		UPDATE product_variants SET deleted_at = $1 WHERE id = $2 AND tenant_id = $3
-	`, now, variantID, tenantID)
-	if err != nil {
+		RETURNING product_id
+	`, now, variantID, tenantID).Scan(&productID)
+	if err != nil && err != sql.ErrNoRows {
 		response.InternalError(c, "Failed to delete product variant")
 		return
+	}
+
+	// Deleting the last variant has to clear has_variants as well, otherwise
+	// AdjustInventory (inventory.go) keeps demanding a variant_id for a product
+	// that has none left to choose from. sql.ErrNoRows means the statement
+	// matched nothing (unknown id, or another tenant's variant) — the response
+	// stays a success as it always has, there is simply nothing to recompute.
+	if err == nil {
+		h.refreshProductHasVariants(productID, tenantID)
 	}
 
 	response.Success(c, map[string]string{"message": "Product variant deleted successfully"})
@@ -866,9 +963,7 @@ func (h *Handler) GenerateProductVariants(c *gin.Context) {
 
 	// Update product has_variants flag
 	if createdCount > 0 {
-		if _, execErr := h.db.Exec("UPDATE products SET has_variants = true WHERE id = $1", productID); execErr != nil {
-			h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
-		}
+		h.refreshProductHasVariants(productID, tenantID)
 	}
 
 	response.Success(c, map[string]interface{}{
