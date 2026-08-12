@@ -66,6 +66,7 @@ func (h *Handler) ListProducts(c *gin.Context) {
 	inventoryType := c.Query("inventory_type")
 	warehouseID := c.Query("warehouse_id") // optional: only return products that have at least one inventory row in this warehouse
 	includeInactive := c.Query("include_inactive") == "true"
+	hasVariants := c.Query("has_variants") == "true" // optional: only products that actually have variants
 
 	// Build query - products are shared across orgs, org-specific data comes from product_organization_settings
 	orgID, _ := middleware.GetOrganizationID(c)
@@ -197,6 +198,23 @@ func (h *Handler) ListProducts(c *gin.Context) {
 			args = append(args, warehouseID)
 			countArgs = append(countArgs, warehouseID)
 		}
+	}
+
+	// The Variants tab's "by product" filter needs the products that actually
+	// have variants. It reads product_variants rather than p.has_variants: the
+	// flag has drifted from the table for years (see migration 492), so a flag
+	// lookup would hide real products. Carries no bind arg, hence no counter
+	// bump — but it must land on the count query too, or the pagination total
+	// would describe a different set than the rows.
+	if hasVariants {
+		const hasVariantsClause = ` AND EXISTS (
+			SELECT 1 FROM product_variants pv
+			WHERE pv.product_id = p.id
+			  AND pv.tenant_id = $1
+			  AND pv.deleted_at IS NULL
+		)`
+		baseQuery += hasVariantsClause
+		countQuery += hasVariantsClause
 	}
 
 	if search != "" {
