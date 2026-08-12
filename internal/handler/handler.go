@@ -2486,6 +2486,9 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 
 		// Stages
 		constructionProjects.GET("/:id/stages", h.ListConstructionStages)
+		// Per-estimate Bosqichlar badge counts — one light query instead of
+		// the frontend fanning out full 5000-line fetches per estimate.
+		constructionProjects.GET("/:id/stage-counts", h.GetProjectStageCounts)
 		constructionProjects.GET("/:id/stages/overview", h.GetConstructionStagesOverview)
 		constructionProjects.POST("/:id/stages", h.perm.Require("construction", "project", "update"), h.CreateConstructionStage)
 
