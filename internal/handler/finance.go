@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -4256,6 +4257,9 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 				h.log.Info("Updated sales invoice amount_paid", "invoice_id", a.DocID, "added", a.Amount, "rows", rows)
 			}
 		} else if a.DocType == "purchase_invoice" {
+			// Same over-payment cap as the sales branch above: without it a
+			// mis-sized allocation (CreatePayment accepts caller-supplied
+			// amounts) pushes amount_paid past total_amount on confirm.
 			res, updErr := tx.Exec(`
 				UPDATE purchase_invoices SET
 					amount_paid = amount_paid + $1,
@@ -4263,11 +4267,12 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 					payment_status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
 					updated_at = $2
 				WHERE id = $3 AND tenant_id = $4
+				  AND amount_paid + $1 <= total_amount + 0.01
 			`, a.Amount, now, a.DocID, tenantID)
 			if updErr != nil {
 				h.log.Error("Failed to update purchase invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)
 			} else if rows, _ := res.RowsAffected(); rows == 0 {
-				h.log.Warn("Purchase invoice not found for allocation", "invoice_id", a.DocID)
+				h.log.Warn("Purchase invoice not found or allocation exceeds remaining balance", "invoice_id", a.DocID, "amount", a.Amount)
 			} else {
 				h.log.Info("Updated purchase invoice amount_paid", "invoice_id", a.DocID, "added", a.Amount, "rows", rows)
 			}
@@ -6070,7 +6075,7 @@ func (h *Handler) GetBankAccount(c *gin.Context) {
 		       COALESCE(ba.account_number, '') as account_number,
 		       COALESCE(ba.currency, 'UZS') as currency, COALESCE(ba.account_type, 'checking') as account_type,
 		       COALESCE(ba.balance, 0) as balance, COALESCE(ba.is_active, true) as is_active,
-		       COALESCE(ba.last_reconciled, ba.last_reconciled_date) as last_reconciled,
+		       ba.last_reconciled,
 		       ba.account_id, ba.created_at, ba.updated_at,
 		       COALESCE(lb.bal, 0) as ledger_balance
 		FROM bank_accounts ba`+bankLedgerBalanceJoin+`
@@ -6169,10 +6174,12 @@ func (h *Handler) CreateBankAccount(c *gin.Context) {
 	}
 
 	var accountID *uuid.UUID
-	if input.AccountID != nil && *input.AccountID != "" {
-		accID, err := uuid.Parse(*input.AccountID)
-		if err == nil {
-			accountID = &accID
+	if input.AccountID != nil {
+		var problem string
+		accountID, problem = h.resolveBankGLAccount(tenantID, *input.AccountID)
+		if problem != "" {
+			response.BadRequest(c, problem)
+			return
 		}
 	}
 
@@ -6315,15 +6322,20 @@ func (h *Handler) UpdateBankAccount(c *gin.Context) {
 		argIndex++
 	}
 	if input.AccountID != nil {
-		if *input.AccountID == "" {
-			updates = append(updates, fmt.Sprintf("account_id = $%d", argIndex))
-			args = append(args, nil)
+		// Validate before accepting: the old code silently skipped an invalid
+		// UUID but still advanced argIndex, leaving a placeholder gap that made
+		// the whole UPDATE fail with a bind error whenever another field was
+		// present in the same request.
+		accID, problem := h.resolveBankGLAccount(tenantID, *input.AccountID)
+		if problem != "" {
+			response.BadRequest(c, problem)
+			return
+		}
+		updates = append(updates, fmt.Sprintf("account_id = $%d", argIndex))
+		if accID != nil {
+			args = append(args, *accID)
 		} else {
-			accID, err := uuid.Parse(*input.AccountID)
-			if err == nil {
-				updates = append(updates, fmt.Sprintf("account_id = $%d", argIndex))
-				args = append(args, accID)
-			}
+			args = append(args, nil)
 		}
 		argIndex++
 	}
@@ -6376,6 +6388,18 @@ func (h *Handler) DeleteBankAccount(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" {
 		response.BadRequest(c, "Bank account ID is required")
+		return
+	}
+
+	// A draft reconciliation holds live selection state against this account;
+	// deleting the account from under it would leave an unfinishable session.
+	var draftRecons int
+	_ = h.db.QueryRow(`
+		SELECT COUNT(*) FROM bank_reconciliations
+		WHERE bank_account_id = $1 AND tenant_id = $2 AND status = 'draft'
+	`, id, tenantID).Scan(&draftRecons)
+	if draftRecons > 0 {
+		response.BadRequest(c, "This bank account has a draft reconciliation. Complete or delete it first.")
 		return
 	}
 
@@ -6448,9 +6472,17 @@ func (h *Handler) ListBankTransactions(c *gin.Context) {
 	argIndex := 3
 	whereExtra := ""
 
-	// Filter by organization
+	// Organization scoping goes through the ACCOUNT, not the transaction's own
+	// organization_id: the statement importer historically left that column
+	// NULL, so filtering on it hid every imported row the moment an
+	// organization was selected while the summary card (which scopes through
+	// the account — bank_balance.go) still counted them. A transaction belongs
+	// to its account's organization; the route already pins one account, so
+	// the only org question is whether the caller may see that account at all.
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {
-		whereExtra += fmt.Sprintf(" AND organization_id = $%d", argIndex)
+		whereExtra += fmt.Sprintf(` AND EXISTS(
+			SELECT 1 FROM bank_accounts ba WHERE ba.id = bank_transactions.bank_account_id
+			  AND (ba.organization_id IS NULL OR ba.organization_id = $%d))`, argIndex)
 		args = append(args, orgID)
 		argIndex++
 	}
@@ -6588,7 +6620,7 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	// Verify bank account exists
 	var exists bool
 	err = h.db.QueryRow(`
-		SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE id = $1 AND tenant_id = $2 AND (deleted_at IS NULL OR deleted_at IS NULL))
+		SELECT EXISTS(SELECT 1 FROM bank_accounts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)
 	`, bankAccountID, tenantID).Scan(&exists)
 	if err != nil || !exists {
 		response.NotFound(c, "Bank account not found")
@@ -6598,12 +6630,15 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Prevent negative balance on debit (withdrawal)
+	// Prevent negative balance on debit (withdrawal). The check must run
+	// against the LEDGER balance of the linked GL account — the mutable
+	// bank_accounts.balance column is dead (Moliya v2): it sat at 0 while the
+	// ledger held millions, so every debit was rejected with "balans: 0.00".
+	// An account with no GL link has no balance truth to check against, so the
+	// guard is skipped there.
 	if input.Type == "debit" {
-		var currentBalance float64
-		h.db.QueryRow(`SELECT COALESCE(balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`, bankAccountID, tenantID).Scan(&currentBalance)
-		if currentBalance < input.Amount {
-			response.BadRequest(c, fmt.Sprintf("Bank hisobida mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", currentBalance, input.Amount))
+		if ledgerBalance, glLinked := h.bankAccountLedgerBalance(tenantID, bankAccountID); glLinked && ledgerBalance < input.Amount {
+			response.BadRequest(c, fmt.Sprintf("Bank hisobida mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", ledgerBalance, input.Amount))
 			return
 		}
 	}
@@ -6627,18 +6662,9 @@ func (h *Handler) CreateBankTransaction(c *gin.Context) {
 		return
 	}
 
-	// Update bank account balance
-	balanceChange := input.Amount
-	if input.Type == "debit" {
-		balanceChange = -balanceChange
-	}
-	_, err = h.db.Exec(`
-		UPDATE bank_accounts SET balance = COALESCE(balance, 0) + $1, updated_at = $2
-		WHERE id = $3 AND tenant_id = $4
-	`, balanceChange, now, bankAccountID, tenantID)
-	if err != nil {
-		h.log.Warn("Failed to update bank account balance", "error", err)
-	}
+	// Deliberately NO write to bank_accounts.balance: that column is dead
+	// (Moliya v2) — the displayed balance is the linked GL account's posted
+	// ledger, and a statement-side row must not move it.
 
 	bankAccID, _ := uuid.Parse(bankAccountID)
 	t := entity.BankTransaction{
@@ -6687,11 +6713,18 @@ func (h *Handler) ReconcileBankTransaction(c *gin.Context) {
 		return
 	}
 
+	// Both flags move together: the list computes is_reconciled from status,
+	// but the reconciliation workflow reads the is_reconciled COLUMN — setting
+	// only status made quick-reconciled rows reappear as candidates in every
+	// future reconciliation session.
+	// reconciled_date is a DATE while updated_at is a timestamptz — sharing
+	// one parameter between them makes Postgres fail type deduction.
 	now := time.Now()
 	result, err := h.db.Exec(`
-		UPDATE bank_transactions SET status = 'reconciled', updated_at = $1
-		WHERE id = $2 AND bank_account_id = $3 AND tenant_id = $4
-	`, now, transactionID, bankAccountID, tenantID)
+		UPDATE bank_transactions
+		SET status = 'reconciled', is_reconciled = true, reconciled_date = $1, updated_at = $2
+		WHERE id = $3 AND bank_account_id = $4 AND tenant_id = $5
+	`, now.Format("2006-01-02"), now, transactionID, bankAccountID, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to reconcile bank transaction", "error", err)
@@ -6871,7 +6904,10 @@ func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 		return
 	}
 
-	// Calculate book balance (sum of all journal entry lines for the linked account)
+	// Calculate book balance (sum of all journal entry lines for the linked
+	// account). je.tenant_id must match ba.tenant_id: journal_entry_lines has
+	// no tenant column, so a GL account id colliding across tenants would pull
+	// in another tenant's lines.
 	var bookBalance float64
 	err = h.db.QueryRow(`
 		SELECT COALESCE(SUM(jel.debit_amount) - SUM(jel.credit_amount), 0)
@@ -6879,14 +6915,18 @@ func (h *Handler) CreateBankReconciliation(c *gin.Context) {
 		JOIN journal_entries je ON jel.journal_entry_id = je.id
 		JOIN bank_accounts ba ON jel.account_id = ba.account_id
 		WHERE ba.id = $1 AND ba.tenant_id = $2
+		  AND je.tenant_id = ba.tenant_id
 		  AND je.status = 'posted' AND je.deleted_at IS NULL
 		  AND je.entry_date <= $3
 	`, bankAccountID, tenantID, input.StatementDate).Scan(&bookBalance)
 
 	if err != nil {
-		// Fallback to bank account balance
-		h.db.QueryRow(`SELECT COALESCE(balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
-			bankAccountID, tenantID).Scan(&bookBalance)
+		// No fallback to the dead bank_accounts.balance column — a
+		// reconciliation anchored on a number the ledger never wrote could
+		// only ever "balance" by accident.
+		h.log.Error("Failed to compute book balance for reconciliation", "error", err)
+		response.InternalError(c, "Failed to create bank reconciliation")
+		return
 	}
 
 	// Get organization ID from middleware header
@@ -7014,19 +7054,27 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 		}
 	}
 
-	// Get unreconciled journal entries for the bank account
+	// Get journal entries for the bank account: unreconciled ones, PLUS the
+	// ones cleared in THIS session (bank_reconciliation_items) — without the
+	// latter, saving a draft made every checked line vanish from the screen
+	// and there was no way to uncheck it. je.tenant_id = ba.tenant_id because
+	// journal_entry_lines has no tenant column of its own.
 	jeRows, err := h.db.Query(`
 		SELECT jel.id, je.entry_date, je.entry_number, je.description,
-		       jel.debit_amount, jel.credit_amount, jel.reconciled
+		       jel.debit_amount, jel.credit_amount, COALESCE(jel.reconciled, false),
+		       (bri.id IS NOT NULL) AS in_session
 		FROM journal_entry_lines jel
 		JOIN journal_entries je ON jel.journal_entry_id = je.id
 		JOIN bank_accounts ba ON jel.account_id = ba.account_id
+		LEFT JOIN bank_reconciliation_items bri
+		  ON bri.journal_entry_line_id = jel.id AND bri.reconciliation_id = $4
 		WHERE ba.id = $1 AND ba.tenant_id = $2
+		  AND je.tenant_id = ba.tenant_id
 		  AND je.status = 'posted' AND je.deleted_at IS NULL
 		  AND je.entry_date <= $3
-		  AND (jel.reconciled = false OR jel.reconciled IS NULL)
+		  AND (jel.reconciled = false OR jel.reconciled IS NULL OR bri.id IS NOT NULL)
 		ORDER BY je.entry_date, je.entry_number
-	`, r.BankAccountID, tenantID, r.StatementDate)
+	`, r.BankAccountID, tenantID, r.StatementDate, reconciliationID)
 
 	if err != nil {
 		h.log.Error("Failed to get journal entries", "error", err)
@@ -7044,21 +7092,26 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 	}
 
 	journalEntries := make([]JournalEntryLine, 0)
+	var clearedBookTotal float64
 	if jeRows != nil {
 		defer jeRows.Close()
 		for jeRows.Next() {
 			var je JournalEntryLine
 			var entryDate time.Time
+			var inSession bool
 			jeRows.Scan(&je.ID, &entryDate, &je.EntryNumber, &je.Description,
-				&je.DebitAmount, &je.CreditAmount, &je.IsReconciled)
+				&je.DebitAmount, &je.CreditAmount, &je.IsReconciled, &inSession)
 			je.EntryDate = entryDate.Format("2006-01-02")
 			je.Amount = je.DebitAmount - je.CreditAmount
+			if inSession {
+				clearedBookTotal += je.Amount
+			}
 			journalEntries = append(journalEntries, je)
 		}
 	}
 
 	// Calculate totals
-	var clearedBankTotal, clearedBookTotal float64
+	var clearedBankTotal float64
 	for _, tx := range bankTransactions {
 		if tx.IsReconciled || tx.Status == "reconciled" {
 			if tx.TransactionType == "credit" {
@@ -7069,6 +7122,23 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 		}
 	}
 
+	// The anchor the difference is measured from: the statement balance at the
+	// last COMPLETED reconciliation of this account. The book side must satisfy
+	// anchor + cleared-this-session = statement ending balance; without the
+	// anchor, every reconciliation after the first compared a period movement
+	// against a cumulative statement balance and was structurally blocked.
+	var openingAnchor float64
+	_ = h.db.QueryRow(`SELECT COALESCE(last_reconciled_balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+		r.BankAccountID, tenantID).Scan(&openingAnchor)
+
+	// A completed reconciliation has already advanced last_reconciled_balance
+	// to its own statement balance, so the live formula would be measuring
+	// against itself — show the difference that was enforced at completion.
+	liveDifference := r.StatementEndingBalance - (openingAnchor + clearedBookTotal)
+	if r.Status != "draft" && r.Difference != nil {
+		liveDifference = *r.Difference
+	}
+
 	response.Success(c, gin.H{
 		"reconciliation":    r,
 		"bank_transactions": bankTransactions,
@@ -7076,9 +7146,11 @@ func (h *Handler) GetBankReconciliation(c *gin.Context) {
 		"summary": gin.H{
 			"statement_balance": r.StatementEndingBalance,
 			"book_balance":      r.BookBalance,
+			"opening_balance":   openingAnchor,
 			"cleared_bank":      clearedBankTotal,
 			"cleared_book":      clearedBookTotal,
-			"difference":        r.StatementEndingBalance - r.BookBalance,
+			// Same formula Update stores and Complete enforces.
+			"difference": liveDifference,
 		},
 	})
 }
@@ -7122,10 +7194,12 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 		return
 	}
 
-	// Check reconciliation exists and is draft
+	// Check reconciliation exists and is draft; keep its bank account so every
+	// line-level write below can be scoped to it.
 	var status string
-	err := h.db.QueryRow(`SELECT status FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`,
-		reconciliationID, tenantID).Scan(&status)
+	var reconBankAccountID uuid.UUID
+	err := h.db.QueryRow(`SELECT status, bank_account_id FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2`,
+		reconciliationID, tenantID).Scan(&status, &reconBankAccountID)
 	if err != nil {
 		response.NotFound(c, "Reconciliation not found")
 		return
@@ -7144,69 +7218,112 @@ func (h *Handler) UpdateBankReconciliation(c *gin.Context) {
 
 	now := time.Now()
 
-	// Reset all bank transactions for this reconciliation
+	// Reset all bank transactions for this reconciliation. status goes back to
+	// 'unmatched' too — leaving it at 'reconciled' made an unchecked row show
+	// as reconciled in the list while the workflow showed it unreconciled.
 	_, err = tx.Exec(`
 		UPDATE bank_transactions
-		SET is_reconciled = false, reconciliation_id = NULL, reconciled_date = NULL, updated_at = $1
-		WHERE reconciliation_id = $2
-	`, now, reconciliationID)
+		SET is_reconciled = false, reconciliation_id = NULL, reconciled_date = NULL,
+		    status = 'unmatched', updated_at = $1
+		WHERE reconciliation_id = $2 AND tenant_id = $3
+	`, now, reconciliationID, tenantID)
 	if err != nil {
 		h.log.Error("Failed to reset bank transactions", "error", err)
 	}
 
-	// Mark selected bank transactions as cleared
+	// Mark selected bank transactions as cleared — only rows of this
+	// reconciliation's own bank account. reconciled_date (DATE) and updated_at
+	// (timestamptz) get SEPARATE parameters: sharing one made Postgres fail
+	// type deduction ("inconsistent types deduced for parameter"), and since
+	// the error was only logged, clearing bank transactions silently never
+	// happened at all.
 	for _, txID := range input.ClearedBankTransactions {
 		_, err = tx.Exec(`
 			UPDATE bank_transactions
-			SET is_reconciled = true, reconciliation_id = $1, reconciled_date = $2, status = 'reconciled', updated_at = $2
-			WHERE id = $3 AND tenant_id = $4
-		`, reconciliationID, now, txID, tenantID)
+			SET is_reconciled = true, reconciliation_id = $1, reconciled_date = $2, status = 'reconciled', updated_at = $3
+			WHERE id = $4 AND tenant_id = $5 AND bank_account_id = $6
+		`, reconciliationID, now.Format("2006-01-02"), now, txID, tenantID, reconBankAccountID)
 		if err != nil {
 			h.log.Error("Failed to update bank transaction", "error", err, "txID", txID)
 		}
 	}
 
-	// Reset journal entry lines
+	// Reset journal entry lines cleared in this session, then forget the
+	// session items — they are re-inserted below for the new selection.
 	_, err = tx.Exec(`
 		UPDATE journal_entry_lines jel
 		SET reconciled = false, reconciled_at = NULL
 		FROM bank_reconciliation_items bri
 		WHERE bri.journal_entry_line_id = jel.id AND bri.reconciliation_id = $1
 	`, reconciliationID)
+	if err != nil {
+		h.log.Error("Failed to reset journal entry lines", "error", err)
+	}
+	if _, err = tx.Exec(`DELETE FROM bank_reconciliation_items WHERE reconciliation_id = $1 AND item_type = 'journal_entry'`,
+		reconciliationID); err != nil {
+		h.log.Error("Failed to clear reconciliation items", "error", err)
+	}
 
-	// Mark selected journal entry lines as reconciled
+	// Mark selected journal entry lines as reconciled. The UPDATE is scoped to
+	// lines of THIS tenant on THIS reconciliation's bank GL account — the old
+	// bare `WHERE id = $2` let any caller flip flags on any tenant's lines.
+	// Each accepted line is recorded in bank_reconciliation_items so the
+	// session's selection survives reloads and the reset above can find it.
+	var clearedBookTotal float64
 	for _, jelID := range input.ClearedJournalEntries {
-		_, err = tx.Exec(`
-			UPDATE journal_entry_lines
+		var amount float64
+		var entryDate time.Time
+		var desc sql.NullString
+		err = tx.QueryRow(`
+			UPDATE journal_entry_lines jel
 			SET reconciled = true, reconciled_at = $1
-			WHERE id = $2
-		`, now, jelID)
+			FROM journal_entries je, bank_accounts ba
+			WHERE jel.id = $2
+			  AND je.id = jel.journal_entry_id AND je.tenant_id = $3
+			  AND je.status = 'posted' AND je.deleted_at IS NULL
+			  AND ba.id = $4 AND ba.tenant_id = $3 AND jel.account_id = ba.account_id
+			RETURNING jel.debit_amount - jel.credit_amount, je.entry_date, jel.description
+		`, now, jelID, tenantID, reconBankAccountID).Scan(&amount, &entryDate, &desc)
 		if err != nil {
-			h.log.Error("Failed to update journal entry line", "error", err, "jelID", jelID)
+			// Not this tenant's line / not this account's line — skip, never clear.
+			h.log.Warn("Skipped journal entry line not belonging to this reconciliation", "jelID", jelID)
+			continue
+		}
+		clearedBookTotal += amount
+		if _, err = tx.Exec(`
+			INSERT INTO bank_reconciliation_items (reconciliation_id, journal_entry_line_id, item_type, transaction_date, description, amount, is_cleared, cleared_at)
+			VALUES ($1, $2, 'journal_entry', $3, $4, $5, true, $6)
+		`, reconciliationID, jelID, entryDate, desc.String, amount, now); err != nil {
+			h.log.Error("Failed to record reconciliation item", "error", err, "jelID", jelID)
 		}
 	}
 
-	// Calculate reconciled balance
+	// Calculate cleared bank-side total (informational)
 	var clearedBankTotal float64
 	err = tx.QueryRow(`
 		SELECT COALESCE(SUM(CASE WHEN transaction_type = 'credit' THEN amount ELSE -amount END), 0)
 		FROM bank_transactions
 		WHERE reconciliation_id = $1 AND is_reconciled = true
 	`, reconciliationID).Scan(&clearedBankTotal)
-
-	var clearedBookTotal float64
-	for _, jelID := range input.ClearedJournalEntries {
-		var debit, credit float64
-		tx.QueryRow(`SELECT COALESCE(debit_amount, 0), COALESCE(credit_amount, 0) FROM journal_entry_lines WHERE id = $1`, jelID).Scan(&debit, &credit)
-		clearedBookTotal += debit - credit
+	if err != nil {
+		h.log.Error("Failed to sum cleared bank transactions", "error", err)
 	}
+
+	// The difference is measured from the last completed reconciliation's
+	// statement balance (the anchor): anchor + cleared-this-session must reach
+	// the new statement's ending balance. Without the anchor every
+	// reconciliation after the first compared a period movement against a
+	// cumulative statement balance.
+	var openingAnchor float64
+	_ = tx.QueryRow(`SELECT COALESCE(last_reconciled_balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+		reconBankAccountID, tenantID).Scan(&openingAnchor)
 
 	// Update reconciliation with calculated values
 	_, err = tx.Exec(`
 		UPDATE bank_reconciliations
-		SET reconciled_balance = $1, difference = statement_ending_balance - $1, notes = $2, updated_at = $3
-		WHERE id = $4
-	`, clearedBookTotal, input.Notes, now, reconciliationID)
+		SET reconciled_balance = $1, difference = statement_ending_balance - $2, notes = $3, updated_at = $4
+		WHERE id = $5 AND tenant_id = $6
+	`, clearedBookTotal, openingAnchor+clearedBookTotal, input.Notes, now, reconciliationID, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to update reconciliation", "error", err)
@@ -7258,13 +7375,13 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	var bankAccountID uuid.UUID
 	var statementDate time.Time
 	var statementBalance, bookBalance float64
-	var difference *float64
+	var reconciledBalance *float64
 	var status string
 
 	err := h.db.QueryRow(`
-		SELECT bank_account_id, statement_date, statement_ending_balance, book_balance, difference, status
+		SELECT bank_account_id, statement_date, statement_ending_balance, book_balance, reconciled_balance, status
 		FROM bank_reconciliations WHERE id = $1 AND tenant_id = $2
-	`, reconciliationID, tenantID).Scan(&bankAccountID, &statementDate, &statementBalance, &bookBalance, &difference, &status)
+	`, reconciliationID, tenantID).Scan(&bankAccountID, &statementDate, &statementBalance, &bookBalance, &reconciledBalance, &status)
 
 	if err != nil {
 		response.NotFound(c, "Reconciliation not found")
@@ -7276,12 +7393,22 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 		return
 	}
 
-	// Check if reconciliation is balanced (difference should be 0 or within write-off tolerance)
-	const writeOffTolerance = 1000.0 // Maximum auto write-off amount (1,000 UZS)
-	var reconDifference float64
-	if difference != nil {
-		reconDifference = *difference
+	// Recompute the difference HERE instead of trusting the stored column: a
+	// reconciliation whose Update was never called stored NULL, which the old
+	// code read as 0 and happily completed with no statement-vs-ledger check
+	// at all. The enforced identity is:
+	//   last completed statement balance (anchor) + cleared this session
+	//     == this statement's ending balance.
+	var openingAnchor float64
+	_ = h.db.QueryRow(`SELECT COALESCE(last_reconciled_balance, 0) FROM bank_accounts WHERE id = $1 AND tenant_id = $2`,
+		bankAccountID, tenantID).Scan(&openingAnchor)
+	var clearedTotal float64
+	if reconciledBalance != nil {
+		clearedTotal = *reconciledBalance
 	}
+
+	const writeOffTolerance = 1000.0 // Maximum auto write-off amount (1,000 UZS)
+	reconDifference := statementBalance - (openingAnchor + clearedTotal)
 	if reconDifference > writeOffTolerance || reconDifference < -writeOffTolerance {
 		response.BadRequest(c, fmt.Sprintf("Reconciliation has a difference of %.2f which exceeds the write-off tolerance (%.0f). Please resolve before completing.", reconDifference, writeOffTolerance))
 		return
@@ -7290,16 +7417,22 @@ func (h *Handler) CompleteBankReconciliation(c *gin.Context) {
 	now := time.Now()
 	tenantUUID, _ := uuid.Parse(tenantID)
 
-	// Complete the reconciliation
-	_, err = h.db.Exec(`
+	// Complete the reconciliation. status='draft' in the WHERE is the claim:
+	// two concurrent completes both passed the SELECT above, and without it
+	// both would post the write-off entries twice.
+	claimResult, err := h.db.Exec(`
 		UPDATE bank_reconciliations
-		SET status = 'completed', completed_at = $1, completed_by = $2, updated_at = $1
-		WHERE id = $3
-	`, now, userID, reconciliationID)
+		SET status = 'completed', completed_at = $1, completed_by = $2, difference = $3, updated_at = $1
+		WHERE id = $4 AND tenant_id = $5 AND status = 'draft'
+	`, now, userID, reconDifference, reconciliationID, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to complete reconciliation", "error", err)
 		response.InternalError(c, "Failed to complete reconciliation")
+		return
+	}
+	if rows, _ := claimResult.RowsAffected(); rows == 0 {
+		response.BadRequest(c, "Reconciliation is already completed")
 		return
 	}
 
@@ -7352,9 +7485,40 @@ func (h *Handler) createOutstandingClearingEntries(tenantID, userID string, bank
 		return
 	}
 
-	// Find outstanding accounts
-	outReceiptsID := findAccount(h.db, tenantUUID, orgID, "outstanding receipts", "5110")
-	outPaymentsID := findAccount(h.db, tenantUUID, orgID, "outstanding payments", "5110")
+	// Find outstanding accounts by NAME ONLY — no code fallback. The old
+	// findAccount(..., "outstanding receipts", "5110") call fell back to code
+	// 5110, which is the bank settlement account ITSELF on the BHMS chart (no
+	// tenant has accounts named "outstanding*"), so completing a
+	// reconciliation posted a DR 5110 / CR 5110 entry for the account's ENTIRE
+	// balance — fabricated turnover in both directions on the cash account.
+	// Tenants that actually run 2-step payment posting must have dedicated,
+	// explicitly named clearing accounts; everyone else correctly gets a no-op.
+	nameOnly := func(nameLike string) uuid.UUID {
+		var id uuid.UUID
+		if orgID != nil {
+			_ = h.db.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND organization_id = $2 AND LOWER(name) LIKE $3
+				AND deleted_at IS NULL AND COALESCE(is_leaf, true) = true LIMIT 1`,
+				tenantUUID, *orgID, nameLike+"%").Scan(&id)
+			if id != uuid.Nil {
+				return id
+			}
+		}
+		_ = h.db.QueryRow(`SELECT id FROM accounts WHERE tenant_id = $1 AND LOWER(name) LIKE $2
+			AND deleted_at IS NULL AND COALESCE(is_leaf, true) = true LIMIT 1`,
+			tenantUUID, nameLike+"%").Scan(&id)
+		return id
+	}
+	outReceiptsID := nameOnly("outstanding receipts")
+	outPaymentsID := nameOnly("outstanding payments")
+
+	// A clearing leg that resolves to the bank account itself can only produce
+	// a self-referencing entry — treat it as not configured.
+	if outReceiptsID == bankGLAccountID {
+		outReceiptsID = uuid.Nil
+	}
+	if outPaymentsID == bankGLAccountID {
+		outPaymentsID = uuid.Nil
+	}
 
 	if outReceiptsID == uuid.Nil && outPaymentsID == uuid.Nil {
 		return // No outstanding accounts configured, nothing to clear
@@ -7776,10 +7940,13 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 
 	var input struct {
 		Transactions []struct {
-			TransactionDate string  `json:"transaction_date" binding:"required"`
-			Reference       string  `json:"reference"`
-			Description     string  `json:"description"`
-			Amount          float64 `json:"amount" binding:"required"`
+			TransactionDate string `json:"transaction_date" binding:"required"`
+			Reference       string `json:"reference"`
+			Description     string `json:"description"`
+			// No binding:"required" — Go's validator treats a legitimate 0.00
+			// as "missing" and used to fail the WHOLE batch with 400. Zero
+			// rows are skipped individually below instead.
+			Amount          float64 `json:"amount"`
 			TransactionType string  `json:"transaction_type"` // credit or debit
 		} `json:"transactions" binding:"required"`
 	}
@@ -7795,12 +7962,32 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 		return
 	}
 
+	// The account must be THIS tenant's — the old code trusted the path param,
+	// so any caller could attach rows to a foreign tenant's account UUID. The
+	// account's organization also stamps every imported row: the importer used
+	// to leave organization_id NULL, which the org-filtered list then hid.
+	var acctOrgID *uuid.UUID
+	err := h.db.QueryRow(`
+		SELECT organization_id FROM bank_accounts
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+	`, bankAccountID, tenantID).Scan(&acctOrgID)
+	if err != nil {
+		response.NotFound(c, "Bank account not found")
+		return
+	}
+
 	importBatchID := uuid.New().String()
 	now := time.Now()
 	imported := 0
 	duplicates := 0
+	failed := 0
 
 	for _, t := range input.Transactions {
+		if t.Amount == 0 {
+			failed++
+			continue
+		}
+
 		// Determine transaction type if not provided
 		txType := t.TransactionType
 		if txType == "" {
@@ -7816,15 +8003,18 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 			amount = -amount
 		}
 
-		// Check for duplicate (same date, amount, reference)
+		// Duplicate = same date, amount, reference AND direction — without the
+		// type, a same-day debit+credit of equal amount (a common in/out pair
+		// with empty references) collapsed to one row and silently understated
+		// cash movement.
 		var exists bool
 		h.db.QueryRow(`
 			SELECT EXISTS(
 				SELECT 1 FROM bank_transactions
-				WHERE bank_account_id = $1 AND transaction_date = $2 AND amount = $3
-				  AND COALESCE(reference, '') = $4
+				WHERE tenant_id = $1 AND bank_account_id = $2 AND transaction_date = $3 AND amount = $4
+				  AND COALESCE(reference, '') = $5 AND transaction_type = $6
 			)
-		`, bankAccountID, t.TransactionDate, amount, t.Reference).Scan(&exists)
+		`, tenantID, bankAccountID, t.TransactionDate, amount, t.Reference, txType).Scan(&exists)
 
 		if exists {
 			duplicates++
@@ -7833,13 +8023,14 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 
 		// Insert transaction
 		_, err := h.db.Exec(`
-			INSERT INTO bank_transactions (tenant_id, bank_account_id, transaction_date, reference, description,
+			INSERT INTO bank_transactions (tenant_id, organization_id, bank_account_id, transaction_date, reference, description,
 			                               amount, transaction_type, status, import_batch_id, created_at, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'unmatched', $8, $9, $9)
-		`, tenantID, bankAccountID, t.TransactionDate, t.Reference, t.Description, amount, txType, importBatchID, now)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'unmatched', $9, $10, $10)
+		`, tenantID, acctOrgID, bankAccountID, t.TransactionDate, t.Reference, t.Description, amount, txType, importBatchID, now)
 
 		if err != nil {
 			h.log.Error("Failed to import transaction", "error", err)
+			failed++
 			continue
 		}
 		imported++
@@ -7849,6 +8040,7 @@ func (h *Handler) ImportBankStatement(c *gin.Context) {
 		"message":         fmt.Sprintf("Imported %d transactions", imported),
 		"imported":        imported,
 		"duplicates":      duplicates,
+		"failed":          failed,
 		"import_batch_id": importBatchID,
 	})
 }
@@ -10285,11 +10477,15 @@ func (h *Handler) ListBudgetLines(c *gin.Context) {
 
 	paginate, page, pageSize, offset := optPagination(c)
 
+	// b.deleted_at IS NULL is load-bearing: DeleteBudget soft-deletes only the
+	// budgets row, so without it the deleted budget's lines kept flowing into
+	// this list — and the four stat cards, summed client-side over exactly this
+	// list, stayed inflated forever after any budget deletion.
 	const budgetLinesFrom = `FROM budget_lines bl
 		JOIN budgets b ON bl.budget_id = b.id
 		LEFT JOIN accounts a ON bl.account_id = a.id
 		LEFT JOIN fiscal_years fy ON b.fiscal_year_id = fy.id
-		WHERE b.tenant_id = $1`
+		WHERE b.tenant_id = $1 AND b.deleted_at IS NULL`
 
 	// Query budget lines with account info and computed actual amounts from journal entries
 	// actual_amount = SUM of debit for expense accounts, SUM of credit for revenue accounts
@@ -11992,15 +12188,27 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 		Type      string `json:"type"`
 		Status    string `json:"status"`
 	}
-	h.db.QueryRow(`
+	// The COALESCE is cast as a whole: b.start_date is DATE and casting only
+	// the fy side produced COALESCE(date, text) — a type error PostgreSQL
+	// rejects. The Scan error was swallowed, so the report header rendered
+	// with an empty name and period on every client, silently.
+	if err := h.db.QueryRow(`
 		SELECT b.id::text, b.name,
-		       COALESCE(b.start_date, fy.start_date::text),
-		       COALESCE(b.end_date, fy.end_date::text),
+		       COALESCE(b.start_date, fy.start_date)::text,
+		       COALESCE(b.end_date, fy.end_date)::text,
 		       b.budget_type, b.status
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
-		WHERE b.id = $1 AND b.tenant_id = $2
-	`, budgetID, tenantID).Scan(&budget.ID, &budget.Name, &budget.StartDate, &budget.EndDate, &budget.Type, &budget.Status)
+		WHERE b.id = $1 AND b.tenant_id = $2 AND b.deleted_at IS NULL
+	`, budgetID, tenantID).Scan(&budget.ID, &budget.Name, &budget.StartDate, &budget.EndDate, &budget.Type, &budget.Status); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			response.NotFound(c, "Budget not found")
+			return
+		}
+		h.log.Error("Failed to load budget header for plan-vs-actual", "error", err)
+		response.InternalError(c, "Failed to get plan vs actual")
+		return
+	}
 
 	// Get budget lines with actual amounts from journal entries
 	rows, err := h.db.Query(`
@@ -12017,7 +12225,7 @@ func (h *Handler) GetBudgetPlanVsActual(c *gin.Context) {
 		JOIN budgets b ON b.id = bl.budget_id
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id
 		JOIN accounts a ON a.id = bl.account_id
-		WHERE bl.budget_id = $1 AND b.tenant_id = $2
+		WHERE bl.budget_id = $1 AND b.tenant_id = $2 AND b.deleted_at IS NULL
 		ORDER BY bl.line_type DESC, a.code
 	`, budgetID, tenantID)
 

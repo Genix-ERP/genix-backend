@@ -670,7 +670,9 @@ type CreateBankAccountInput struct {
 	BankName      string  `json:"bank_name" binding:"required,min=1,max=255"`
 	AccountNumber string  `json:"account_number" binding:"required,min=1,max=50"`
 	Currency      string  `json:"currency" binding:"required,min=1,max=10"`
-	AccountType   string  `json:"account_type" binding:"required,oneof=checking savings money_market certificate"`
+	// 'deposit' included: the Pul oqimi create/edit form has always offered it
+	// and every save with that choice 400'd against this list.
+	AccountType   string  `json:"account_type" binding:"required,oneof=checking savings deposit money_market certificate"`
 	Balance       float64 `json:"balance"`
 	AccountID     *string `json:"account_id"`
 }

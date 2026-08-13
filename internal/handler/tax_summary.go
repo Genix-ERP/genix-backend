@@ -69,23 +69,31 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 	}
 	payrollBuckets := []payrollBucket{}
 	var totalEmployeeWithhold, totalEmployerContrib float64
+	// Grouped by payer too — the old MIN(payer_snapshot) collapsed a code
+	// carried by both payers into one 'employee' bucket, understating
+	// employer_contrib. The period anchor is pp.end_date containment
+	// (matching /tax-reports/employee-taxes) — the old overlap test summed
+	// a period's FULL amount into every window it touched (soliq audit
+	// 2026-08-13).
 	rows, err := h.db.Query(`
 		SELECT
 		  pet.tax_code_snapshot,
 		  COALESCE(NULLIF(pet.tax_name_snapshot, ''), pet.tax_code_snapshot) AS name,
 		  COALESCE(pet.rate_snapshot, 0),
 		  COALESCE(SUM(pet.amount), 0) AS total_amount,
-		  COALESCE(MIN(pet.payer_snapshot), '')
+		  COALESCE(pet.payer_snapshot, '')
 		FROM payroll_entry_taxes pet
 		JOIN payroll_entries pe ON pe.id = pet.payroll_entry_id
 		JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
 		WHERE pet.tenant_id = $1
-		  AND pp.end_date   >= $2::date
-		  AND pp.start_date <= $3::date
-		GROUP BY pet.tax_code_snapshot, name, pet.rate_snapshot
+		  AND pp.end_date >= $2::date
+		  AND pp.end_date <= $3::date
+		GROUP BY pet.tax_code_snapshot, name, pet.rate_snapshot, pet.payer_snapshot
 		ORDER BY pet.tax_code_snapshot ASC
 	`, tenantID, start, end)
-	if err == nil {
+	if err != nil {
+		h.log.Error("tax-summary: payroll bucket query failed", "error", err)
+	} else {
 		defer rows.Close()
 		for rows.Next() {
 			var b payrollBucket
@@ -101,16 +109,47 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 		}
 	}
 
+	// Legacy fallback (mirrors /tax-reports/employee-taxes): no snapshots →
+	// read the legacy entry columns, so this tab agrees with the GL's 6410.
+	if len(payrollBuckets) == 0 {
+		var ndfl, soc, inps float64
+		if err := h.db.QueryRow(`
+			SELECT COALESCE(SUM(pe.income_tax), 0), COALESCE(SUM(pe.social_security), 0), COALESCE(SUM(pe.pension), 0)
+			FROM payroll_entries pe
+			JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
+			WHERE pe.tenant_id = $1 AND pe.deleted_at IS NULL
+			  AND pp.end_date >= $2::date AND pp.end_date <= $3::date
+		`, tenantID, start, end).Scan(&ndfl, &soc, &inps); err != nil {
+			h.log.Error("tax-summary: legacy payroll fallback failed", "error", err)
+		} else {
+			for _, lb := range []payrollBucket{
+				{Code: "NDFL", Name: "Daromad solig'i (JShDS) — legacy", Amount: ndfl, Payer: "employee"},
+				{Code: "SOC_TAX", Name: "Ijtimoiy sug'urta — legacy", Amount: soc, Payer: "employee"},
+				{Code: "INPS", Name: "INPS — legacy", Amount: inps, Payer: "employee"},
+			} {
+				if lb.Amount <= 0 {
+					continue
+				}
+				totalEmployeeWithhold += lb.Amount
+				payrollBuckets = append(payrollBuckets, lb)
+			}
+		}
+	}
+
 	// ── 2. NDS (sales) — realizatsiya / zachet / balansi ──
 	ndsRate := h.getCompanyTaxRatePct(tenantID, "sales", defaultNdsRatePct)
+	// Credit/debit notes REDUCE their side's tax (same tables, positive
+	// amounts, invoice_type marks them).
 	var salesTax, purchaseTax float64
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(tax_amount), 0) FROM sales_invoices
+		SELECT COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END), 0)
+		FROM sales_invoices
 		WHERE tenant_id=$1 AND invoice_date BETWEEN $2 AND $3
 		  AND status NOT IN ('draft','cancelled') AND deleted_at IS NULL
 	`, tenantID, start, end).Scan(&salesTax)
 	_ = h.db.QueryRow(`
-		SELECT COALESCE(SUM(tax_amount), 0) FROM purchase_invoices
+		SELECT COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END), 0)
+		FROM purchase_invoices
 		WHERE tenant_id=$1 AND invoice_date BETWEEN $2 AND $3
 		  AND status NOT IN ('draft','cancelled') AND deleted_at IS NULL
 	`, tenantID, start, end).Scan(&purchaseTax)
@@ -153,7 +192,19 @@ func (h *Handler) GetTaxSummaryCombined(c *gin.Context) {
 	dividendRate := h.getCompanyTaxRatePct(tenantID, "dividend", defaultDividendRatePct)
 
 	// ── Totals the director cares about ──
-	companyTaxTotal := ndsBalance + profitTaxAmount + totalEmployerContrib
+	// Regime-aware: a turnover-regime tenant pays turnover tax INSTEAD of
+	// profit tax (and typically no NDS) — the old total always added profit
+	// tax and never turnover, so simplified-regime tenants saw the wrong
+	// headline (soliq audit 2026-08-13). When both regimes are configured
+	// (regime_conflict), profit is kept and the conflict flag tells the UI.
+	turnoverOnly := h.hasActiveCompanyTaxRate(tenantID, "turnover", nil) &&
+		!h.hasActiveCompanyTaxRate(tenantID, "sales", nil) &&
+		!h.hasActiveCompanyTaxRate(tenantID, "profit", nil)
+	companyProfitLeg := profitTaxAmount
+	if turnoverOnly {
+		companyProfitLeg = turnoverAmount
+	}
+	companyTaxTotal := ndsBalance + companyProfitLeg + totalEmployerContrib
 	if ndsBalance < 0 {
 		// NDS credit balance doesn't count as payable in the director total.
 		companyTaxTotal -= ndsBalance

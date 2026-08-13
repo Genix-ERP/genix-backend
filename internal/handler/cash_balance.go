@@ -94,16 +94,21 @@ func (h *Handler) cashBalancesAsOf(tenantID, orgID uuid.UUID, asOf string) ([]ca
 	// be in scope, so its amounts would be summed anyway. Keeping the line and
 	// entry conditions inside one inner join is what makes the date and status
 	// filters actually bind.
+	// COALESCE on opening_balance: the column is nullable, and a bare NULL +
+	// SUM made the whole row NULL — the scan error then silently dropped that
+	// account from the dashboard total. je.tenant_id binds the lines to this
+	// tenant (journal_entry_lines has no tenant column of its own).
 	rows, err := h.db.Query(`
 		SELECT a.code,
 		       COALESCE(NULLIF(a.name_uz, ''), a.name) AS name,
-		       a.opening_balance + COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
+		       COALESCE(a.opening_balance, 0) + COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
 		FROM accounts a
 		JOIN account_types at ON at.id = a.account_type_id
 		LEFT JOIN (
 			journal_entry_lines l
 			JOIN journal_entries je ON je.id = l.journal_entry_id
 				AND je.status = 'posted' AND je.deleted_at IS NULL
+				AND je.tenant_id = $1
 				AND je.entry_date <= $2
 		) ON l.account_id = a.id
 		WHERE`+cashAccountSetSQL+orgFilter+`
@@ -148,6 +153,7 @@ func (h *Handler) cashMovementBetween(tenantID, orgID uuid.UUID, from, to string
 		JOIN journal_entry_lines l ON l.account_id = a.id
 		JOIN journal_entries je ON je.id = l.journal_entry_id
 			AND je.status = 'posted' AND je.deleted_at IS NULL
+			AND je.tenant_id = a.tenant_id
 			AND je.entry_date >= $2 AND je.entry_date <= $3
 		WHERE`+cashAccountSetSQL+orgFilter, args...).Scan(&debits, &credits)
 	return debits, credits, err

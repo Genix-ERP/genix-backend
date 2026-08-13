@@ -104,6 +104,15 @@ func reconciliationWhere(c *gin.Context, tenantID uuid.UUID, includeStatus bool)
 		where += fmt.Sprintf(" AND ct.name ILIKE $%d", n)
 		args = append(args, "%"+search+"%")
 	}
+	// Partner side. Contacts typed 'both' trade in both directions, so they
+	// belong to either side's list; acts whose partner is free-text only
+	// (no contact row) have no type to filter on and appear only under "all".
+	switch c.Query("partner_type") {
+	case "customer":
+		where += " AND ct.type IN ('customer', 'both')"
+	case "vendor":
+		where += " AND ct.type IN ('vendor', 'both')"
+	}
 	return where, args, n
 }
 

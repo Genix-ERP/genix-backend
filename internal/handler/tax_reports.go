@@ -35,6 +35,7 @@ type TaxReportPeriod struct {
 	FiledByID        *uuid.UUID `json:"filed_by,omitempty"`
 	FiledByName      *string    `json:"filed_by_name,omitempty"`
 	Notes            *string    `json:"notes,omitempty"`
+	PaidAt           *time.Time `json:"paid_at,omitempty"`
 	CreatedByID      *uuid.UUID `json:"created_by,omitempty"`
 	CreatedByName    *string    `json:"created_by_name,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
@@ -133,7 +134,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 			trp.deadline, trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
 			trp.net_tax_liability, trp.filing_reference, trp.filed_date, trp.filed_by,
 			uf.first_name || ' ' || uf.last_name as filed_by_name,
-			trp.notes, trp.created_by,
+			trp.notes, trp.paid_at, trp.created_by,
 			uc.first_name || ' ' || uc.last_name as created_by_name,
 			trp.created_at, trp.updated_at
 		FROM tax_report_periods trp
@@ -189,7 +190,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 		var startDate, endDate time.Time
 		var deadline sql.NullTime
 		var filingRef, notes sql.NullString
-		var filedDate sql.NullTime
+		var filedDate, paidAt sql.NullTime
 		var filedByID, createdByID sql.NullString
 		var filedByName, createdByName sql.NullString
 
@@ -197,12 +198,15 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 			&p.ID, &p.TenantID, &p.Name, &p.PeriodType, &startDate, &endDate,
 			&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 			&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
-			&filedByName, &notes, &createdByID, &createdByName,
+			&filedByName, &notes, &paidAt, &createdByID, &createdByName,
 			&p.CreatedAt, &p.UpdatedAt,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan tax report period", "error", err)
 			continue
+		}
+		if paidAt.Valid {
+			p.PaidAt = &paidAt.Time
 		}
 
 		p.StartDate = startDate.Format("2006-01-02")
@@ -272,7 +276,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 	var startDate, endDate time.Time
 	var deadline sql.NullTime
 	var filingRef, notes sql.NullString
-	var filedDate sql.NullTime
+	var filedDate, paidAt sql.NullTime
 	var filedByID, createdByID sql.NullString
 	var filedByName, createdByName sql.NullString
 
@@ -282,7 +286,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 			trp.deadline, trp.status, trp.total_sales, trp.total_sales_tax, trp.total_purchases, trp.total_purchase_tax,
 			trp.net_tax_liability, trp.filing_reference, trp.filed_date, trp.filed_by,
 			uf.first_name || ' ' || uf.last_name,
-			trp.notes, trp.created_by,
+			trp.notes, trp.paid_at, trp.created_by,
 			uc.first_name || ' ' || uc.last_name,
 			trp.created_at, trp.updated_at
 		FROM tax_report_periods trp
@@ -293,7 +297,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 		&p.ID, &p.TenantID, &p.Name, &p.PeriodType, &startDate, &endDate,
 		&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 		&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
-		&filedByName, &notes, &createdByID, &createdByName,
+		&filedByName, &notes, &paidAt, &createdByID, &createdByName,
 		&p.CreatedAt, &p.UpdatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -329,6 +333,9 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 	}
 	if notes.Valid {
 		p.Notes = &notes.String
+	}
+	if paidAt.Valid {
+		p.PaidAt = &paidAt.Time
 	}
 	if createdByID.Valid {
 		id, _ := uuid.Parse(createdByID.String)
@@ -467,8 +474,8 @@ func (h *Handler) CalculateTaxReport(c *gin.Context) {
 		return
 	}
 
-	if status == "filed" {
-		response.BadRequest(c, "Cannot recalculate a filed report")
+	if status == "filed" || status == "paid" {
+		response.BadRequest(c, "Cannot recalculate a filed or paid report")
 		return
 	}
 
@@ -484,69 +491,100 @@ func (h *Handler) CalculateTaxReport(c *gin.Context) {
 	_, _ = tx.Exec("DELETE FROM tax_report_lines WHERE report_id = $1", periodID)
 	_, _ = tx.Exec("DELETE FROM tax_transactions WHERE report_id = $1", periodID)
 
-	// Calculate sales tax from sales invoices
+	// Calculate sales tax from sales invoices.
+	//
+	// sales_invoices has NO header tax_rate_id column (only purchases got one,
+	// migration 202) — the old query referenced the phantom si.tax_rate_id and
+	// si.total, always errored, and the error was swallowed, so Calculate
+	// 500'd on the period UPDATE forever and periods never left 'draft'
+	// (soliq audit 2026-08-13). Sales taxes live on the LINES (tax_id), so
+	// the representative rate is derived per invoice from its lines. Credit
+	// notes REDUCE output tax — they are the same table with
+	// invoice_type='credit_note' and positive amounts.
 	var totalSales, totalSalesTax float64
 	salesRows, err := tx.Query(`
 		SELECT
-			COALESCE(si.tax_rate_id, '00000000-0000-0000-0000-000000000000') as tax_rate_id,
+			COALESCE(lt.tax_id::text, '00000000-0000-0000-0000-000000000000') as tax_rate_id,
 			COALESCE(tr.name, 'No Tax') as tax_name,
 			COALESCE(tr.rate, 0) as tax_rate,
 			COUNT(*) as tx_count,
-			SUM(si.subtotal) as taxable_amount,
-			SUM(si.tax_amount) as tax_amount,
-			SUM(si.total) as total_amount
+			SUM(si.subtotal * CASE WHEN COALESCE(si.invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END) as taxable_amount,
+			SUM(si.tax_amount * CASE WHEN COALESCE(si.invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END) as tax_amount,
+			SUM(si.total_amount * CASE WHEN COALESCE(si.invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END) as total_amount
 		FROM sales_invoices si
-		LEFT JOIN tax_rates tr ON tr.id = si.tax_rate_id
+		LEFT JOIN LATERAL (
+			SELECT MIN(l.tax_id::text)::uuid AS tax_id FROM sales_invoice_lines l
+			WHERE l.sales_invoice_id = si.id AND l.tax_id IS NOT NULL
+		) lt ON true
+		LEFT JOIN tax_rates tr ON tr.id = lt.tax_id
 		WHERE si.tenant_id = $1
 			AND si.invoice_date >= $2
 			AND si.invoice_date <= $3
 			AND si.status NOT IN ('draft', 'cancelled')
 			AND si.deleted_at IS NULL
-		GROUP BY si.tax_rate_id, tr.name, tr.rate
+		GROUP BY lt.tax_id, tr.name, tr.rate
 	`, tenantID, startDate, endDate)
 
-	if err == nil {
-		defer salesRows.Close()
-		for salesRows.Next() {
-			var taxRateID string
-			var taxName string
-			var taxRate float64
-			var txCount int
-			var taxableAmt, taxAmt, totalAmt float64
+	if err != nil {
+		h.log.Error("CalculateTaxReport: sales query failed", "error", err)
+		response.InternalError(c, "Failed to calculate sales tax")
+		return
+	}
+	// Drain the rows FIRST, insert after Close: issuing tx.Exec while rows
+	// from the same tx connection are open is not supported by lib/pq — the
+	// old in-loop INSERTs failed silently behind the discarded error.
+	type taxBucket struct {
+		taxRateID                  string
+		taxName                    string
+		taxRate                    float64
+		txCount                    int
+		taxableAmt, taxAmt, totalAmt float64
+	}
+	var salesBuckets []taxBucket
+	for salesRows.Next() {
+		var b taxBucket
+		if err := salesRows.Scan(&b.taxRateID, &b.taxName, &b.taxRate, &b.txCount, &b.taxableAmt, &b.taxAmt, &b.totalAmt); err != nil {
+			salesRows.Close()
+			h.log.Error("CalculateTaxReport: sales scan failed", "error", err)
+			response.InternalError(c, "Failed to calculate sales tax")
+			return
+		}
+		salesBuckets = append(salesBuckets, b)
+	}
+	salesRows.Close()
 
-			if err := salesRows.Scan(&taxRateID, &taxName, &taxRate, &txCount, &taxableAmt, &taxAmt, &totalAmt); err != nil {
-				continue
-			}
+	for _, b := range salesBuckets {
+		totalSales += b.taxableAmt
+		totalSalesTax += b.taxAmt
 
-			totalSales += taxableAmt
-			totalSalesTax += taxAmt
-
-			// Insert report line
-			lineID := uuid.New()
-			var taxRateIDPtr *uuid.UUID
-			if taxRateID != "00000000-0000-0000-0000-000000000000" {
-				id, _ := uuid.Parse(taxRateID)
-				taxRateIDPtr = &id
-			}
-
-			_, _ = tx.Exec(`
-				INSERT INTO tax_report_lines (id, report_id, tax_rate_id, tax_name, tax_rate, transaction_type, taxable_amount, tax_amount, total_amount, transaction_count)
-				VALUES ($1, $2, $3, $4, $5, 'sales', $6, $7, $8, $9)
-			`, lineID, periodID, taxRateIDPtr, taxName, taxRate, taxableAmt, taxAmt, totalAmt, txCount)
+		var taxRateIDPtr *uuid.UUID
+		if b.taxRateID != "00000000-0000-0000-0000-000000000000" {
+			id, _ := uuid.Parse(b.taxRateID)
+			taxRateIDPtr = &id
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO tax_report_lines (id, report_id, tax_rate_id, tax_name, tax_rate, transaction_type, taxable_amount, tax_amount, total_amount, transaction_count)
+			VALUES ($1, $2, $3, $4, $5, 'sales', $6, $7, $8, $9)
+		`, uuid.New(), periodID, taxRateIDPtr, b.taxName, b.taxRate, b.taxableAmt, b.taxAmt, b.totalAmt, b.txCount); err != nil {
+			h.log.Error("CalculateTaxReport: sales line insert failed", "error", err)
+			response.InternalError(c, "Failed to calculate sales tax")
+			return
 		}
 	}
 
-	// Calculate purchase tax from purchase invoices
+	// Calculate purchase tax from purchase invoices. Debit notes REDUCE the
+	// input-tax offset (same table, invoice_type='debit_note', positive
+	// amounts).
 	var totalPurchases, totalPurchaseTax float64
 	purchaseRows, err := tx.Query(`
 		SELECT
-			COALESCE(pi.tax_rate_id, '00000000-0000-0000-0000-000000000000') as tax_rate_id,
+			COALESCE(pi.tax_rate_id::text, '00000000-0000-0000-0000-000000000000') as tax_rate_id,
 			COALESCE(tr.name, 'No Tax') as tax_name,
 			COALESCE(tr.rate, 0) as tax_rate,
 			COUNT(*) as tx_count,
-			SUM(pi.subtotal) as taxable_amount,
-			SUM(pi.tax_amount) as tax_amount,
-			SUM(pi.total_amount) as total_amount
+			SUM(pi.subtotal * CASE WHEN COALESCE(pi.invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END) as taxable_amount,
+			SUM(pi.tax_amount * CASE WHEN COALESCE(pi.invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END) as tax_amount,
+			SUM(pi.total_amount * CASE WHEN COALESCE(pi.invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END) as total_amount
 		FROM purchase_invoices pi
 		LEFT JOIN tax_rates tr ON tr.id = pi.tax_rate_id
 		WHERE pi.tenant_id = $1
@@ -557,34 +595,40 @@ func (h *Handler) CalculateTaxReport(c *gin.Context) {
 		GROUP BY pi.tax_rate_id, tr.name, tr.rate
 	`, tenantID, startDate, endDate)
 
-	if err == nil {
-		defer purchaseRows.Close()
-		for purchaseRows.Next() {
-			var taxRateID string
-			var taxName string
-			var taxRate float64
-			var txCount int
-			var taxableAmt, taxAmt, totalAmt float64
+	if err != nil {
+		h.log.Error("CalculateTaxReport: purchase query failed", "error", err)
+		response.InternalError(c, "Failed to calculate purchase tax")
+		return
+	}
+	var purchaseBuckets []taxBucket
+	for purchaseRows.Next() {
+		var b taxBucket
+		if err := purchaseRows.Scan(&b.taxRateID, &b.taxName, &b.taxRate, &b.txCount, &b.taxableAmt, &b.taxAmt, &b.totalAmt); err != nil {
+			purchaseRows.Close()
+			h.log.Error("CalculateTaxReport: purchase scan failed", "error", err)
+			response.InternalError(c, "Failed to calculate purchase tax")
+			return
+		}
+		purchaseBuckets = append(purchaseBuckets, b)
+	}
+	purchaseRows.Close()
 
-			if err := purchaseRows.Scan(&taxRateID, &taxName, &taxRate, &txCount, &taxableAmt, &taxAmt, &totalAmt); err != nil {
-				continue
-			}
+	for _, b := range purchaseBuckets {
+		totalPurchases += b.taxableAmt
+		totalPurchaseTax += b.taxAmt
 
-			totalPurchases += taxableAmt
-			totalPurchaseTax += taxAmt
-
-			// Insert report line
-			lineID := uuid.New()
-			var taxRateIDPtr *uuid.UUID
-			if taxRateID != "00000000-0000-0000-0000-000000000000" {
-				id, _ := uuid.Parse(taxRateID)
-				taxRateIDPtr = &id
-			}
-
-			_, _ = tx.Exec(`
-				INSERT INTO tax_report_lines (id, report_id, tax_rate_id, tax_name, tax_rate, transaction_type, taxable_amount, tax_amount, total_amount, transaction_count)
-				VALUES ($1, $2, $3, $4, $5, 'purchases', $6, $7, $8, $9)
-			`, lineID, periodID, taxRateIDPtr, taxName, taxRate, taxableAmt, taxAmt, totalAmt, txCount)
+		var taxRateIDPtr *uuid.UUID
+		if b.taxRateID != "00000000-0000-0000-0000-000000000000" {
+			id, _ := uuid.Parse(b.taxRateID)
+			taxRateIDPtr = &id
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO tax_report_lines (id, report_id, tax_rate_id, tax_name, tax_rate, transaction_type, taxable_amount, tax_amount, total_amount, transaction_count)
+			VALUES ($1, $2, $3, $4, $5, 'purchases', $6, $7, $8, $9)
+		`, uuid.New(), periodID, taxRateIDPtr, b.taxName, b.taxRate, b.taxableAmt, b.taxAmt, b.totalAmt, b.txCount); err != nil {
+			h.log.Error("CalculateTaxReport: purchase line insert failed", "error", err)
+			response.InternalError(c, "Failed to calculate purchase tax")
+			return
 		}
 	}
 
@@ -657,11 +701,16 @@ func (h *Handler) FileTaxReport(c *gin.Context) {
 		response.NotFound(c, "Tax report period not found")
 		return
 	}
+	if err != nil {
+		h.log.Error("Failed to load tax report period status", "error", err)
+		response.InternalError(c, "Failed to file tax report")
+		return
+	}
 	if status == "draft" {
 		response.BadRequest(c, "Report must be calculated before filing")
 		return
 	}
-	if status == "filed" {
+	if status == "filed" || status == "paid" {
 		response.BadRequest(c, "Report is already filed")
 		return
 	}
@@ -711,8 +760,10 @@ func (h *Handler) DeleteTaxReportPeriod(c *gin.Context) {
 		response.NotFound(c, "Tax report period not found")
 		return
 	}
-	if status == "filed" {
-		response.BadRequest(c, "Cannot delete a filed report")
+	if status == "filed" || status == "paid" {
+		// A paid period has a posted tax-payment JE hanging off it — deleting
+		// the period would orphan that entry (soliq audit 2026-08-13).
+		response.BadRequest(c, "Cannot delete a filed or paid report")
 		return
 	}
 
@@ -756,14 +807,18 @@ func (h *Handler) GetTaxReportSummary(c *gin.Context) {
 	if hasDates {
 		dateArgs := append(args, startDate, endDate)
 		h.db.QueryRow(fmt.Sprintf(`
-			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			SELECT COALESCE(SUM(subtotal * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COUNT(*)
 			FROM sales_invoices
 			WHERE tenant_id = $1%s AND invoice_date >= $%d AND invoice_date <= $%d
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
 		`, orgFilter, argIdx, argIdx+1), dateArgs...).Scan(&totalSales, &totalSalesTax, &salesCount)
 	} else {
 		h.db.QueryRow(fmt.Sprintf(`
-			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			SELECT COALESCE(SUM(subtotal * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COUNT(*)
 			FROM sales_invoices
 			WHERE tenant_id = $1%s
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
@@ -776,14 +831,18 @@ func (h *Handler) GetTaxReportSummary(c *gin.Context) {
 	if hasDates {
 		dateArgs := append(args, startDate, endDate)
 		h.db.QueryRow(fmt.Sprintf(`
-			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			SELECT COALESCE(SUM(subtotal * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COUNT(*)
 			FROM purchase_invoices
 			WHERE tenant_id = $1%s AND invoice_date >= $%d AND invoice_date <= $%d
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
 		`, orgFilter, argIdx, argIdx+1), dateArgs...).Scan(&totalPurchases, &totalPurchaseTax, &purchaseCount)
 	} else {
 		h.db.QueryRow(fmt.Sprintf(`
-			SELECT COALESCE(SUM(subtotal), 0), COALESCE(SUM(tax_amount), 0), COUNT(*)
+			SELECT COALESCE(SUM(subtotal * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COALESCE(SUM(tax_amount * CASE WHEN COALESCE(invoice_type, 'invoice') IN ('credit_note', 'debit_note') THEN -1 ELSE 1 END), 0),
+			       COUNT(*)
 			FROM purchase_invoices
 			WHERE tenant_id = $1%s
 				AND status NOT IN ('draft', 'cancelled') AND deleted_at IS NULL
@@ -866,17 +925,26 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 	transactions := make([]map[string]interface{}, 0)
 
 	if txType == "" || txType == "sales" {
-		// Get sales invoices
+		// Get sales invoices. The header has NO tax_rate_id column (that's a
+		// purchases-only column, migration 202) — the old join on the phantom
+		// si.tax_rate_id (and phantom si.total) made this whole arm error out,
+		// and the swallowed error meant the tab silently showed purchases
+		// only (soliq audit 2026-08-13). Sales taxes live on the lines, so
+		// the representative rate is derived per invoice from them.
 		salesQuery := fmt.Sprintf(`
 			SELECT
 				si.id, 'sales_invoice' as type, si.invoice_number, si.invoice_date,
 				'customer' as party_type, si.customer_id, si.customer_name,
 				COALESCE(c.tax_id, '') as party_tax_id,
-				tr.id as tax_rate_id, COALESCE(tr.name, 'No Tax') as tax_name, COALESCE(tr.rate, 0) as tax_rate,
-				si.subtotal, si.tax_amount, si.total
+				lt.tax_id as tax_rate_id, COALESCE(tr.name, 'No Tax') as tax_name, COALESCE(tr.rate, 0) as tax_rate,
+				si.subtotal, si.tax_amount, si.total_amount
 			FROM sales_invoices si
 			LEFT JOIN contacts c ON c.id = si.customer_id
-			LEFT JOIN tax_rates tr ON tr.id = si.tax_rate_id
+			LEFT JOIN LATERAL (
+				SELECT MIN(l.tax_id::text)::uuid AS tax_id FROM sales_invoice_lines l
+				WHERE l.sales_invoice_id = si.id AND l.tax_id IS NOT NULL
+			) lt ON true
+			LEFT JOIN tax_rates tr ON tr.id = lt.tax_id
 			WHERE si.tenant_id = $1%s
 				AND si.status NOT IN ('draft', 'cancelled') AND si.deleted_at IS NULL`, txOrgFilter)
 		salesArgs := make([]interface{}, len(baseArgs))
@@ -888,6 +956,9 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		salesQuery += ` ORDER BY si.invoice_date DESC`
 		salesRows, err := h.db.Query(salesQuery, salesArgs...)
 
+		if err != nil {
+			h.log.Error("GetTaxTransactions: sales query failed", "error", err)
+		}
 		if err == nil {
 			defer salesRows.Close()
 			for salesRows.Next() {
@@ -959,6 +1030,9 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		purchaseQuery += ` ORDER BY pi.invoice_date DESC`
 		purchaseRows, err := h.db.Query(purchaseQuery, purchaseArgs...)
 
+		if err != nil {
+			h.log.Error("GetTaxTransactions: purchase query failed", "error", err)
+		}
 		if err == nil {
 			defer purchaseRows.Close()
 			for purchaseRows.Next() {

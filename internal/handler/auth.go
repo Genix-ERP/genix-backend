@@ -335,6 +335,7 @@ func (h *Handler) Register(c *gin.Context) {
 
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+	h.seedDefaultTaxRates(tx, tenantID)
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
@@ -2220,6 +2221,7 @@ func (h *Handler) RegisterWithOTP(c *gin.Context) {
 
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+	h.seedDefaultTaxRates(tx, tenantID)
 
 	// Commit transaction
 	if err := tx.Commit(); err != nil {
@@ -2662,6 +2664,7 @@ func (h *Handler) googleRegisterNewUser(c *gin.Context, email, googleSub, firstN
 
 	// Seed default units of measure
 	h.seedDefaultUnitsOfMeasure(tx, tenantID)
+	h.seedDefaultTaxRates(tx, tenantID)
 
 	if err := tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
@@ -2748,6 +2751,30 @@ func randomSuffix() string {
 		b[i] = chars[rand.Intn(len(chars))]
 	}
 	return string(b)
+}
+
+// seedDefaultTaxRates creates the standard Uzbek QQS rows in the legacy
+// tax_rates catalog for a new tenant. Inactive by default — applying 12%
+// VAT is a regime decision the admin makes in settings; the rows just make
+// the picker non-empty (soliq audit 2026-08-13, mirror of migration 499).
+func (h *Handler) seedDefaultTaxRates(tx *sql.Tx, tenantID uuid.UUID) {
+	rates := []struct {
+		code, name string
+		rate       float64
+	}{
+		{"NDS12", "QQS 12%", 12},
+		{"NDS0", "QQS 0% (imtiyozli)", 0},
+	}
+	for _, r := range rates {
+		_, err := tx.Exec(`
+			INSERT INTO tax_rates (id, tenant_id, code, name, rate, type, tax_type, is_active, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, 'percentage', 'sales', false, NOW(), NOW())
+			ON CONFLICT (tenant_id, code) DO NOTHING
+		`, uuid.New(), tenantID, r.code, r.name, r.rate)
+		if err != nil {
+			h.log.Error("Failed to seed tax rate", "error", err, "code", r.code)
+		}
+	}
 }
 
 // seedDefaultUnitsOfMeasure creates standard UoM entries for a new tenant

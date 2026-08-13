@@ -46,11 +46,18 @@ const budgetActualSQL = `
 		  AND je.entry_date <= COALESCE(b.end_date, fy.end_date)
 	), 0)`
 
-// budgetRollupSQL rolls every line of one budget into a planned/actual pair.
+// budgetRollupSQL rolls every line of one budget into planned/actual pairs,
+// split by side (expense vs revenue) plus the combined legacy pair.
 //
 // A LATERAL over budget_lines, not a per-row query in a Go loop: the loop shape
 // is what made GetGeneralLedger cost 163 round-trips for 162 accounts, and this
 // list is paginated so the rollup rides along with the page already being read.
+//
+// The side split exists because summing the two directions into one "actual"
+// is meaningless for control: an expense actual is money SPENT, a revenue
+// actual is money EARNED, and their sum flagged budgets as "overspent" the
+// moment revenue merely beat its plan. Overspend must be judged on the expense
+// side alone (matching checkBudgetLineExceeded, which skips revenue lines).
 //
 // `planned` stays 0 for a budget with no lines. It is deliberately NOT
 // substituted with b.total_amount here — callers that want that fallback apply
@@ -59,7 +66,11 @@ const budgetActualSQL = `
 const budgetRollupSQL = `
 	LEFT JOIN LATERAL (
 		SELECT COALESCE(SUM(bl.budgeted_amount), 0) AS planned,
-		       COALESCE(SUM(` + budgetActualSQL + `), 0) AS actual
+		       COALESCE(SUM(` + budgetActualSQL + `), 0) AS actual,
+		       COALESCE(SUM(bl.budgeted_amount) FILTER (WHERE COALESCE(bl.line_type, 'expense') <> 'revenue'), 0) AS planned_expense,
+		       COALESCE(SUM(` + budgetActualSQL + `) FILTER (WHERE COALESCE(bl.line_type, 'expense') <> 'revenue'), 0) AS actual_expense,
+		       COALESCE(SUM(bl.budgeted_amount) FILTER (WHERE COALESCE(bl.line_type, 'expense') = 'revenue'), 0) AS planned_revenue,
+		       COALESCE(SUM(` + budgetActualSQL + `) FILTER (WHERE COALESCE(bl.line_type, 'expense') = 'revenue'), 0) AS actual_revenue
 		FROM budget_lines bl
 		WHERE bl.budget_id = b.id
 	) roll ON TRUE`
@@ -95,38 +106,60 @@ func (h *Handler) GetBudgetsSummary(c *gin.Context) {
 	}
 
 	var out struct {
-		ActiveBudgets    int     `json:"active_budgets"`
-		OverspentBudgets int     `json:"overspent_budgets"`
-		TotalPlanned     float64 `json:"total_planned"`
-		TotalActual      float64 `json:"total_actual"`
-		Variance         float64 `json:"variance"`
+		ActiveBudgets    int `json:"active_budgets"`
+		OverspentBudgets int `json:"overspent_budgets"`
+		// Side-split figures — what the UI cards show. Spending control lives
+		// on the expense side; revenue is a separate achievement metric, and
+		// mixing the two directions into one number is what used to flag
+		// over-performing revenue as an overspend.
+		PlannedExpense float64 `json:"planned_expense"`
+		ActualExpense  float64 `json:"actual_expense"`
+		PlannedRevenue float64 `json:"planned_revenue"`
+		ActualRevenue  float64 `json:"actual_revenue"`
+		// Legacy combined pair, kept for callers scanning the old shape.
+		TotalPlanned float64 `json:"total_planned"`
+		TotalActual  float64 `json:"total_actual"`
+		Variance     float64 `json:"variance"`
 	}
 
-	// One query over the same rollup the list uses. `effective_planned` applies
-	// the total_amount fallback once, in a CTE, so the overspent test and the
-	// planned total cannot disagree about which number a line-less budget has.
+	// One query over the same rollup the list uses. The total_amount fallback
+	// for line-less budgets is applied once, in the CTE, on the side the
+	// budget's own type names — so the overspent test and the planned totals
+	// cannot disagree about which number a line-less budget has.
 	err := h.db.QueryRow(`
 		WITH rolled AS (
 			SELECT b.status,
-			       CASE WHEN roll.planned = 0 THEN COALESCE(b.total_amount, 0)
-			            ELSE roll.planned END AS effective_planned,
-			       roll.actual
+			       CASE WHEN roll.planned = 0 AND b.budget_type <> 'revenue'
+			            THEN COALESCE(b.total_amount, 0)
+			            ELSE roll.planned_expense END AS eff_planned_expense,
+			       CASE WHEN roll.planned = 0 AND b.budget_type = 'revenue'
+			            THEN COALESCE(b.total_amount, 0)
+			            ELSE roll.planned_revenue END AS eff_planned_revenue,
+			       roll.actual_expense, roll.actual_revenue
 			FROM budgets b
 			LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id`+budgetRollupSQL+where+`
 		)
 		SELECT
 			COUNT(*) FILTER (WHERE status = 'active'),
-			COUNT(*) FILTER (WHERE status = 'active' AND actual > effective_planned),
-			COALESCE(SUM(effective_planned), 0),
-			COALESCE(SUM(actual), 0)
+			COUNT(*) FILTER (WHERE status = 'active'
+			                   AND eff_planned_expense > 0
+			                   AND actual_expense > eff_planned_expense),
+			COALESCE(SUM(eff_planned_expense), 0),
+			COALESCE(SUM(actual_expense), 0),
+			COALESCE(SUM(eff_planned_revenue), 0),
+			COALESCE(SUM(actual_revenue), 0)
 		FROM rolled`, args...).Scan(
-		&out.ActiveBudgets, &out.OverspentBudgets, &out.TotalPlanned, &out.TotalActual)
+		&out.ActiveBudgets, &out.OverspentBudgets,
+		&out.PlannedExpense, &out.ActualExpense,
+		&out.PlannedRevenue, &out.ActualRevenue)
 	if err != nil {
 		h.log.Error("Failed to build budgets summary", "error", err)
 		response.InternalError(c, "Failed to build budgets summary")
 		return
 	}
-	out.Variance = out.TotalPlanned - out.TotalActual
+	out.TotalPlanned = out.PlannedExpense + out.PlannedRevenue
+	out.TotalActual = out.ActualExpense + out.ActualRevenue
+	out.Variance = out.PlannedExpense - out.ActualExpense
 
 	response.Success(c, out)
 }
