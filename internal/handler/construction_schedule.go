@@ -330,9 +330,12 @@ func (h *Handler) UpdateWorkSchedule(c *gin.Context) {
 	defer tx.Rollback()
 
 	if clearing {
+		// Sanasi olib tashlangan ish yana "rejalashtirilmagan" holatga qaytadi —
+		// schedule_source ham 'none' bo'lishi kerak, aks holda sanasiz ish
+		// "qo'lda qo'yilgan" bo'lib qolib, avtoreja unga tegmay ketardi.
 		if _, err := tx.Exec(`
 			UPDATE construction_estimate_line
-			SET sched_start = NULL, sched_end = NULL, updated_date = NOW()
+			SET sched_start = NULL, sched_end = NULL, schedule_source = 'none', updated_date = NOW()
 			WHERE id = $1 AND tenant_id = $2
 		`, lineID, tenantID); err != nil {
 			h.log.Error("work schedule: clear failed", "error", err)
@@ -350,9 +353,18 @@ func (h *Handler) UpdateWorkSchedule(c *gin.Context) {
 		return
 	}
 
+	// Bu yagona joy — foydalanuvchi bar'ni sudrab yoki sanani yozib o'zgartirgan
+	// joy — schedule_source ni 'manual' qiladi (TZ §0.3: qo'lda qo'yilgan sana
+	// daxlsiz). Ilgari hech qaysi qo'l yo'li buni yozmasdi, shuning uchun
+	// avtoreja bir marta yurgizilgach, prorabning qo'l bilan qo'ygan sanasini
+	// keyingi yugurish jimgina qaytarib tashlardi.
+	//
+	// Quyidagi propagatsiya (FS kaskadi) ataylab 'manual' qilinmaydi: u
+	// foydalanuvchining qarori emas, uning harakatidan kelib chiqqan natija —
+	// aks holda bitta sudrash butun zanjirni abadiy muzlatib qo'yardi.
 	if _, err := tx.Exec(`
 		UPDATE construction_estimate_line
-		SET sched_start = $1, sched_end = $2, updated_date = NOW()
+		SET sched_start = $1, sched_end = $2, schedule_source = 'manual', updated_date = NOW()
 		WHERE id = $3 AND tenant_id = $4
 	`, newStart, newEnd, lineID, tenantID); err != nil {
 		h.log.Error("work schedule: update failed", "error", err)
@@ -525,9 +537,18 @@ func (h *Handler) BulkUpdateWorkSchedule(c *gin.Context) {
 
 	for _, it := range body.Items {
 		if it.SchedStart == nil && it.SchedEnd == nil {
+			// Sanasiz ish 'none' ga qaytadi — yuqoridagi bir qatorli
+			// tozalash bilan bir xil sabab.
+			//
+			// Sana YOZILADIGAN tarmoq (pastda) ataylab schedule_source ga
+			// tegmaydi: bu endpoint'ni "Hammasini grafikka qo'shish",
+			// "Grafikka qo'shish" va bekor qilish chaqiradi — ular tizim
+			// bergan standart sanalar, prorabning tanlovi emas. Ularni
+			// 'manual' qilish minglab ishni avtorejadan abadiy chiqarib
+			// yuborardi.
 			if _, err := tx.Exec(`
 				UPDATE construction_estimate_line
-				SET sched_start = NULL, sched_end = NULL, updated_date = NOW()
+				SET sched_start = NULL, sched_end = NULL, schedule_source = 'none', updated_date = NOW()
 				WHERE id = $1 AND tenant_id = $2
 			`, it.LineID, tenantID); err != nil {
 				response.InternalError(c, "Failed to update schedule")
