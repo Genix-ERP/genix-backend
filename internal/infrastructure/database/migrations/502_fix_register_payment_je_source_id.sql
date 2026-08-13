@@ -1,4 +1,4 @@
--- 500: RegisterPartnerPayment JEs carried the CONTACT id as source_id.
+-- 502 (asli 500): RegisterPartnerPayment JEs carried the CONTACT id as source_id.
 --
 -- POST /payments/register wrote journal_entries.source_id = contact_id instead
 -- of the payment id. That broke JE→payment tracing and made the

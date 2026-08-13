@@ -1,4 +1,4 @@
--- 499: Seed the legacy tax_rates catalog with the standard Uzbek QQS rates.
+-- 501 (asli 499): Seed the legacy tax_rates catalog with the standard Uzbek QQS rates.
 --
 -- Soliq audit 2026-08-13: the only tax_rates rows most tenants ever had were
 -- test artifacts (soft-deleted), so the sales UI's default-tax fallback found
