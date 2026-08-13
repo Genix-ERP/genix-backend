@@ -6673,6 +6673,31 @@ func (h *Handler) CloneBuildingEstimates(c *gin.Context) {
 		LIMIT 1
 	`, projectID, tenantID, targetBuildingID).Scan(&openIterID)
 
+	// The target block was created moments ago in this very transaction, so it
+	// has NO iteration yet — the lookup above always came back NULL and the
+	// period_fakt seeding below was skipped entirely. Result: the clone carried
+	// done_quantity (so the progress bar/status showed the source's 52%) while
+	// the Bosqichlar BAJARILDI input read 0, breaking the
+	// done_quantity = Σ period_fakt invariant this code is meant to keep.
+	// Open the block's first iteration so the seeding has somewhere to land.
+	// Iterations are per (project, building) with one open row each
+	// (migration 451), so seq 1 is correct for a brand-new block.
+	if !openIterID.Valid {
+		var newIterID int64
+		if err := tx.QueryRow(`
+			INSERT INTO construction_form2_iteration
+			    (tenant_id, project_id, building_id, iteration_seq, status, opened_at, opened_by)
+			VALUES ($1, $2, $3, 1, 'open', NOW(), $4)
+			RETURNING id
+		`, tenantID, projectID, targetBuildingID, userID).Scan(&newIterID); err != nil {
+			h.log.Error("CloneBuildingEstimates: open iteration for target block failed",
+				"error", err, "target_building_id", targetBuildingID)
+			response.InternalError(c, "Failed to open Forma 2 iteration for the cloned block")
+			return
+		}
+		openIterID = sql.NullInt64{Int64: newIterID, Valid: true}
+	}
+
 	// 2. For each source estimate, create a fresh estimate row on the
 	//    target building, then clone all of its lines. is_current is
 	//    deliberately set to FALSE on every clone — the source's "v86 is
