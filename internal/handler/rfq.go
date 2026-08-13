@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -166,11 +167,6 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 	id := uuid.New()
 	now := time.Now()
 
-	// Generate RFQ number
-	var count int
-	h.db.QueryRow("SELECT COUNT(*) FROM rfqs WHERE tenant_id = $1", tenantID).Scan(&count)
-	rfqNumber := fmt.Sprintf("RFQ%05d", count+1)
-
 	// Parse deadline - default to 30 days from now if not provided
 	var deadline time.Time
 	if input.Deadline != "" {
@@ -195,16 +191,6 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 		notes = &input.Notes
 	}
 
-	// Start transaction
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
-		response.InternalError(c, "Failed to create RFQ")
-		return
-	}
-	defer tx.Rollback()
-
-	// Insert RFQ
 	// issue_date is the date RFQ was created, deadline is the response deadline
 	issueDate := now.Format("2006-01-02")
 
@@ -215,19 +201,78 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
+	// Generate RFQ number with MAX+1 scoped by (tenant, org). Must NOT filter
+	// on deleted_at — the unique constraint rfqs_tenant_org_rfq_number_key
+	// applies to every row (including soft-deleted), so excluding them would
+	// hand out numbers that are already taken. Mirrors the purchase-orders
+	// numbering pattern.
+	nextRFQNumber := func() string {
+		var maxNum int
+		if orgIDPtr != nil {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(rfq_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM rfqs
+				WHERE tenant_id = $1 AND organization_id = $2
+				  AND rfq_number ~ '^RFQ-?[0-9]+$'`,
+				tenantID, *orgIDPtr,
+			).Scan(&maxNum)
+		} else {
+			h.db.QueryRow(`
+				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(rfq_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+				FROM rfqs
+				WHERE tenant_id = $1 AND organization_id IS NULL
+				  AND rfq_number ~ '^RFQ-?[0-9]+$'`,
+				tenantID,
+			).Scan(&maxNum)
+		}
+		return fmt.Sprintf("RFQ%05d", maxNum+1)
+	}
+
+	// Insert the RFQ header OUTSIDE the transaction so a unique-constraint
+	// collision (concurrent POSTs racing for the same next number) can be
+	// retried; the transaction below covers only items and invitations,
+	// matching the create-purchase-order pattern.
 	query := `
-		INSERT INTO rfqs (id, tenant_id, organization_id, rfq_number, title, description, status, issue_date, response_deadline, deadline, terms, notes, created_by, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		INSERT INTO rfqs (id, tenant_id, organization_id, rfq_number, title, description, status, issue_date, deadline, terms, notes, created_by, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 	`
 
-	_, err = tx.Exec(query,
-		id, tenantID, orgIDPtr, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, deadline, terms, notes, userID, now, now,
-	)
-	if err != nil {
-		h.log.Error("Failed to insert RFQ", "error", err)
+	var rfqNumber string
+	for attempt := 0; attempt < 5; attempt++ {
+		rfqNumber = nextRFQNumber()
+		_, err := h.db.Exec(query,
+			id, tenantID, orgIDPtr, rfqNumber, input.Title, description, entity.RFQStatusDraft, issueDate, deadline, terms, notes, userID, now, now,
+		)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "rfqs_tenant_org_rfq_number_key") && attempt < 4 {
+			h.log.Warn("RFQ number collision, retrying", "rfq_number", rfqNumber, "attempt", attempt+1)
+			continue
+		}
+		h.log.Error("Failed to insert RFQ", "error", err, "rfq_number", rfqNumber)
 		response.InternalError(c, "Failed to create RFQ")
 		return
 	}
+
+	// If anything below fails, remove the header so we don't leak an orphaned
+	// zero-line draft. Callers must roll back the tx first — the uncommitted
+	// child rows FK-reference the header.
+	cleanupHeader := func() {
+		if _, delErr := h.db.Exec(`DELETE FROM rfqs WHERE id = $1`, id); delErr != nil {
+			h.log.Error("Failed to clean up orphaned RFQ header", "error", delErr, "rfq_id", id)
+		}
+	}
+
+	// Transaction covers items and invitations only.
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		cleanupHeader()
+		response.InternalError(c, "Failed to create RFQ")
+		return
+	}
+	defer tx.Rollback()
 
 	// Insert items
 	items := make([]entity.RFQItem, 0, len(input.Items))
@@ -259,6 +304,8 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 		`, itemID, tenantID, id, lineNumber, productID, item.Description, item.Quantity, unit, specs, now, now)
 		if err != nil {
 			h.log.Error("Failed to insert RFQ item", "error", err)
+			tx.Rollback()
+			cleanupHeader()
 			response.InternalError(c, "Failed to create RFQ")
 			return
 		}
@@ -294,6 +341,7 @@ func (h *Handler) CreateRFQ(c *gin.Context) {
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
+		cleanupHeader()
 		response.InternalError(c, "Failed to create RFQ")
 		return
 	}
@@ -617,8 +665,11 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 		totalAmount += item.UnitPrice * qty
 	}
 
-	// Insert response
-	_, err = tx.Exec(`
+	// Insert response. On re-submission the ON CONFLICT branch keeps the
+	// existing row's id, so RETURNING is required — inserting items against
+	// the freshly generated candidate id would violate the FK and abort the
+	// whole transaction.
+	err = tx.QueryRow(`
 		INSERT INTO rfq_responses (id, tenant_id, rfq_id, vendor_id, total_amount, lead_time_days, valid_until, notes, created_at, updated_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		ON CONFLICT (rfq_id, vendor_id) DO UPDATE SET
@@ -627,7 +678,8 @@ func (h *Handler) SubmitRFQResponse(c *gin.Context) {
 			valid_until = EXCLUDED.valid_until,
 			notes = EXCLUDED.notes,
 			updated_at = EXCLUDED.updated_at
-	`, responseID, tenantID, rfqID, vendorID, totalAmount, input.LeadTimeDays, validUntil, notes, now, now)
+		RETURNING id
+	`, responseID, tenantID, rfqID, vendorID, totalAmount, input.LeadTimeDays, validUntil, notes, now, now).Scan(&responseID)
 	if err != nil {
 		h.log.Error("Failed to insert response", "error", err)
 		response.InternalError(c, "Failed to submit response")
@@ -909,7 +961,7 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 		SELECT i.product_id, i.description, i.quantity, COALESCE(i.unit, 'pcs'),
 			   COALESCE(ri.unit_price, 0)
 		FROM rfq_items i
-		LEFT JOIN rfq_response_items ri ON ri.item_id = i.id AND ri.response_id = $2
+		LEFT JOIN rfq_response_items ri ON ri.rfq_item_id = i.id AND ri.response_id = $2
 		WHERE i.rfq_id = $1
 		ORDER BY i.line_number
 	`, rfqID, winningResponse.ID)
@@ -935,26 +987,29 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 		return
 	}
 
+	// purchase_order_lines.product_id is NOT NULL — free-text RFQ items
+	// cannot be converted, fail fast with an actionable message instead of a
+	// mid-insert 500.
+	for _, item := range items {
+		if !item.ProductID.Valid {
+			response.BadRequest(c, "All RFQ items must be linked to a product before converting to a Purchase Order")
+			return
+		}
+	}
+
 	// Get vendor name
 	var vendorName string
 	h.db.QueryRow("SELECT name FROM contacts WHERE id = $1", winnerID).Scan(&vendorName)
 
-	// Start transaction
-	tx, err := h.db.Begin()
-	if err != nil {
-		h.log.Error("Failed to start transaction", "error", err)
-		response.InternalError(c, "Failed to convert RFQ to PO")
-		return
+	// Get organization ID from context
+	orgID, _ := middleware.GetOrganizationID(c)
+	var orgIDPtr *uuid.UUID
+	if orgID != uuid.Nil {
+		orgIDPtr = &orgID
 	}
-	defer tx.Rollback()
 
 	now := time.Now()
 	poID := uuid.New()
-
-	// Generate PO number
-	var poCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	poNumber := fmt.Sprintf("PO-%05d", poCount+1)
 
 	// Calculate expected delivery date based on lead time
 	expectedDate := now.AddDate(0, 0, 7) // default 7 days
@@ -977,10 +1032,11 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 		poNotes += "\n\nVendor Notes: " + winningResponse.Notes.String
 	}
 
-	// Insert Purchase Order
-	_, err = tx.Exec(`
+	// Insert the PO header OUTSIDE the line transaction so a number collision
+	// can be retried, matching the create-purchase-order pattern.
+	headerQuery := `
 		INSERT INTO purchase_orders (
-			id, tenant_id, order_number, vendor_id, vendor_name,
+			id, tenant_id, organization_id, order_number, vendor_id,
 			order_date, expected_date, subtotal, total_amount,
 			status, payment_status, notes, rfq_id,
 			requested_by, created_at, updated_at
@@ -990,15 +1046,44 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 			$10, $11, $12, $13,
 			$14, $15, $16
 		)
-	`, poID, tenantID, poNumber, winnerID, vendorName,
-		now, expectedDate, subtotal, subtotal,
-		"draft", "unpaid", poNotes, rfqID,
-		userID, now, now)
-	if err != nil {
-		h.log.Error("Failed to create PO", "error", err)
+	`
+
+	var poNumber string
+	for attempt := 0; attempt < 5; attempt++ {
+		poNumber = h.nextPurchaseOrderNumber(tenantID, orgIDPtr)
+		_, err = h.db.Exec(headerQuery,
+			poID, tenantID, orgIDPtr, poNumber, winnerID,
+			now, expectedDate, subtotal, subtotal,
+			entity.POStatusDraft, entity.PaymentStatusUnpaid, poNotes, rfqID,
+			userID, now, now)
+		if err == nil {
+			break
+		}
+		if strings.Contains(err.Error(), "purchase_orders_tenant_org_order_number_key") && attempt < 4 {
+			h.log.Warn("Purchase order number collision, retrying", "order_number", poNumber, "attempt", attempt+1)
+			continue
+		}
+		h.log.Error("Failed to create PO", "error", err, "order_number", poNumber)
 		response.InternalError(c, "Failed to create Purchase Order")
 		return
 	}
+
+	// If line insertion fails, remove the header so we don't leak an orphaned
+	// zero-line draft PO. Callers must roll back the tx first.
+	cleanupHeader := func() {
+		if _, delErr := h.db.Exec(`DELETE FROM purchase_orders WHERE id = $1`, poID); delErr != nil {
+			h.log.Error("Failed to clean up orphaned purchase order header", "error", delErr, "po_id", poID)
+		}
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		h.log.Error("Failed to start transaction", "error", err)
+		cleanupHeader()
+		response.InternalError(c, "Failed to convert RFQ to PO")
+		return
+	}
+	defer tx.Rollback()
 
 	// Insert PO lines
 	for i, item := range items {
@@ -1006,37 +1091,32 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 		lineNumber := i + 1
 		lineTotal := item.Quantity * item.UnitPrice
 
-		var productID *uuid.UUID
-		if item.ProductID.Valid {
-			if pid, err := uuid.Parse(item.ProductID.String); err == nil {
-				productID = &pid
-			}
-		}
-
-		// Get product name if product_id exists
-		productName := item.Description
-		if productID != nil {
-			var pName string
-			if err := h.db.QueryRow("SELECT name FROM products WHERE id = $1", productID).Scan(&pName); err == nil && pName != "" {
-				productName = pName
-			}
+		productID, err := uuid.Parse(item.ProductID.String)
+		if err != nil {
+			h.log.Error("Invalid product ID on RFQ item", "error", err, "product_id", item.ProductID.String)
+			tx.Rollback()
+			cleanupHeader()
+			response.InternalError(c, "Failed to create Purchase Order lines")
+			return
 		}
 
 		_, err = tx.Exec(`
 			INSERT INTO purchase_order_lines (
-				id, tenant_id, purchase_order_id, line_number,
-				product_id, product_name, quantity, unit_price, total_price,
+				id, purchase_order_id, line_number, product_id, description,
+				quantity, unit_price, line_total, quantity_received, quantity_invoiced,
 				created_at, updated_at
 			) VALUES (
-				$1, $2, $3, $4,
-				$5, $6, $7, $8, $9,
-				$10, $11
+				$1, $2, $3, $4, $5,
+				$6, $7, $8, $9, $10,
+				$11, $12
 			)
-		`, lineID, tenantID, poID, lineNumber,
-			productID, productName, item.Quantity, item.UnitPrice, lineTotal,
+		`, lineID, poID, lineNumber, productID, item.Description,
+			item.Quantity, item.UnitPrice, lineTotal, 0, 0,
 			now, now)
 		if err != nil {
 			h.log.Error("Failed to create PO line", "error", err)
+			tx.Rollback()
+			cleanupHeader()
 			response.InternalError(c, "Failed to create Purchase Order lines")
 			return
 		}
@@ -1044,6 +1124,7 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 
 	if err = tx.Commit(); err != nil {
 		h.log.Error("Failed to commit transaction", "error", err)
+		cleanupHeader()
 		response.InternalError(c, "Failed to convert RFQ to PO")
 		return
 	}
