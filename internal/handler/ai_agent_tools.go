@@ -2047,17 +2047,21 @@ func toolSetWorkflowStatus(h *Handler, c *gin.Context, tenantID uuid.UUID, orgAr
 func toolBusinessOverview(h *Handler, c *gin.Context, tenantID uuid.UUID, orgArg interface{}, userID uuid.UUID, args map[string]interface{}) (interface{}, error) {
 	f := func(q string, a ...interface{}) float64 { var v float64; _ = h.db.QueryRow(q, a...).Scan(&v); return v }
 	i := func(q string, a ...interface{}) int { var v int; _ = h.db.QueryRow(q, a...).Scan(&v); return v }
-	// Cash comes from the posted ledger over CASH-type accounts — the single
-	// cash engine (conventions.md §2). bank_accounts.balance is a dead,
-	// never-ledger-synced column that must not be quoted as cash.
-	cash := f(`SELECT COALESCE(SUM(l.debit_amount - l.credit_amount),0)
-		FROM journal_entry_lines l
-		JOIN journal_entries je ON je.id = l.journal_entry_id
-			AND je.status = 'posted' AND je.deleted_at IS NULL
-			AND ($2::uuid IS NULL OR je.organization_id = $2)
-		JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
-			AND a.is_leaf = true AND a.is_active = true
-		JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'`, tenantID, orgArg)
+	// Cash comes from the ONE cash engine (cashBalancesAsOf): canonical
+	// account predicate + opening_balance + account-level org scoping. The
+	// hand-rolled query this replaces used bare at.code='CASH' and bare
+	// is_leaf=true, so it dropped is_bank_account accounts and NULL-is_leaf
+	// rows — the AI quoted a cash figure no human surface showed.
+	aiOrgID := uuid.Nil
+	if orgArg != nil {
+		if oid, ok := orgArg.(uuid.UUID); ok {
+			aiOrgID = oid
+		}
+	}
+	var cash float64
+	if _, engineCash, cashErr := h.cashBalancesAsOf(tenantID, aiOrgID, time.Now().Format("2006-01-02")); cashErr == nil {
+		cash = engineCash
+	}
 	ar := f(`SELECT COALESCE(SUM(total_amount-amount_paid),0) FROM sales_invoices
 		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2) AND total_amount-amount_paid > 0.005`, tenantID, orgArg)
 	ap := f(`SELECT COALESCE(SUM(total_amount-amount_paid),0) FROM purchase_invoices

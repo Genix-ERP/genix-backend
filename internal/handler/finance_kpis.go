@@ -144,6 +144,14 @@ func (h *Handler) GetFinanceKPIs(c *gin.Context) {
 
 	assetsBegin, liabBegin, _, _, _ := bsAt(bsOpen)
 	assetsEnd, liabEnd, currentAssets, currentLiabilities, cash := bsAt(periodTo)
+
+	// The cash_balance KPI must equal the dashboard's cash card, so it comes
+	// from the one cash engine (cashBalancesAsOf): opening_balance counted,
+	// organizations scoped on the ACCOUNT. bsAt's line-driven variant stays
+	// for the balance-sheet ratios, but the headline cash number is engine's.
+	if _, engineCash, cashErr := h.cashBalancesAsOf(tenantID, orgID, periodTo); cashErr == nil {
+		cash = engineCash
+	}
 	equityBegin := assetsBegin - liabBegin
 	equityEnd := assetsEnd - liabEnd
 	avgAssets := (assetsBegin + assetsEnd) / 2

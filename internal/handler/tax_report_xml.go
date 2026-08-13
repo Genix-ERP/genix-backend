@@ -94,13 +94,14 @@ func (h *Handler) ExportEmployeeTaxReportXML(c *gin.Context) {
 		  COALESCE(MAX(pet.rate_snapshot), 0)      AS rate
 		FROM payroll_entry_taxes pet
 		JOIN payroll_entries pe ON pe.id = pet.payroll_entry_id
+		JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
 		WHERE pet.tenant_id             = $1
 		  AND UPPER(pet.tax_code_snapshot) = $2
-		  AND pe.created_at >= $3
-		  AND pe.created_at <= $4
+		  AND pp.end_date >= $3
+		  AND pp.end_date <= $4
 		GROUP BY pe.employee_id, pe.employee_name, pe.position_snapshot
 		ORDER BY pe.employee_name
-	`, tenantID, taxCode, startDate, endDate+" 23:59:59")
+	`, tenantID, taxCode, startDate, endDate)
 	if err != nil {
 		h.log.Error("Failed to aggregate employee-taxes for XML export", "error", err)
 		response.InternalError(c, "Failed to build XML report")

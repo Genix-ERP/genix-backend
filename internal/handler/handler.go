@@ -1369,14 +1369,21 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	}
 
 	// Cash Transactions (Kassa)
+	// Legacy cash_transactions shadow table: READ-ONLY since the Pul oqimi
+	// deep fix (2026-08-13). Writes recorded "posted" money with no journal
+	// entry behind it, so the till could be empty while /cash/balance —
+	// which reads only the ledger — still showed the money, and the RKO
+	// sufficiency guard then approved orders the till could not pay. All
+	// money movement goes through /cash/orders (draft → confirm posts the
+	// JE). GETs stay for history.
 	cashTransactions := rg.Group("/cash-transactions")
 	cashTransactions.Use(h.perm.Require("finance", "cash_transaction", "read"))
 	{
 		cashTransactions.GET("", h.ListCashTransactions)
-		cashTransactions.POST("", h.perm.Require("finance", "cash_transaction", "create"), h.CreateCashTransaction)
+		cashTransactions.POST("", h.CashTransactionWritesRetired)
 		cashTransactions.GET("/:id", h.GetCashTransaction)
-		cashTransactions.PUT("/:id", h.perm.Require("finance", "cash_transaction", "update"), h.UpdateCashTransaction)
-		cashTransactions.DELETE("/:id", h.perm.Require("finance", "cash_transaction", "delete"), h.DeleteCashTransaction)
+		cashTransactions.PUT("/:id", h.CashTransactionWritesRetired)
+		cashTransactions.DELETE("/:id", h.CashTransactionWritesRetired)
 	}
 
 	// Fiscal Years. Period management gates: create/update/delete follow the
@@ -1432,16 +1439,15 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	bankImport := rg.Group("/bank-statement-imports")
 	{
 		bankImport.POST("", h.perm.Require("finance", "bank_account", "update"), h.ImportBankStatement1C)
-		bankImport.GET("", h.ListBankImports)
+		// The list shows statement dates, balances and turnover totals — that
+		// is finance data, so it carries the same read gate as every other
+		// bank surface (it used to be reachable by any authenticated tenant
+		// user).
+		bankImport.GET("", h.perm.Require("finance", "bank_account", "read"), h.ListBankImports)
 
 		// Excel vipiska (Turonbank format) — parse + auto-classify + review,
 		// then post or reject each line. Ported from the yuksalish branch,
 		// where these have been live; genix and sharja 404'd on all five.
-		//
-		// Gated per-route on finance:bank_account, not with a group-level
-		// Use(): the two routes above predate this and currently carry no
-		// gate at all, and silently tightening them is an unrelated
-		// regression that belongs in its own change.
 		bankImport.POST("/vipiska", h.perm.Require("finance", "bank_account", "update"), h.ImportBankVipiska)
 		bankImport.GET("/:id/transactions", h.perm.Require("finance", "bank_account", "read"), h.GetBankVipiskaTransactions)
 		bankImport.PUT("/lines/:lineId/accounts", h.perm.Require("finance", "bank_account", "update"), h.UpdateBankVipiskaLineAccounts)
