@@ -92,10 +92,25 @@ func (h *Handler) ListPurchaseOrders(c *gin.Context) {
 	}
 
 	if status != "" {
-		argCount++
-		baseQuery += fmt.Sprintf(" AND po.status = $%d", argCount)
-		countQuery += fmt.Sprintf(" AND po.status = $%d", argCount)
-		args = append(args, status)
+		// Accepts a single status or a comma-separated set
+		// (e.g. status=approved,ordered,partial for receivable POs).
+		statuses := make([]string, 0, 4)
+		for _, s := range strings.Split(status, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				statuses = append(statuses, s)
+			}
+		}
+		if len(statuses) > 0 {
+			placeholders := make([]string, len(statuses))
+			for i, s := range statuses {
+				argCount++
+				placeholders[i] = fmt.Sprintf("$%d", argCount)
+				args = append(args, s)
+			}
+			statusFilter := fmt.Sprintf(" AND po.status IN (%s)", strings.Join(placeholders, ","))
+			baseQuery += statusFilter
+			countQuery += statusFilter
+		}
 	}
 
 	if vendorID != "" {
@@ -262,6 +277,34 @@ func (h *Handler) fillLineDescriptions(tenantID uuid.UUID, lines []entity.Create
 			lines[i].Description = name
 		}
 	}
+}
+
+// nextPurchaseOrderNumber generates the next PO number with MAX+1 scoped by
+// (tenant, org). Must NOT filter on deleted_at — the unique constraint
+// purchase_orders_tenant_org_order_number_key applies to every row
+// (including soft-deleted), so excluding them would hand out numbers
+// that are already taken and loop forever on collision retry. Mirrors
+// the sales-orders fix.
+func (h *Handler) nextPurchaseOrderNumber(tenantID uuid.UUID, orgID *uuid.UUID) string {
+	var maxNum int
+	if orgID != nil {
+		h.db.QueryRow(`
+			SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+			FROM purchase_orders
+			WHERE tenant_id = $1 AND organization_id = $2
+			  AND order_number ~ '^PO-[0-9]+$'`,
+			tenantID, *orgID,
+		).Scan(&maxNum)
+	} else {
+		h.db.QueryRow(`
+			SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+			FROM purchase_orders
+			WHERE tenant_id = $1 AND organization_id IS NULL
+			  AND order_number ~ '^PO-[0-9]+$'`,
+			tenantID,
+		).Scan(&maxNum)
+	}
+	return fmt.Sprintf("PO-%05d", maxNum+1)
 }
 
 func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
@@ -448,32 +491,8 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 		orgIDPtr = &orgID
 	}
 
-	// Generate order number with MAX+1 scoped by (tenant, org). Must NOT
-	// filter on deleted_at — the unique constraint
-	// purchase_orders_tenant_org_order_number_key applies to every row
-	// (including soft-deleted), so excluding them would hand out numbers
-	// that are already taken and loop forever on collision retry. Mirrors
-	// the sales-orders fix.
 	nextOrderNumber := func() string {
-		var maxNum int
-		if orgIDPtr != nil {
-			h.db.QueryRow(`
-				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
-				FROM purchase_orders
-				WHERE tenant_id = $1 AND organization_id = $2
-				  AND order_number ~ '^PO-[0-9]+$'`,
-				tenantID, *orgIDPtr,
-			).Scan(&maxNum)
-		} else {
-			h.db.QueryRow(`
-				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
-				FROM purchase_orders
-				WHERE tenant_id = $1 AND organization_id IS NULL
-				  AND order_number ~ '^PO-[0-9]+$'`,
-				tenantID,
-			).Scan(&maxNum)
-		}
-		return fmt.Sprintf("PO-%05d", maxNum+1)
+		return h.nextPurchaseOrderNumber(tenantID, orgIDPtr)
 	}
 
 	// Insert purchase order — done OUTSIDE the transaction so we can retry
