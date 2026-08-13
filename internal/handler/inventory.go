@@ -1138,7 +1138,8 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 
 	baseQuery := `
 		SELECT t.id, t.tenant_id, t.inventory_id, t.transaction_type, t.reference_type, t.reference_id,
-			   t.quantity, t.unit_cost, t.total_cost, t.from_warehouse_id, t.to_warehouse_id,
+			   t.quantity, t.unit_cost, t.total_cost, COALESCE(t.warehouse_id, i.warehouse_id),
+			   t.from_warehouse_id, t.to_warehouse_id,
 			   t.from_location_id, t.to_location_id, t.reason, t.notes, t.transaction_date,
 			   t.created_by, t.created_at,
 			   i.product_id, p.code as product_code, p.name as product_name,
@@ -1151,12 +1152,12 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 		LEFT JOIN warehouses tw ON t.to_warehouse_id = tw.id
 		LEFT JOIN warehouses iw ON i.warehouse_id = iw.id
 		LEFT JOIN employees e ON t.created_by = e.id
-		WHERE t.tenant_id = $1
+		WHERE t.tenant_id = $1 AND t.deleted_at IS NULL
 	`
 	countQuery := `
 		SELECT COUNT(*) FROM inventory_transactions t
 		JOIN inventory i ON t.inventory_id = i.id
-		WHERE t.tenant_id = $1
+		WHERE t.tenant_id = $1 AND t.deleted_at IS NULL
 	`
 
 	args := []interface{}{tenantID}
@@ -1178,9 +1179,13 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	}
 
 	if warehouseID != "" {
+		// v2 applyStockDelta rows (production, adjustments…) denormalize the
+		// warehouse into t.warehouse_id and leave from/to NULL (migration 447);
+		// legacy rows only set from/to. i.warehouse_id covers pre-447 rows
+		// where t.warehouse_id is NULL. Match all of them.
 		argCount++
-		baseQuery += fmt.Sprintf(" AND (t.from_warehouse_id = $%d OR t.to_warehouse_id = $%d)", argCount, argCount)
-		countQuery += fmt.Sprintf(" AND (t.from_warehouse_id = $%d OR t.to_warehouse_id = $%d)", argCount, argCount)
+		baseQuery += fmt.Sprintf(" AND (COALESCE(t.warehouse_id, i.warehouse_id) = $%d OR t.from_warehouse_id = $%d OR t.to_warehouse_id = $%d)", argCount, argCount, argCount)
+		countQuery += fmt.Sprintf(" AND (COALESCE(t.warehouse_id, i.warehouse_id) = $%d OR t.from_warehouse_id = $%d OR t.to_warehouse_id = $%d)", argCount, argCount, argCount)
 		args = append(args, warehouseID)
 	}
 
@@ -1236,6 +1241,7 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 		Quantity          float64                `json:"quantity"`
 		UnitCost          *float64               `json:"unit_cost,omitempty"`
 		TotalCost         *float64               `json:"total_cost,omitempty"`
+		WarehouseID       *uuid.UUID             `json:"warehouse_id,omitempty"`
 		FromWarehouseID   *uuid.UUID             `json:"from_warehouse_id,omitempty"`
 		FromWarehouseName string                 `json:"from_warehouse_name,omitempty"`
 		ToWarehouseID     *uuid.UUID             `json:"to_warehouse_id,omitempty"`
@@ -1257,13 +1263,13 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 	for rows.Next() {
 		var m MovementResponse
 		var refType, reason, notes sql.NullString
-		var refID, fromWH, toWH, fromLoc, toLoc, createdBy sql.NullString
+		var refID, wh, fromWH, toWH, fromLoc, toLoc, createdBy sql.NullString
 		var unitCost, totalCost sql.NullFloat64
 		var fromWHName, toWHName, createdFirstName, createdLastName sql.NullString
 
 		err := rows.Scan(
 			&m.ID, &m.TenantID, &m.InventoryID, &m.TransactionType, &refType, &refID,
-			&m.Quantity, &unitCost, &totalCost, &fromWH, &toWH,
+			&m.Quantity, &unitCost, &totalCost, &wh, &fromWH, &toWH,
 			&fromLoc, &toLoc, &reason, &notes, &m.TransactionDate,
 			&createdBy, &m.CreatedAt,
 			&m.ProductID, &m.ProductCode, &m.ProductName,
@@ -1287,6 +1293,10 @@ func (h *Handler) ListInventoryMovements(c *gin.Context) {
 		}
 		if totalCost.Valid {
 			m.TotalCost = &totalCost.Float64
+		}
+		if wh.Valid {
+			whID, _ := uuid.Parse(wh.String)
+			m.WarehouseID = &whID
 		}
 		if fromWH.Valid {
 			fwh, _ := uuid.Parse(fromWH.String)
