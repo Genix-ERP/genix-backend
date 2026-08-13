@@ -1756,6 +1756,10 @@ func (h *Handler) PayExpense(c *gin.Context) {
 	}
 
 	var input struct {
+		// journal_id is what the web dialog sends now: the user picks a naqd
+		// or bank JOURNAL and the paying account is resolved from it — no
+		// account picker. payment_account_id stays for older clients.
+		JournalID        string `json:"journal_id"`
 		PaymentAccountID string `json:"payment_account_id"`
 		PaymentMethod    string `json:"payment_method"`
 		PaidDate         string `json:"paid_date"`
@@ -1859,10 +1863,37 @@ func (h *Handler) PayExpense(c *gin.Context) {
 		expenseAccountID = findAccount(tx, tenantID, orgIDPtr, "miscellaneous expense", "9410")
 	}
 
-	// Credit: the paying account — explicit choice from the pay dialog,
-	// else the tenant's kassa.
+	// Credit: the paying account — resolved from the chosen journal first,
+	// else an explicit account from older clients, else the tenant's kassa.
 	var creditAccountID uuid.UUID
-	if input.PaymentAccountID != "" {
+	var payJournalID uuid.UUID
+	var payJournalType string
+	if input.JournalID != "" {
+		jid, jerr := uuid.Parse(input.JournalID)
+		if jerr != nil {
+			response.BadRequest(c, "Invalid journal_id")
+			return
+		}
+		var jNext int
+		if err := tx.QueryRow(`
+			SELECT type, COALESCE(next_number, 1) FROM journals
+			WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+			  AND type IN ('cash', 'bank') AND COALESCE(is_active, true) = true
+		`, jid, tenantID).Scan(&payJournalType, &jNext); err != nil {
+			response.BadRequest(c, "Naqd yoki bank jurnali topilmadi")
+			return
+		}
+		creditAccountID = h.resolveJournalSettlementAccount(tx, tenantID, jid)
+		if creditAccountID == uuid.Nil {
+			if diag := h.journalAccountDiagnostic(tx, tenantID, jid); diag != "" {
+				response.BadRequest(c, "To'lov qayd etilmadi — "+diag)
+				return
+			}
+			response.BadRequest(c, "To'lov qayd etilmadi — jurnalga pul hisobi biriktirilmagan. Jurnal sozlamalarida hisobni ko'rsating")
+			return
+		}
+		payJournalID = jid
+	} else if input.PaymentAccountID != "" {
 		aid, err := uuid.Parse(input.PaymentAccountID)
 		if err != nil {
 			response.BadRequest(c, "Invalid payment_account_id")
@@ -1909,21 +1940,30 @@ func (h *Handler) PayExpense(c *gin.Context) {
 		}
 	}
 
-	// Journal: MISC first, GENERAL fallback (same choice the old posting
+	// Journal: the cash/bank journal the user paid from, when one was chosen —
+	// the payment then shows up in that journal's book, not buried in MISC.
+	// Otherwise MISC first, GENERAL fallback (same choice the old posting
 	// used, so expense entries stay in one journal across the migration).
 	var journalID uuid.UUID
 	var nextNumber int
-	journalQ := `
+	if payJournalID != uuid.Nil {
+		journalID = payJournalID
+		if err := tx.QueryRow(`SELECT COALESCE(next_number, 1) FROM journals WHERE id = $1`, payJournalID).Scan(&nextNumber); err != nil {
+			nextNumber = 1
+		}
+	} else {
+		journalQ := `
 		SELECT id, COALESCE(next_number, 1)
 		FROM journals WHERE tenant_id = $1 AND code IN ('MISC','GENERAL') AND deleted_at IS NULL
 		ORDER BY CASE WHEN code='MISC' THEN 0 ELSE 1 END LIMIT 1`
-	err = tx.QueryRow(journalQ, tenantID).Scan(&journalID, &nextNumber)
-	if err != nil && h.ensureDefaultChart(tenantID, orgIDPtr) {
 		err = tx.QueryRow(journalQ, tenantID).Scan(&journalID, &nextNumber)
-	}
-	if err != nil {
-		response.BadRequest(c, "No MISC/GENERAL journal found for this tenant")
-		return
+		if err != nil && h.ensureDefaultChart(tenantID, orgIDPtr) {
+			err = tx.QueryRow(journalQ, tenantID).Scan(&journalID, &nextNumber)
+		}
+		if err != nil {
+			response.BadRequest(c, "No MISC/GENERAL journal found for this tenant")
+			return
+		}
 	}
 
 	journalEntryID := uuid.New()
@@ -1986,6 +2026,14 @@ func (h *Handler) PayExpense(c *gin.Context) {
 	}
 
 	paymentMethod := strings.TrimSpace(input.PaymentMethod)
+	if paymentMethod == "" {
+		switch payJournalType {
+		case "cash":
+			paymentMethod = "cash"
+		case "bank":
+			paymentMethod = "bank"
+		}
+	}
 	res, err := tx.Exec(`
 		UPDATE expenses SET status = 'paid', paid_at = $1, paid_by = $2,
 		       payment_account_id = $3, journal_entry_id = $4,
