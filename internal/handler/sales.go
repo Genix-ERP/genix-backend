@@ -3108,21 +3108,62 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					}
 				}
 
-				// COGS entries
+				// COGS entries.
+				//
+				// Stock accounts carry mandatory 'ombor' analytics (TT §4.5), so
+				// these lines MUST carry warehouse_id or the invariant trigger
+				// rejects them and poisons the whole transaction. The DB-side
+				// enrichment can't help on its own: it looked for
+				// sales_invoices.warehouse_id, a column that does not exist
+				// (fixed in migration 496). Resolve the delivery warehouse here
+				// and pass it explicitly — the trigger stays a backstop.
+				var cogsWarehouseID *uuid.UUID
+				{
+					var whID uuid.UUID
+					err := tx.QueryRow(`
+						SELECT wl.warehouse_id
+						FROM stock_operations so
+						LEFT JOIN warehouse_locations wl ON wl.id = so.source_location_id
+						WHERE so.source_type = 'sales_order' AND so.source_id = $1
+						  AND so.direction = 'delivery' AND so.deleted_at IS NULL
+						  AND so.state <> 'cancelled' AND wl.warehouse_id IS NOT NULL
+						ORDER BY so.created_at DESC LIMIT 1`, orderID).Scan(&whID)
+					if err != nil {
+						// Fallback: the delivery order recorded against this sales order.
+						err = tx.QueryRow(`
+							SELECT warehouse_id FROM sales_delivery_orders
+							WHERE sales_order_id = $1 AND warehouse_id IS NOT NULL
+							ORDER BY created_at DESC LIMIT 1`, orderID).Scan(&whID)
+					}
+					if err == nil && whID != uuid.Nil {
+						cogsWarehouseID = &whID
+					}
+				}
+
 				for pair, costAmount := range cogsGrouped {
 					// Debit: COGS
 					if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						debit_amount, credit_amount, exchange_rate, warehouse_id, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						uuid.New(), jeID, jeLineNumber, pair.Expense, "Cost of Goods Sold",
-						costAmount, 0.0, 1.0, now,
+						costAmount, 0.0, 1.0, cogsWarehouseID, now,
 					); err != nil {
+						// Abort instead of logging on: once a statement fails the
+						// transaction is poisoned, so continuing only produced a
+						// cascade of "current transaction is aborted" noise and an
+						// opaque 500 for the user.
 						h.log.Error("CreateInvoiceFromOrder: COGS journal line failed", "error", err, "expenseAcct", pair.Expense)
+						tx.Rollback()
+						response.BadRequest(c, "Hisob-faktura yaratib bo'lmadi: tannarx provodkasi rad etildi — "+err.Error())
+						return
 					}
 					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Expense); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: update COGS account balance failed", "error", err, "expenseAcct", pair.Expense)
+						tx.Rollback()
+						response.InternalError(c, "Failed to create invoice")
+						return
 					}
 					jeLineNumber++
 
@@ -3130,15 +3171,21 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					if _, err := tx.Exec(`
 					INSERT INTO journal_entry_lines (
 						id, journal_entry_id, line_number, account_id, description,
-						debit_amount, credit_amount, exchange_rate, created_at
-					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+						debit_amount, credit_amount, exchange_rate, warehouse_id, created_at
+					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
 						uuid.New(), jeID, jeLineNumber, pair.Output, "Stock Interim Delivery",
-						0.0, costAmount, 1.0, now,
+						0.0, costAmount, 1.0, cogsWarehouseID, now,
 					); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: stock output journal line failed", "error", err, "outputAcct", pair.Output)
+						tx.Rollback()
+						response.BadRequest(c, "Hisob-faktura yaratib bo'lmadi: ombor provodkasi rad etildi — "+err.Error())
+						return
 					}
 					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", costAmount, now, pair.Output); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: update stock output balance failed", "error", err, "outputAcct", pair.Output)
+						tx.Rollback()
+						response.InternalError(c, "Failed to create invoice")
+						return
 					}
 					jeLineNumber++
 				}
