@@ -269,12 +269,12 @@ type LandedCostInput struct {
 		CostTypeName     string  `json:"cost_type_name" binding:"required"`
 		VendorID         string  `json:"vendor_id,omitempty"`
 		VendorName       string  `json:"vendor_name,omitempty"`
-		Amount           float64 `json:"amount" binding:"required"`
+		Amount           float64 `json:"amount" binding:"required,gt=0"`
 		Currency         string  `json:"currency,omitempty"`
 		Reference        string  `json:"reference,omitempty"`
 		AllocationMethod string  `json:"allocation_method,omitempty"`
 		Notes            string  `json:"notes,omitempty"`
-	} `json:"lines" binding:"required,min=1"`
+	} `json:"lines" binding:"required,min=1,dive"`
 }
 
 // ListLandedCosts returns all landed costs

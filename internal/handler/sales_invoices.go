@@ -936,6 +936,7 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("terms_conditions = $%d", argCount))
 		args = append(args, *input.TermsConditions)
 	}
+	cancelling := false
 	if input.Status != nil && *input.Status != currentStatus {
 		// Manual status writes are restricted to cancellation. 'sent' must go through
 		// POST /:id/send (which posts the AR journal entry), and 'partial'/'paid' are
@@ -959,6 +960,7 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
+		cancelling = true
 	}
 
 	if len(updates) == 0 {
@@ -987,8 +989,38 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		return
 	}
 
+	if cancelling {
+		h.releaseInvoicedQuantities(invoiceID)
+	}
+
 	// Fetch and return updated invoice
 	h.GetSalesInvoice(c)
+}
+
+// releaseInvoicedQuantities gives back the sales_order_lines.quantity_invoiced
+// that an invoice had claimed. Without this, deleting a draft or cancelling an
+// unposted invoice left the counter inflated forever: the delivered-basis
+// creator computes delivered − invoiced and refused to re-invoice goods whose
+// only invoice was already dead, and the full-order path (whose duplicate
+// guard ignores cancelled/deleted invoices) double-counted on the retry.
+// Pre-aggregated per order line — UPDATE..FROM applies one arbitrary source
+// row per target, so two invoice lines pointing at one order line would
+// otherwise release only one of them.
+func (h *Handler) releaseInvoicedQuantities(invoiceID uuid.UUID) {
+	if _, err := h.db.Exec(`
+		UPDATE sales_order_lines sol
+		SET quantity_invoiced = GREATEST(COALESCE(sol.quantity_invoiced, 0) - sil.qty, 0),
+		    updated_at = NOW()
+		FROM (
+			SELECT sales_order_line_id, SUM(quantity) AS qty
+			FROM sales_invoice_lines
+			WHERE sales_invoice_id = $1 AND sales_order_line_id IS NOT NULL
+			GROUP BY sales_order_line_id
+		) sil
+		WHERE sol.id = sil.sales_order_line_id
+	`, invoiceID); err != nil {
+		h.log.Error("releaseInvoicedQuantities failed", "error", err, "invoice_id", invoiceID)
+	}
 }
 
 // DeleteSalesInvoice soft deletes a sales invoice
@@ -1035,6 +1067,8 @@ func (h *Handler) DeleteSalesInvoice(c *gin.Context) {
 		response.NotFound(c, "Sales invoice")
 		return
 	}
+
+	h.releaseInvoicedQuantities(invoiceID)
 
 	response.NoContent(c)
 }
@@ -1970,16 +2004,16 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 	var orgInvoiceNumber, currentStatus string
 	var customerID uuid.UUID
 	var orgID *uuid.UUID
-	var subtotal, taxAmount, totalAmount float64
+	var subtotal, discountAmount, taxAmount, totalAmount float64
 	var currencyID *uuid.UUID
 
 	err = h.db.QueryRow(`
-		SELECT invoice_number, status, customer_id, organization_id, subtotal, tax_amount,
+		SELECT invoice_number, status, customer_id, organization_id, subtotal, COALESCE(discount_amount, 0), tax_amount,
 			total_amount, currency_id
 		FROM sales_invoices
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'invoice'`,
 		invoiceID, tenantID,
-	).Scan(&orgInvoiceNumber, &currentStatus, &customerID, &orgID, &subtotal, &taxAmount,
+	).Scan(&orgInvoiceNumber, &currentStatus, &customerID, &orgID, &subtotal, &discountAmount, &taxAmount,
 		&totalAmount, &currencyID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Sales invoice")
@@ -2006,7 +2040,7 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 	creditNoteID := uuid.New()
 	now := time.Now()
 
-	var cnSubtotal, cnTaxAmount, cnTotalAmount float64
+	var cnSubtotal, cnDiscountAmount, cnTaxAmount, cnTotalAmount float64
 
 	if len(input.Lines) > 0 {
 		for _, line := range input.Lines {
@@ -2017,7 +2051,11 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 		}
 		cnTotalAmount = cnSubtotal + cnTaxAmount
 	} else {
+		// Full-copy: carry the original's discount. Hardcoding it to 0 made
+		// the header self-contradictory (subtotal − 0 + tax ≠ total) and the
+		// confirm-time JE imbalanced by exactly the discount.
 		cnSubtotal = subtotal
+		cnDiscountAmount = discountAmount
 		cnTaxAmount = taxAmount
 		cnTotalAmount = totalAmount
 	}
@@ -2034,10 +2072,10 @@ func (h *Handler) CreateCreditNote(c *gin.Context) {
 			currency_id, exchange_rate, subtotal, discount_amount,
 			tax_amount, total_amount, amount_paid, status,
 			reference, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'credit_note', $8, $9, $10, 1.0, $11, 0, $12, $13, 0, 'draft', $14, $15, $16, $17)`,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, 'credit_note', $8, $9, $10, 1.0, $11, $12, $13, $14, 0, 'draft', $15, $16, $17, $18)`,
 		creditNoteID, tenantID, orgID, cnNumber, customerID,
 		cnDate, cnDate, invoiceID, input.Reason,
-		currencyID, cnSubtotal, cnTaxAmount, cnTotalAmount,
+		currencyID, cnSubtotal, cnDiscountAmount, cnTaxAmount, cnTotalAmount,
 		orgInvoiceNumber, createdBy, now, now,
 	)
 	if err != nil {
@@ -2155,15 +2193,15 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 	var customerID uuid.UUID
 	var originalInvoiceID *uuid.UUID
 	var organizationID *uuid.UUID
-	var totalAmount, taxAmount, cnSubtotal float64
+	var totalAmount, taxAmount, cnSubtotal, cnDiscount float64
 	var cnDate time.Time
 
 	err = h.db.QueryRow(`
-		SELECT status, invoice_number, customer_id, original_invoice_id, organization_id, total_amount, tax_amount, subtotal, invoice_date
+		SELECT status, invoice_number, customer_id, original_invoice_id, organization_id, total_amount, tax_amount, subtotal, COALESCE(discount_amount, 0), invoice_date
 		FROM sales_invoices
 		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND invoice_type = 'credit_note'`,
 		creditNoteID, tenantID,
-	).Scan(&currentStatus, &cnNumber, &customerID, &originalInvoiceID, &organizationID, &totalAmount, &taxAmount, &cnSubtotal, &cnDate)
+	).Scan(&currentStatus, &cnNumber, &customerID, &originalInvoiceID, &organizationID, &totalAmount, &taxAmount, &cnSubtotal, &cnDiscount, &cnDate)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Credit note")
 		return
@@ -2238,8 +2276,12 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 
 			lineNumber := 1
 
-			// Debit Revenue (reversal)
-			if revenueAccountID != uuid.Nil && cnSubtotal > 0 {
+			// Debit Revenue (reversal) — net of the invoice discount. The
+			// original posting credited revenue net, and the AR credit below
+			// is the discounted total, so reversing the GROSS subtotal left
+			// the JE imbalanced by the discount on every discounted invoice.
+			cnRevenueReversal := cnSubtotal - cnDiscount
+			if revenueAccountID != uuid.Nil && cnRevenueReversal > 0 {
 				lineID := uuid.New()
 				tx.Exec(`
 					INSERT INTO journal_entry_lines (
@@ -2247,7 +2289,7 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 						debit_amount, credit_amount, exchange_rate, created_at
 					) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 					lineID, journalEntryID, lineNumber, revenueAccountID, "Revenue Reversal (Credit Note)",
-					cnSubtotal, 0.0, 1.0, now,
+					cnRevenueReversal, 0.0, 1.0, now,
 				)
 				lineNumber++
 			}
@@ -2279,8 +2321,8 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 
 			// Update account balances
 			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
-			if revenueAccountID != uuid.Nil {
-				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", cnSubtotal, now, revenueAccountID)
+			if revenueAccountID != uuid.Nil && cnRevenueReversal > 0 {
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", cnRevenueReversal, now, revenueAccountID)
 			}
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
 				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)

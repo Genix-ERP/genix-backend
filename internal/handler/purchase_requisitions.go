@@ -230,11 +230,11 @@ func (h *Handler) CreatePurchaseRequisition(c *gin.Context) {
 			Description     string  `json:"description,omitempty"`
 			Quantity        float64 `json:"quantity" binding:"required,gt=0"`
 			Unit            string  `json:"unit,omitempty"`
-			EstimatedPrice  float64 `json:"estimated_price,omitempty"`
+			EstimatedPrice  float64 `json:"estimated_price,omitempty" binding:"omitempty,gte=0"`
 			PreferredVendor string  `json:"preferred_vendor,omitempty"`
 			VendorName      string  `json:"vendor_name,omitempty"`
 			Specifications  string  `json:"specifications,omitempty"`
-		} `json:"lines" binding:"required,min=1"`
+		} `json:"lines" binding:"required,min=1,dive"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {

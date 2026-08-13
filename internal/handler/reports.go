@@ -1874,7 +1874,7 @@ func (h *Handler) GetSalesSummary(c *gin.Context) {
 		       COALESCE(SUM(total_amount), 0) AS revenue
 		FROM sales_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL
-		  AND order_date >= NOW() - INTERVAL '6 months'%s
+		  AND order_date >= date_trunc('month', NOW()) - INTERVAL '5 months'%s
 		GROUP BY TO_CHAR(order_date, 'YYYY-MM')
 		ORDER BY month
 	`, orgFilter), args...)

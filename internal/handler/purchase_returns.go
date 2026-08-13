@@ -251,16 +251,16 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 			ProductID      string  `json:"product_id,omitempty"`
 			ProductName    string  `json:"product_name" binding:"required"`
 			ProductCode    string  `json:"product_code,omitempty"`
-			ReturnQuantity float64 `json:"return_quantity" binding:"required"`
+			ReturnQuantity float64 `json:"return_quantity" binding:"required,gt=0"`
 			Unit           string  `json:"unit,omitempty"`
-			UnitPrice      float64 `json:"unit_price,omitempty"`
+			UnitPrice      float64 `json:"unit_price,omitempty" binding:"omitempty,gte=0"`
 			ReturnReason   string  `json:"return_reason,omitempty"`
 			ReasonDetails  string  `json:"reason_details,omitempty"`
 			BatchNumber    string  `json:"batch_number,omitempty"`
 			SerialNumbers  string  `json:"serial_numbers,omitempty"`
 			Condition      string  `json:"condition,omitempty"`
 			Notes          string  `json:"notes,omitempty"`
-		} `json:"lines" binding:"required,min=1"`
+		} `json:"lines" binding:"required,min=1,dive"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {
@@ -303,12 +303,70 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 		}
 	}
 
+	// Validate lines against their PO lines before writing anything, so a
+	// refusal can't leave a header-only return behind. A return referencing a
+	// PO line used to accept ANY quantity and ANY price: returning 100 of the
+	// 10 you received, at 10× the PO price, produced a supplier credit for
+	// money never paid.
+	for i := range input.Lines {
+		li := &input.Lines[i]
+		if li.POLineID == "" {
+			continue
+		}
+		polID, perr := uuid.Parse(li.POLineID)
+		if perr != nil {
+			response.BadRequest(c, "Invalid PO line ID")
+			return
+		}
+		var ordered, received, poPrice float64
+		lerr := h.db.QueryRow(`
+			SELECT pol.quantity, COALESCE(pol.quantity_received, 0), pol.unit_price
+			FROM purchase_order_lines pol
+			JOIN purchase_orders po ON po.id = pol.purchase_order_id
+			WHERE pol.id = $1 AND po.tenant_id = $2 AND po.deleted_at IS NULL
+		`, polID, tenantID).Scan(&ordered, &received, &poPrice)
+		if lerr == sql.ErrNoRows {
+			response.NotFound(c, "Purchase order line")
+			return
+		}
+		if lerr != nil {
+			response.InternalError(c, "Failed to check purchase order line")
+			return
+		}
+		basis := received
+		if basis <= 0 {
+			basis = ordered
+		}
+		var alreadyReturned float64
+		h.db.QueryRow(`
+			SELECT COALESCE(SUM(prl.return_quantity), 0)
+			FROM purchase_return_lines prl
+			JOIN purchase_returns pr ON pr.id = prl.return_id
+			WHERE prl.po_line_id = $1 AND pr.tenant_id = $2
+			  AND pr.deleted_at IS NULL AND pr.status NOT IN ($3, $4)
+		`, polID, tenantID, ReturnStatusRejected, ReturnStatusCancelled).Scan(&alreadyReturned)
+		if li.ReturnQuantity > basis-alreadyReturned+0.0001 {
+			response.BadRequest(c, fmt.Sprintf(
+				"%s: qaytarish miqdori qabul qilingan miqdordan oshib ketdi (qabul qilingan: %.2f, avval qaytarilgan: %.2f)",
+				li.ProductName, basis, alreadyReturned))
+			return
+		}
+		if li.UnitPrice == 0 {
+			li.UnitPrice = poPrice
+		} else if li.UnitPrice > poPrice+0.01 {
+			response.BadRequest(c, fmt.Sprintf(
+				"%s: qaytarish narxi xarid narxidan yuqori bo'lishi mumkin emas (xarid narxi: %.2f)",
+				li.ProductName, poPrice))
+			return
+		}
+	}
+
 	var poID *uuid.UUID
 	var poNumber string
 	if input.PurchaseOrderID != "" {
 		if pid, err := uuid.Parse(input.PurchaseOrderID); err == nil {
 			poID = &pid
-			h.db.QueryRow("SELECT order_number FROM purchase_orders WHERE id = $1", pid).Scan(&poNumber)
+			h.db.QueryRow("SELECT order_number FROM purchase_orders WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", pid, tenantID).Scan(&poNumber)
 		}
 	}
 
@@ -317,7 +375,7 @@ func (h *Handler) CreatePurchaseReturn(c *gin.Context) {
 	if input.GoodsReceiptID != "" {
 		if gid, err := uuid.Parse(input.GoodsReceiptID); err == nil {
 			grID = &gid
-			h.db.QueryRow("SELECT gr_number FROM goods_receipts WHERE id = $1", gid).Scan(&grNumber)
+			h.db.QueryRow("SELECT gr_number FROM goods_receipts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL", gid, tenantID).Scan(&grNumber)
 		}
 	}
 

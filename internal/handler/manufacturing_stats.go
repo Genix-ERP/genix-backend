@@ -60,12 +60,12 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 	}
 	if s := c.Query("to"); s != "" {
 		if t, err := time.Parse("2006-01-02", s); err == nil {
-			to = t.Add(24*time.Hour - time.Nanosecond)
+			to = t.Add(24*time.Hour - time.Microsecond)
 			customPeriod = true
 		}
 	}
 	if to.Before(from) {
-		to = from.Add(24*time.Hour - time.Nanosecond)
+		to = from.Add(24*time.Hour - time.Microsecond)
 	}
 
 	// ── KPI totals: one COUNT(*) FILTER query ───────────────────────────
@@ -160,7 +160,7 @@ func (h *Handler) GetManufacturingStats(c *gin.Context) {
 			seriesFrom = seriesTo.AddDate(0, 0, -91)
 		}
 	}
-	seriesEnd := seriesTo.Add(24*time.Hour - time.Nanosecond)
+	seriesEnd := seriesTo.Add(24*time.Hour - time.Microsecond)
 
 	plannedBy := map[string]float64{}
 	if pRows, pErr := h.db.Query(`
@@ -495,11 +495,11 @@ func (h *Handler) GetManufacturingReport(c *gin.Context) {
 	}
 	if s := c.Query("to"); s != "" {
 		if t, err := time.Parse("2006-01-02", s); err == nil {
-			to = t.Add(24*time.Hour - time.Nanosecond)
+			to = t.Add(24*time.Hour - time.Microsecond)
 		}
 	}
 	if to.Before(from) {
-		to = from.Add(24*time.Hour - time.Nanosecond)
+		to = from.Add(24*time.Hour - time.Microsecond)
 	}
 
 	// Shared period-set predicate — params: $1 tenant, $2 from, $3 to, $4 org.

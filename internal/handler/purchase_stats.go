@@ -55,7 +55,7 @@ func (h *Handler) GetPurchaseOrderStats(c *gin.Context) {
 	if s := c.Query("to"); s != "" {
 		if t, err := time.Parse("2006-01-02", s); err == nil {
 			// inclusive end of day
-			to = t.Add(24*time.Hour - time.Nanosecond)
+			to = t.Add(24*time.Hour - time.Microsecond)
 		}
 	}
 

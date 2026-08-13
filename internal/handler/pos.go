@@ -735,11 +735,19 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 	discountAmount := subtotal * input.DiscountPercent / 100
 	afterDiscount := subtotal - discountAmount
 
+	// The order-level discount reduces the taxable base too — taxing the
+	// pre-discount net overcharged VAT on every discounted order (10%
+	// discount, 12% VAT: tax came out 120k on a 900k sale instead of 108k)
+	// and made Σ(line totals) exceed the order total.
+	orderFactor := 1.0
+	if input.DiscountPercent > 0 {
+		orderFactor = 1 - input.DiscountPercent/100
+	}
 	var taxAmount float64
 	for _, line := range input.Lines {
 		lineSubtotal := line.Quantity * line.UnitPrice
 		lineDiscount := lineSubtotal * line.DiscountPercent / 100
-		lineNet := lineSubtotal - lineDiscount
+		lineNet := (lineSubtotal - lineDiscount) * orderFactor
 		lineTax := lineNet * line.TaxPercent / 100
 		taxAmount += lineTax
 	}
@@ -792,7 +800,11 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 
 		lineSubtotal := line.Quantity * line.UnitPrice
 		lineDiscount := lineSubtotal * line.DiscountPercent / 100
-		lineNet := lineSubtotal - lineDiscount
+		// The order-level discount lands on the stored lines too, so
+		// Σ(line_total) equals the order's total_amount — with the factor
+		// only in the header, a single discounted line's total exceeded the
+		// whole order's and any line-vs-header reconciliation broke.
+		lineNet := (lineSubtotal - lineDiscount) * orderFactor
 		lineTax := lineNet * line.TaxPercent / 100
 		lineTotal := lineNet + lineTax
 
@@ -897,7 +909,15 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 		}
 	}
 
-	// Update session totals
+	// Update session totals. Cash counts what STAYED in the drawer: the
+	// customer tenders 100k for a 90k sale and takes 10k back, so the drawer
+	// holds 90k — recording the tendered 100k made every session close show
+	// a shortage equal to the day's change. The GL leg below has always used
+	// totalCash-amountReturn; the session now agrees with it.
+	drawerCash := totalCash - amountReturn
+	if drawerCash < 0 {
+		drawerCash = 0
+	}
 	_, err = tx.Exec(`
 		UPDATE pos_sessions SET
 			total_sales = total_sales + $1,
@@ -907,7 +927,7 @@ func (h *Handler) CreatePOSOrder(c *gin.Context) {
 			order_count = order_count + 1,
 			updated_at = NOW()
 		WHERE id = $5
-	`, totalAmount, totalCash, totalCard, totalOther, sessionID)
+	`, totalAmount, drawerCash, totalCard, totalOther, sessionID)
 
 	if err != nil {
 		h.log.Error("Failed to update session", "error", err)

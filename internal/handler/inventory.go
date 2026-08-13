@@ -7241,27 +7241,26 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 
 		// Sync: when a receipt operation from a PO completes, mark PO as received
 		if op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil && *op.SourceID != uuid.Nil {
-			// Update PO line quantities from operation lines
-			opLines, _ := h.db.Query(`
-				SELECT sol.product_id, sol.done_qty
-				FROM stock_operation_lines sol
-				WHERE sol.operation_id = $1 AND sol.tenant_id = $2 AND sol.done_qty > 0
-			`, id, tenantID)
-			if opLines != nil {
-				defer opLines.Close()
-				for opLines.Next() {
-					var prodID uuid.UUID
-					var doneQty float64
-					if err := opLines.Scan(&prodID, &doneQty); err == nil {
-						if _, execErr := h.db.Exec(`
-							UPDATE purchase_order_lines
-							SET quantity_received = $1, updated_at = $2
-							WHERE purchase_order_id = $3 AND product_id = $4
-						`, doneQty, now, *op.SourceID, prodID); execErr != nil {
-							h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_order_lines", "error", execErr)
-						}
-					}
-				}
+			// Mirror this operation's received quantities onto the PO lines.
+			// Accumulate, don't assign: `SET quantity_received = done_qty` made
+			// the newest receipt operation ERASE every earlier one (receive 5,
+			// then 3 → the PO showed 3, flipped back from received to partial).
+			// Aggregated per product before the UPDATE..FROM (one arbitrary
+			// source row per target otherwise), and capped at the ordered
+			// quantity like the goods-receipt path.
+			if _, execErr := h.db.Exec(`
+				UPDATE purchase_order_lines pol
+				SET quantity_received = LEAST(COALESCE(pol.quantity_received, 0) + agg.done, pol.quantity),
+				    updated_at = $3
+				FROM (
+					SELECT product_id, SUM(done_qty) AS done
+					FROM stock_operation_lines
+					WHERE operation_id = $1 AND tenant_id = $2 AND done_qty > 0
+					GROUP BY product_id
+				) agg
+				WHERE pol.purchase_order_id = $4 AND pol.product_id = agg.product_id
+			`, id, tenantID, now, *op.SourceID); execErr != nil {
+				h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE purchase_order_lines", "error", execErr)
 			}
 
 			// Check if PO is fully received
