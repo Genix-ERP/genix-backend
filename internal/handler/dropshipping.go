@@ -485,13 +485,22 @@ func (h *Handler) createDropshipPO(tx *sql.Tx, tenantID, dropshipOrderID, vendor
 	poID := uuid.New()
 	now := time.Now()
 
-	// Generate PO number
+	// Generate PO number — same scheme as CreatePurchaseOrder (see the note
+	// there): only `PO-` + up to six digits counts toward MAX, so a stray
+	// epoch-ms number can't seed the sequence, and %03d widens on its own.
+	//
+	// The old form did `SUBSTRING(order_number FROM 4)::INTEGER` over every
+	// 'PO-%' row, which threw on the dated numbers this same table also holds
+	// ('PO-20260731-0001' → not an integer) and overflowed on 13-digit ones.
+	// The Scan error was discarded, so it silently fell back to lastNum = 0
+	// and handed out PO-000001 — a duplicate waiting to happen.
 	var lastNum int
 	h.db.QueryRow(`
-		SELECT COALESCE(MAX(CAST(SUBSTRING(order_number FROM 4) AS INTEGER)), 0)
-		FROM purchase_orders WHERE tenant_id = $1 AND order_number LIKE 'PO-%'
+		SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+		FROM purchase_orders
+		WHERE tenant_id = $1 AND order_number ~ '^PO-[0-9]{1,6}$'
 	`, tenantID).Scan(&lastNum)
-	poNumber := fmt.Sprintf("PO-%06d", lastNum+1)
+	poNumber := fmt.Sprintf("PO-%03d", lastNum+1)
 
 	// Calculate totals
 	var subtotal float64

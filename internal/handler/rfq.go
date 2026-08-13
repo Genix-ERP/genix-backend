@@ -951,10 +951,17 @@ func (h *Handler) ConvertRFQToPO(c *gin.Context) {
 	now := time.Now()
 	poID := uuid.New()
 
-	// Generate PO number
+	// Generate PO number — same scheme as CreatePurchaseOrder (see the note
+	// there). COUNT(*) was wrong twice over: it re-issues a number as soon as
+	// any order is deleted, and it ignores the dated/legacy numbers the table
+	// also holds. MAX over `PO-` + up to six digits is the one source of truth.
 	var poCount int
-	h.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	poNumber := fmt.Sprintf("PO-%05d", poCount+1)
+	h.db.QueryRow(`
+		SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+		FROM purchase_orders
+		WHERE tenant_id = $1 AND order_number ~ '^PO-[0-9]{1,6}$'`,
+		tenantID).Scan(&poCount)
+	poNumber := fmt.Sprintf("PO-%03d", poCount+1)
 
 	// Calculate expected delivery date based on lead time
 	expectedDate := now.AddDate(0, 0, 7) // default 7 days
