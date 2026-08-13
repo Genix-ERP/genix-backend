@@ -404,3 +404,268 @@ class TestPartnerBalancesPagingContract:
         body = resp.json()
         assert isinstance(body["data"], list)
         assert "meta" not in body or body.get("meta") is None
+
+
+# ============================================================================
+# Hardening guards (2026-08-13). Each of these pins a live-reproduced defect:
+#
+#   1. /payments/reconcile accepted ANY tenant document — a draft or cancelled
+#      invoice could be flipped straight to 'paid'.
+#   2. Credit ignored currency — 100 USD settled "100 so'm" of a UZS invoice.
+#   3. No lock and no cap — two concurrent reconciles both applied the full
+#      due (amount_paid reached 200% of total, credit double-spent).
+#   4. Soft-deleted payments still counted as credit.
+#   5. /payments/register numbered its JE per-journal while the unique key is
+#      per (tenant, org) across ALL journals — 500 on tenants whose org-wide
+#      max lives in a sibling journal; and its JE carried the CONTACT id as
+#      source_id instead of the payment id (migration 500 repairs old rows).
+# ============================================================================
+
+
+@pytest.fixture()
+def guard_seed(tenant_id, test_company):
+    """Committed seeder + full cleanup for the guard tests."""
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, user=DB_USER,
+        password=DB_PASSWORD, dbname=DB_NAME,
+    )
+    conn.autocommit = True
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    org_id = str(test_company["id"])
+    made = {"contacts": [], "invoices": [], "payments": [], "jes": []}
+    marker = uuid.uuid4().hex[:6].upper()
+
+    def contact(label):
+        cid = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO contacts (id, tenant_id, organization_id, name, code, type)"
+            " VALUES (%s, %s, %s, %s, %s, 'customer')",
+            (cid, tenant_id, org_id, f"GUARD30 {label} {marker}", f"G30-{label}-{marker}"),
+        )
+        made["contacts"].append(cid)
+        return cid
+
+    def invoice(cid, total, status, currency_id=None):
+        iid = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO sales_invoices (id, tenant_id, organization_id, invoice_number,"
+            " customer_id, invoice_date, due_date, subtotal, total_amount, amount_paid,"
+            " status, currency_id)"
+            " VALUES (%s, %s, %s, %s, %s, CURRENT_DATE, CURRENT_DATE + 14, %s, %s, 0, %s, %s)",
+            (iid, tenant_id, org_id, f"INV-G30-{uuid.uuid4().hex[:8].upper()}",
+             cid, total, total, status, currency_id),
+        )
+        made["invoices"].append(iid)
+        return iid
+
+    def payment(cid, amount, currency_id=None, rate=1.0):
+        pid = str(uuid.uuid4())
+        cur.execute(
+            "INSERT INTO payments (id, tenant_id, organization_id, payment_number, type,"
+            " contact_id, payment_date, amount, status, currency_id, exchange_rate)"
+            " VALUES (%s, %s, %s, %s, 'receipt', %s, CURRENT_DATE, %s, 'confirmed', %s, %s)",
+            (pid, tenant_id, org_id, f"REC-G30-{uuid.uuid4().hex[:8].upper()}",
+             cid, amount, currency_id, rate),
+        )
+        made["payments"].append(pid)
+        return pid
+
+    yield {"contact": contact, "invoice": invoice, "payment": payment,
+           "made": made, "cur": cur, "org_id": org_id}
+
+    for pid in made["payments"]:
+        cur.execute("DELETE FROM payment_allocations WHERE payment_id = %s", (pid,))
+        cur.execute("DELETE FROM payments WHERE id = %s", (pid,))
+    for jid in made["jes"]:
+        # Posted JE lines are immutable (TT 4.4) — reverse the balance effect
+        # (448 convention: balance = D - C) and soft-delete the header. The
+        # number stays owned by the row, which nextEntryNumberSeq now accounts
+        # for by including deleted entries in its MAX.
+        cur.execute(
+            "SELECT account_id, debit_amount, credit_amount FROM journal_entry_lines"
+            " WHERE journal_entry_id = %s", (jid,))
+        for ln in cur.fetchall():
+            cur.execute(
+                "UPDATE accounts SET current_balance = current_balance - %s + %s WHERE id = %s",
+                (ln["debit_amount"], ln["credit_amount"], ln["account_id"]))
+        cur.execute(
+            "UPDATE journal_entries SET deleted_at = NOW(), updated_at = NOW() WHERE id = %s",
+            (jid,))
+    for iid in made["invoices"]:
+        cur.execute("DELETE FROM sales_invoices WHERE id = %s", (iid,))
+    for cid in made["contacts"]:
+        try:
+            cur.execute("DELETE FROM contacts WHERE id = %s", (cid,))
+        except psycopg2.Error:
+            # Referenced by surviving JE lines — soft-delete instead.
+            cur.execute(
+                "UPDATE contacts SET deleted_at = NOW(), updated_at = NOW() WHERE id = %s",
+                (cid,))
+    conn.close()
+
+
+class TestReconcileGuards:
+    def _reconcile(self, api_client, cid, doc_id):
+        return api_client.post("/payments/reconcile", json={
+            "contact_id": cid, "direction": "customer",
+            "document_id": doc_id, "amount": 0,
+        })
+
+    def test_rejects_draft_and_cancelled_documents(self, api_client, guard_seed, db_read):
+        cid = guard_seed["contact"]("DOCSTATE")
+        inv_draft = guard_seed["invoice"](cid, 300000, "draft")
+        inv_cxl = guard_seed["invoice"](cid, 200000, "cancelled")
+        guard_seed["payment"](cid, 500000)
+
+        for doc_id, status in ((inv_draft, "draft"), (inv_cxl, "cancelled")):
+            resp = self._reconcile(api_client, cid, doc_id)
+            assert resp.status_code == 400, f"{status}: {resp.text}"
+            db_read.execute(
+                "SELECT status, amount_paid::float FROM sales_invoices WHERE id = %s",
+                (doc_id,))
+            row = db_read.fetchone()
+            assert row["status"] == status, "status must not change"
+            assert row["amount_paid"] == 0, "no money may land on a non-open document"
+
+    def test_credit_is_same_currency_only(self, api_client, guard_seed, db_read):
+        db_read.execute("SELECT id FROM currencies WHERE UPPER(code) = 'USD' LIMIT 1")
+        usd = db_read.fetchone()
+        if not usd:
+            pytest.skip("no USD currency seeded")
+
+        cid = guard_seed["contact"]("FX")
+        inv = guard_seed["invoice"](cid, 1500000, "sent", currency_id=None)  # UZS
+        guard_seed["payment"](cid, 100, currency_id=str(usd["id"]), rate=12115.0)
+
+        resp = self._reconcile(api_client, cid, inv)
+        assert resp.status_code == 400, (
+            "foreign-currency credit must not settle a UZS document: " + resp.text)
+        db_read.execute(
+            "SELECT amount_paid::float FROM sales_invoices WHERE id = %s", (inv,))
+        assert db_read.fetchone()["amount_paid"] == 0
+
+    def test_concurrent_reconcile_cannot_overpay(self, api_client, guard_seed, db_read):
+        import threading
+
+        import requests as _requests
+
+        cid = guard_seed["contact"]("RACE")
+        inv = guard_seed["invoice"](cid, 500000, "sent")
+        guard_seed["payment"](cid, 500000)
+        guard_seed["payment"](cid, 500000)  # 1 000 000 credit vs 500 000 due
+
+        headers = dict(api_client.session.headers)
+        barrier = threading.Barrier(2)
+        outcomes = []
+
+        def hit():
+            barrier.wait()
+            r = _requests.post(
+                f"{api_client.base_url}/payments/reconcile", headers=headers,
+                json={"contact_id": cid, "direction": "customer",
+                      "document_id": inv, "amount": 0})
+            outcomes.append(r.status_code)
+
+        threads = [threading.Thread(target=hit) for _ in range(2)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+
+        db_read.execute(
+            "SELECT amount_paid::float, total_amount::float FROM sales_invoices WHERE id = %s",
+            (inv,))
+        row = db_read.fetchone()
+        assert row["amount_paid"] <= row["total_amount"] + 0.001, (
+            f"overpaid: {row['amount_paid']} of {row['total_amount']} ({outcomes})")
+        db_read.execute(
+            "SELECT COALESCE(SUM(amount), 0)::float AS alloc FROM payment_allocations"
+            " WHERE document_id = %s", (inv,))
+        assert db_read.fetchone()["alloc"] <= row["total_amount"] + 0.001, (
+            "allocations must not exceed the document total")
+
+    def test_soft_deleted_payment_is_not_credit(self, api_client, guard_seed):
+        cid = guard_seed["contact"]("SOFTDEL")
+        guard_seed["invoice"](cid, 100000, "sent")
+        pid = guard_seed["payment"](cid, 100000)
+        guard_seed["cur"].execute(
+            "UPDATE payments SET deleted_at = NOW() WHERE id = %s", (pid,))
+
+        ledger = api_client.get(
+            "/payments/partner-ledger",
+            params={"contact_id": cid, "direction": "customer"})
+        assert ledger.status_code == 200, ledger.text
+        assert ledger.json()["data"]["credit_available"] == 0
+
+        rows = api_client.get(
+            "/payments/partner-balances", params={"direction": "customer"}
+        ).json()["data"]
+        row = next((r for r in rows if r["contact_id"] == cid), None)
+        assert row is not None and row["credit"] == 0
+
+    def test_register_numbering_and_je_source(self, api_client, guard_seed, db_read, tenant_id):
+        """Entry numbers are unique per (tenant, org) across ALL journals, so
+        /payments/register must number at that scope. Seed the org-wide max
+        into a journal register will NOT pick — per-journal numbering would
+        collide (the pre-fix 500) while org-scope numbering skips past it.
+        Also pins the JE source contract: payment id, not contact id."""
+        org_id = guard_seed["org_id"]
+        cur = guard_seed["cur"]
+
+        # The journal register picks (cash first, then GENERAL, then any).
+        db_read.execute(
+            """SELECT id FROM journals
+               WHERE tenant_id = %s AND deleted_at IS NULL
+                 AND (organization_id = %s OR organization_id IS NULL)
+               ORDER BY CASE WHEN LOWER(COALESCE(type,'')) = 'cash' THEN 0
+                             WHEN code = 'GENERAL' THEN 1 ELSE 2 END""",
+            (tenant_id, org_id))
+        journals = [str(r["id"]) for r in db_read.fetchall()]
+        if len(journals) < 2:
+            pytest.skip("needs two journals to stage a cross-journal max")
+        picked, other = journals[0], journals[-1]
+
+        db_read.execute(
+            """SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'')
+                       AS BIGINT)), 0) AS m
+               FROM journal_entries
+               WHERE tenant_id = %s AND organization_id IS NOT DISTINCT FROM %s""",
+            (tenant_id, org_id))
+        org_max = int(db_read.fetchone()["m"])
+
+        marker_num = str(org_max + 5)
+        marker_je = str(uuid.uuid4())
+        cur.execute(
+            """INSERT INTO journal_entries (id, tenant_id, organization_id, journal_id,
+                   entry_number, entry_date, description, status, total_debit, total_credit,
+                   created_at, updated_at)
+               VALUES (%s, %s, %s, %s, %s, CURRENT_DATE, 'G30 numbering marker', 'draft',
+                       0, 0, NOW(), NOW())""",
+            (marker_je, tenant_id, org_id, other, marker_num))
+
+        try:
+            cid = guard_seed["contact"]("REGNUM")
+            resp = api_client.post("/payments/register", json={
+                "contact_id": cid, "amount": 1000,
+                "direction": "customer", "method": "cash"})
+            assert resp.status_code == 200, resp.text
+            payment_id = resp.json()["data"]["payment_id"]
+            guard_seed["made"]["payments"].append(payment_id)
+
+            db_read.execute(
+                "SELECT journal_entry_id FROM payments WHERE id = %s", (payment_id,))
+            je_id = db_read.fetchone()["journal_entry_id"]
+            assert je_id, "register must link its JE on the payment row"
+            guard_seed["made"]["jes"].append(str(je_id))
+
+            db_read.execute(
+                """SELECT source_type, source_id,
+                          CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT) AS n
+                   FROM journal_entries WHERE id = %s""", (je_id,))
+            je = db_read.fetchone()
+            assert je["source_type"] == "payment_receipt"
+            assert str(je["source_id"]) == str(payment_id), (
+                "JE source_id must be the PAYMENT id, not the contact id")
+            assert int(je["n"]) > int(marker_num), (
+                "numbering must clear the org-wide max held by a sibling journal")
+        finally:
+            cur.execute("DELETE FROM journal_entries WHERE id = %s AND status = 'draft'",
+                        (marker_je,))

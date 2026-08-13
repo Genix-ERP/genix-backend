@@ -34,28 +34,39 @@ import (
 // is done by creating the opposite order, never by editing or reversing
 // the confirmed document in place.
 
-// ledgerAccountBalance returns SUM(debit-credit) of posted, non-deleted
-// journal entry lines for one account — the only balance definition the
-// kassa module is allowed to use.
+// ledgerAccountBalance returns the account's opening balance plus
+// SUM(debit-credit) of posted, non-deleted journal entry lines — the only
+// balance definition the kassa module is allowed to use, and the SAME one the
+// canonical cash engine uses (cash_balance.go): opening_balance counts because
+// CreateAccount writes it with no JE behind it. Excluding it here made the RKO
+// guard reject expenses a till with a migrated opening balance could pay while
+// the dashboard showed the money.
+//
+// No org filter on the LINES: the balance of ONE account is the whole ledger
+// behind that account. Entry-level org filtering dropped NULL-org entries (and
+// mixed-context history) from the guard while the register card counted them.
 func ledgerAccountBalance(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, accountID uuid.UUID) float64 {
-	query := `
-		SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
-		FROM journal_entry_lines l
-		JOIN journal_entries je ON je.id = l.journal_entry_id
-		WHERE l.account_id = $1 AND je.tenant_id = $2
-		  AND je.status = 'posted' AND je.deleted_at IS NULL`
-	args := []interface{}{accountID, tenantID}
-	if orgID != nil {
-		query += " AND je.organization_id = $3"
-		args = append(args, *orgID)
-	}
 	var bal float64
-	_ = q.QueryRow(query, args...).Scan(&bal)
+	_ = q.QueryRow(`
+		SELECT COALESCE(a.opening_balance, 0) + COALESCE((
+			SELECT SUM(l.debit_amount - l.credit_amount)
+			FROM journal_entry_lines l
+			JOIN journal_entries je ON je.id = l.journal_entry_id
+				AND je.tenant_id = a.tenant_id
+				AND je.status = 'posted' AND je.deleted_at IS NULL
+			WHERE l.account_id = a.id
+		), 0)
+		FROM accounts a
+		WHERE a.id = $1 AND a.tenant_id = $2`, accountID, tenantID).Scan(&bal)
 	return bal
 }
 
 // registerCashAccount resolves the GL account a register posts to: its
-// linked account_id walked down to a leaf, else the tenant's 5010 kassa.
+// linked account_id walked down to a leaf, else the tenant's 5010 kassa —
+// but ONLY when that 5010 is unambiguous. The old findAccount fallback put
+// LIMIT 1 on a multi-branch tenant's nine 5010 leaves and could post a
+// register's money to another branch's kassa; better to fail the confirm
+// with "cannot resolve kassa GL account" and demand an explicit link.
 func registerCashAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, registerID uuid.UUID) uuid.UUID {
 	var linked sql.NullString
 	_ = q.QueryRow(`SELECT account_id::text FROM cash_registers WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
@@ -67,10 +78,11 @@ func registerCashAccount(q dbQuerier, tenantID uuid.UUID, orgID *uuid.UUID, regi
 			}
 		}
 	}
-	if id := findAccount(q, tenantID, orgID, "kassa", "5010"); id != uuid.Nil {
-		return id
+	id, err := defaultCashRegisterAccount(q, tenantID, orgID)
+	if err != nil {
+		return uuid.Nil
 	}
-	return findAccount(q, tenantID, orgID, "cash", "5010")
+	return id
 }
 
 // resolveCounterAccount validates an explicit counter account reference
@@ -123,10 +135,14 @@ func middlewareOrgPtr(c *gin.Context) *uuid.UUID {
 	return nil
 }
 
+// Balance = opening_balance + posted ledger sum — same definition as
+// ledgerAccountBalance and the canonical cash engine, so the register card,
+// the RKO guard and the dashboard can never disagree about the same account.
 const cashRegisterSelect = `
 	SELECT cr.id, cr.name, COALESCE(cr.code, ''), cr.currency, COALESCE(cr.limit_amount, 0),
 	       COALESCE(cr.is_active, true), cr.account_id::text,
-	       COALESCE(a.code, ''), COALESCE(a.name_uz, a.name, ''), COALESCE(lb.bal, 0), cr.created_at
+	       COALESCE(a.code, ''), COALESCE(a.name_uz, a.name, ''),
+	       COALESCE(a.opening_balance, 0) + COALESCE(lb.bal, 0), cr.created_at
 	FROM cash_registers cr
 	LEFT JOIN accounts a ON a.id = cr.account_id
 	LEFT JOIN LATERAL (
@@ -653,9 +669,14 @@ func (h *Handler) ensureDefaultCashRegister(tenantID uuid.UUID, orgIDPtr *uuid.U
 		return id, nil
 	}
 
-	accountID := findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
-	if accountID == uuid.Nil {
-		accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+	// Same ambiguity rule as CreateCashRegister: link the auto-created
+	// register to 5010 only when there is exactly ONE candidate leaf in scope.
+	// The old findAccount(...) call put LIMIT 1 on a nine-way choice on multi-
+	// branch tenants and silently bound the default register to an arbitrary
+	// branch's kassa — real money then posted there.
+	accountID, acctErr := defaultCashRegisterAccount(h.db, tenantID, orgIDPtr)
+	if acctErr != nil {
+		return uuid.Nil, fmt.Errorf("cannot auto-create a default cash register: %s", acctErr.Error())
 	}
 	var accountVal interface{}
 	if accountID != uuid.Nil {
@@ -1092,9 +1113,28 @@ func (h *Handler) ConfirmCashOrder(c *gin.Context) {
 		return
 	}
 
+	// Closed/locked fiscal periods are as binding for kassa as for manual
+	// entries: the JE below is INSERTed directly as 'posted', which the DB
+	// period trigger (BEFORE UPDATE OF status) never sees — so the handler
+	// must run the same checkPeriodLock every manual-JE path runs, or a
+	// backdated order posts straight into a closed month.
+	if lockMsg := h.checkPeriodLock(tenantID, orderDate); lockMsg != "" {
+		response.BadRequest(c, lockMsg)
+		return
+	}
+
 	// Sufficiency guard for outflows reads the LEDGER balance of the
 	// register's cash account — never the cash_transactions shadow table.
+	// The row lock serializes concurrent RKO confirms on the same account:
+	// without it, two confirms both read the pre-commit balance and both
+	// passed, overdrawing the till. The waiter's balance read below runs on a
+	// fresh snapshot after the winner commits.
 	if orderType == "rko" {
+		if _, err := tx.Exec(`SELECT pg_advisory_xact_lock(hashtext($1::text))`, cashAccountID); err != nil {
+			h.log.Error("Failed to lock cash account for RKO confirm", "error", err)
+			response.InternalError(c, "Failed to confirm cash order")
+			return
+		}
 		available := ledgerAccountBalance(tx, tenantID, orgIDPtr, cashAccountID)
 		if available < amount {
 			response.BadRequest(c, fmt.Sprintf("Kassada mablag' yetarli emas (ledger balans: %.2f, kerak: %.2f)", available, amount))
@@ -1165,6 +1205,13 @@ func (h *Handler) ConfirmCashOrder(c *gin.Context) {
 		) VALUES ($1, $2, 1, $3, $4, $5, $6, 0, 1.0, $7)`,
 		uuid.New(), journalEntryID, drAccount, drContact, lineDesc, amount, now,
 	); err != nil {
+		// TT §4.2/§4.5 trigger rejections (leaf-only, mandatory analytics such
+		// as "6710 requires employee") come back as actionable 400s, not
+		// opaque 500s the cashier cannot act on.
+		if friendly := friendlyPostingError(err); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
 		h.log.Error("Failed to insert cash order debit line", "error", err)
 		response.InternalError(c, "Failed to post journal entry")
 		return
@@ -1176,6 +1223,10 @@ func (h *Handler) ConfirmCashOrder(c *gin.Context) {
 		) VALUES ($1, $2, 2, $3, $4, $5, 0, $6, 1.0, $7)`,
 		uuid.New(), journalEntryID, crAccount, crContact, lineDesc, amount, now,
 	); err != nil {
+		if friendly := friendlyPostingError(err); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
 		h.log.Error("Failed to insert cash order credit line", "error", err)
 		response.InternalError(c, "Failed to post journal entry")
 		return
@@ -1222,6 +1273,18 @@ func (h *Handler) ConfirmCashOrder(c *gin.Context) {
 		"journal_entry_id": journalEntryID.String(),
 		"entry_number":     entryNumber,
 	})
+}
+
+// CashTransactionWritesRetired answers every write on the legacy
+// /cash-transactions API. The table is a shadow ledger: rows here carried
+// status='posted' but no journal entry, so nothing the cash engine reads ever
+// saw them — money "recorded" through this API was invisible to the cash
+// balance, the cash book and the dashboard while still emptying the physical
+// till. Kassa v2 replaced the flow with /cash/orders, whose confirm posts a
+// balanced JE in the same transaction.
+func (h *Handler) CashTransactionWritesRetired(c *gin.Context) {
+	response.Error(c, http.StatusGone, "GONE",
+		"Bu API o'chirilgan: kassa harakatlari endi faqat kassa orderlari orqali yuritiladi (POST /cash/orders, so'ng /confirm). Ushbu jadvalga yozuv buxgalteriya provodkasisiz pul qayd etar edi.")
 }
 
 // CancelCashOrder cancels a DRAFT order. Confirmed orders are immutable —
@@ -1294,9 +1357,14 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 		}
 		accountID = registerCashAccount(h.db, tenantID, orgIDPtr, rid)
 	} else {
-		accountID = findAccount(h.db, tenantID, orgIDPtr, "kassa", "5010")
-		if accountID == uuid.Nil {
-			accountID = findAccount(h.db, tenantID, orgIDPtr, "cash", "5010")
+		// No register named: only an UNAMBIGUOUS 5010 may be assumed. The old
+		// findAccount fallback was a LIMIT-1 coin flip that showed an
+		// arbitrary branch's cash book on multi-branch tenants.
+		var acctErr error
+		accountID, acctErr = defaultCashRegisterAccount(h.db, tenantID, orgIDPtr)
+		if acctErr != nil {
+			response.BadRequest(c, "register_id is required: "+acctErr.Error())
+			return
 		}
 	}
 	if accountID == uuid.Nil {
@@ -1307,8 +1375,14 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 	var accountCode, accountName string
 	_ = h.db.QueryRow(`SELECT code, COALESCE(name_uz, name, '') FROM accounts WHERE id = $1`, accountID).Scan(&accountCode, &accountName)
 
+	// Opening = the account's opening_balance + everything posted before the
+	// period, over the WHOLE ledger of this one account — same definition as
+	// ledgerAccountBalance and the register card. The old entry-level
+	// organization filter dropped NULL-org entries from the book while the
+	// card counted them, so the two disagreed for mixed-context history.
 	openingQuery := `
-		SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
+		SELECT COALESCE((SELECT COALESCE(a.opening_balance, 0) FROM accounts a WHERE a.id = $1), 0)
+		     + COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
 		FROM journal_entry_lines l
 		JOIN journal_entries je ON je.id = l.journal_entry_id
 		WHERE l.account_id = $1 AND je.tenant_id = $2
@@ -1322,12 +1396,6 @@ func (h *Handler) GetCashBook(c *gin.Context) {
 		  AND je.status = 'posted' AND je.deleted_at IS NULL
 		  AND je.entry_date >= $3 AND je.entry_date <= $4`
 	dailyArgs := []interface{}{accountID, tenantID, dateFrom, dateTo}
-	if orgIDPtr != nil {
-		openingQuery += " AND je.organization_id = $4"
-		openingArgs = append(openingArgs, *orgIDPtr)
-		dailyQuery += " AND je.organization_id = $5"
-		dailyArgs = append(dailyArgs, *orgIDPtr)
-	}
 	dailyQuery += " GROUP BY je.entry_date ORDER BY je.entry_date"
 
 	var opening float64
@@ -1406,7 +1474,11 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 	args := []interface{}{tenantID, asOf}
 	orgFilter := ""
 	if orgID := middlewareOrgPtr(c); orgID != nil {
-		orgFilter = " AND je.organization_id = $3"
+		// Organization scoping on the ACCOUNT, exactly like cashBalancesAsOf
+		// (cash_balance.go documents why): entry-level filtering dropped
+		// NULL-org entries from this surface while the dashboard counted
+		// them, and pulled in every org's accounts at full balance.
+		orgFilter = " AND a.organization_id = $3"
 		args = append(args, *orgID)
 	}
 
@@ -1423,9 +1495,10 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 			journal_entry_lines l
 			JOIN journal_entries je ON je.id = l.journal_entry_id
 				AND je.status = 'posted' AND je.deleted_at IS NULL
-				AND je.entry_date <= $2`+orgFilter+`
+				AND je.tenant_id = $1
+				AND je.entry_date <= $2
 		) ON l.account_id = a.id
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND `+cashAccountPredicate("a", "at")+`
+		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND `+cashAccountPredicate("a", "at")+orgFilter+`
 		GROUP BY a.id, a.code, COALESCE(a.name_uz, a.name), a.opening_balance
 		ORDER BY a.code`, args...)
 	if err != nil {

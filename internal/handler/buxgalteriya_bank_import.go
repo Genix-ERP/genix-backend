@@ -146,27 +146,32 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 		stmtDate = meta.StatementDate
 	}
 
-	_, err = h.db.Exec(`
-		INSERT INTO bank_statement_imports (
-			id, tenant_id, organization_id, format, file_name, file_size, raw_content,
-			statement_date, opening_balance, closing_balance,
-			total_credit, total_debit, transaction_count,
-			status, imported_by, imported_at, created_at, content_hash
-		) VALUES ($1, $2, $3, '1c_txt', $4, $5, $6, $7, $8, $9, $10, $11, $12, 'imported', $13, $14, $14, $15)
-	`, importID, tenantID, orgPtr, fileHeader.Filename, len(content), raw,
-		stmtDate, meta.OpeningBalance, meta.ClosingBalance,
-		meta.TotalCredit, meta.TotalDebit, len(parsed),
-		userID, now, contentHash)
+	// Header + lines + totals commit atomically — the old per-line h.db.Exec
+	// loop logged and swallowed failures, so an import could claim N
+	// operations while the review screen showed fewer, and those missing rows
+	// could never be posted.
+	dbTx, err := h.db.Begin()
 	if err != nil {
-		h.log.Error("ImportBankStatement: insert import failed", "error", err)
 		response.InternalError(c, "Failed to save import")
 		return
 	}
+	defer dbTx.Rollback()
 
-	// Insert transactions + naive counterparty matching by INN
+	// Link the import to the ERP bank account whose account_number matches the
+	// statement's own account (РасчСчет header), when present.
+	var stmtBankAccountID interface{}
+	if meta.AccountNumber != "" {
+		var baID uuid.UUID
+		if e := h.db.QueryRow(`SELECT id FROM bank_accounts WHERE tenant_id = $1 AND account_number = $2 AND deleted_at IS NULL LIMIT 1`,
+			tenantID, meta.AccountNumber).Scan(&baID); e == nil {
+			stmtBankAccountID = baID
+		}
+	}
+
+	// Count matches BEFORE writing so the header row carries final totals.
+	matchedIDs := make([]interface{}, len(parsed))
 	matched := 0
 	for i, t := range parsed {
-		var matchedContactID interface{}
 		if t.CounterpartyINN != "" {
 			var cid uuid.UUID
 			if err := h.db.QueryRow(`
@@ -174,13 +179,32 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 				WHERE tenant_id = $1 AND tax_id = $2 AND deleted_at IS NULL
 				LIMIT 1
 			`, tenantID, t.CounterpartyINN).Scan(&cid); err == nil {
-				matchedContactID = cid
+				matchedIDs[i] = cid
 				matched++
 			}
 		}
+	}
 
+	_, err = dbTx.Exec(`
+		INSERT INTO bank_statement_imports (
+			id, tenant_id, organization_id, bank_account_id, format, file_name, file_size, raw_content,
+			statement_date, opening_balance, closing_balance,
+			total_credit, total_debit, transaction_count, matched_count, unmatched_count,
+			status, imported_by, imported_at, created_at, content_hash
+		) VALUES ($1, $2, $3, $4, '1c_txt', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'imported', $16, $17, $17, $18)
+	`, importID, tenantID, orgPtr, stmtBankAccountID, fileHeader.Filename, len(content), raw,
+		stmtDate, meta.OpeningBalance, meta.ClosingBalance,
+		meta.TotalCredit, meta.TotalDebit, len(parsed), matched, len(parsed)-matched,
+		userID, now, contentHash)
+	if err != nil {
+		h.log.Error("ImportBankStatement: insert import failed", "error", err)
+		response.InternalError(c, "Failed to save import")
+		return
+	}
+
+	for i, t := range parsed {
 		matchStatus := "unmatched"
-		if matchedContactID != nil {
+		if matchedIDs[i] != nil {
 			matchStatus = "suggested"
 		}
 
@@ -189,7 +213,7 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 			docDateArg = t.DocDate
 		}
 
-		_, err := h.db.Exec(`
+		_, err := dbTx.Exec(`
 			INSERT INTO bank_statement_transactions (
 				id, import_id, line_number, doc_number, doc_date,
 				counterparty_name, counterparty_inn, counterparty_account,
@@ -199,18 +223,19 @@ func (h *Handler) ImportBankStatement1C(c *gin.Context) {
 		`, uuid.New(), importID, i+1, t.DocNumber, docDateArg,
 			t.CounterpartyName, t.CounterpartyINN, t.CounterpartyAccount,
 			t.BankName, t.BankBIC, t.Amount, t.Direction, t.Purpose,
-			matchedContactID, matchStatus, now)
+			matchedIDs[i], matchStatus, now)
 		if err != nil {
 			h.log.Error("ImportBankStatement: insert txn failed", "error", err, "line", i+1)
+			response.InternalError(c, fmt.Sprintf("Failed to save operation line %d — import rolled back", i+1))
+			return
 		}
 	}
 
-	// Update import totals
-	_, _ = h.db.Exec(`
-		UPDATE bank_statement_imports
-		SET matched_count = $1, unmatched_count = $2
-		WHERE id = $3
-	`, matched, len(parsed)-matched, importID)
+	if err := dbTx.Commit(); err != nil {
+		h.log.Error("ImportBankStatement: commit", "error", err)
+		response.InternalError(c, "Failed to save import")
+		return
+	}
 
 	resp := bankImportResponse{
 		ImportID:         importID,
@@ -296,6 +321,7 @@ type bankStatementMeta struct {
 	ClosingBalance float64
 	TotalCredit    float64
 	TotalDebit     float64
+	AccountNumber  string // РасчСчет — the company's own settlement account
 }
 
 // parseBankClientTxt parses the 1C Bank-client .txt export format.
@@ -455,6 +481,7 @@ func parseBankClientTxt(content string) ([]parsedBankTxn, bankStatementMeta, []s
 	if len(out) == 0 {
 		warnings = append(warnings, "no transactions parsed — file may be in an unsupported format")
 	}
+	meta.AccountNumber = myAccount
 	return out, meta, warnings
 }
 

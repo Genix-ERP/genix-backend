@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/genixerp/genix-backend/internal/domain/entity"
@@ -182,4 +183,52 @@ func (h *Handler) GetBankAccountsSummary(c *gin.Context) {
 		"usd_balance":        usdBalance,
 		"unreconciled_count": unreconciledCount,
 	})
+}
+
+// resolveBankGLAccount validates a client-supplied GL account id before it is
+// linked to a bank account. The old code parsed the UUID best-effort and never
+// checked the tenant, so an invalid id silently created an unlinked account and
+// a foreign tenant's id linked their ledger into ours. The account must parse,
+// live in this tenant, be active, and be a leaf (TT §4.2 — a group account can
+// never accumulate a posted-line balance, so the link would be dead weight).
+// Returns (nil, "") for an empty input — "no link" is a valid choice.
+func (h *Handler) resolveBankGLAccount(tenantID string, raw string) (*uuid.UUID, string) {
+	if raw == "" {
+		return nil, ""
+	}
+	accID, err := uuid.Parse(raw)
+	if err != nil {
+		return nil, "Invalid GL account id"
+	}
+	var isLeaf bool
+	err = h.db.QueryRow(`
+		SELECT COALESCE(is_leaf, true) FROM accounts
+		WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL AND is_active = true`,
+		accID, tenantID).Scan(&isLeaf)
+	if err != nil {
+		return nil, "GL account not found in this tenant"
+	}
+	if !isLeaf {
+		return nil, "GL account must be a leaf account"
+	}
+	return &accID, ""
+}
+
+// bankAccountLedgerBalance returns the posted-ledger balance of the GL account
+// a bank account is linked to, and whether a link exists at all. This is the
+// same definition bankLedgerBalanceJoin renders for the list — SUM(debit -
+// credit) over posted lines — packaged for single-account checks such as the
+// debit sufficiency guard.
+func (h *Handler) bankAccountLedgerBalance(tenantID, bankAccountID string) (balance float64, glLinked bool) {
+	var bal sql.NullFloat64
+	var accountID sql.NullString
+	err := h.db.QueryRow(`
+		SELECT ba.account_id::text, lb.bal
+		FROM bank_accounts ba`+bankLedgerBalanceJoin+`
+		WHERE ba.id = $1 AND ba.tenant_id = $2 AND ba.deleted_at IS NULL`,
+		bankAccountID, tenantID).Scan(&accountID, &bal)
+	if err != nil || !accountID.Valid {
+		return 0, false
+	}
+	return bal.Float64, true
 }

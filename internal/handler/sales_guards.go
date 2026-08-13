@@ -10,6 +10,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/genixerp/genix-backend/internal/middleware"
@@ -293,6 +294,17 @@ func (h *Handler) releaseSalesOrderReservation(tenantID uuid.UUID, orderID uuid.
 func (h *Handler) salesOrgScopeOK(c *gin.Context, table string, id, tenantID uuid.UUID) bool {
 	orgID, ok := middleware.GetOrganizationID(c)
 	if !ok || orgID == uuid.Nil {
+		// The resolver IGNORES an org header it can't validate against this
+		// tenant (middleware.go OrganizationResolver, AI audit 2026-08-10).
+		// For detail reads/mutations that silent downgrade must NOT widen a
+		// foreign-org request to tenant-wide access: a well-formed header
+		// that didn't resolve is a scope miss, not "no org selected"
+		// (test_26 TestOrgScopeOnDetail).
+		if raw := strings.TrimSpace(c.GetHeader("X-Organization-ID")); raw != "" {
+			if _, perr := uuid.Parse(raw); perr == nil {
+				return false
+			}
+		}
 		return true
 	}
 	var recOrg sql.NullString

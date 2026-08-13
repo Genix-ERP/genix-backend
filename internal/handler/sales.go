@@ -640,7 +640,12 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		return
 	}
 
-	// Insert order lines
+	// Insert order lines. Line VAT is computed here from tax_id → tax_rates
+	// (the old code INSERTed tax_amount as a literal 0.0, so even a line
+	// with a tax_id carried no tax and the invoice built from it had none —
+	// soliq audit 2026-08-13).
+	taxRateCache := map[string]float64{}
+	computedLineTax := 0.0
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 		productID, _ := uuid.Parse(line.ProductID)
@@ -658,9 +663,19 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 			id, _ := uuid.Parse(line.UnitID)
 			unitID = &id
 		}
+		lineTax := 0.0
 		if line.TaxID != "" {
 			id, _ := uuid.Parse(line.TaxID)
 			taxID = &id
+			rate, cached := taxRateCache[line.TaxID]
+			if !cached {
+				_ = h.db.QueryRow(
+					`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+					id, tenantID).Scan(&rate)
+				taxRateCache[line.TaxID] = rate
+			}
+			lineTax = (lineTotal - lineDiscount) * rate / 100.0
+			computedLineTax += lineTax
 		}
 		if line.WarehouseID != "" {
 			id, _ := uuid.Parse(line.WarehouseID)
@@ -682,12 +697,24 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		if _, execErr := h.db.Exec(lineQuery,
 			lineID, orderID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, lineDiscount,
-			taxID, 0.0, lineTotal-lineDiscount, 0.0, 0.0,
+			taxID, lineTax, lineTotal-lineDiscount, 0.0, 0.0,
 			lineWarehouseID, line.Notes, packagingID, line.PackagingQty, now, now,
 		); execErr != nil {
 
 			h.log.Error("write failed (was silently discarded)", "stmt", "exec", "error", execErr)
 
+		}
+	}
+
+	// The client's header tax_amount wins when provided; when it sent none
+	// but the lines carry tax_ids, derive the header from the computed line
+	// taxes so header and lines agree.
+	if input.TaxAmount == 0 && computedLineTax > 0 {
+		if _, execErr := h.db.Exec(`
+			UPDATE sales_orders SET tax_amount = $1, total_amount = total_amount + $1, updated_at = $2
+			WHERE id = $3 AND tenant_id = $4`,
+			computedLineTax, now, orderID, tenantID); execErr != nil {
+			h.log.Error("Failed to sync order header tax from lines", "error", execErr)
 		}
 	}
 

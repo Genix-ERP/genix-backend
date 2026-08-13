@@ -288,10 +288,15 @@ func (h *Handler) GetTaxRegime(c *gin.Context) {
 	now := time.Now()
 	regime := h.tenantRegime(tenantID, now)
 
-	// Year-to-date income (proxy: posted/any sales invoices this calendar year).
+	// Year-to-date income — real (non-draft, non-cancelled) sales only;
+	// credit notes reduce it (soliq audit 2026-08-13: the old query counted
+	// drafts and cancelled invoices toward the regime threshold).
 	var incomeYTD float64
-	_ = h.db.QueryRow(`SELECT COALESCE(SUM(total_amount),0) FROM sales_invoices
-		WHERE tenant_id=$1 AND deleted_at IS NULL AND invoice_date >= date_trunc('year', CURRENT_DATE)`, tenantID).Scan(&incomeYTD)
+	_ = h.db.QueryRow(`SELECT COALESCE(SUM(total_amount * CASE WHEN COALESCE(invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END),0)
+		FROM sales_invoices
+		WHERE tenant_id=$1 AND deleted_at IS NULL
+		  AND status NOT IN ('draft','cancelled')
+		  AND invoice_date >= date_trunc('year', CURRENT_DATE)`, tenantID).Scan(&incomeYTD)
 
 	percent := 0.0
 	if turnoverThreshold > 0 {

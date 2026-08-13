@@ -72,8 +72,8 @@ func (h *Handler) GetNdsTax(c *gin.Context) {
 	var salesCount int64
 	if err := h.db.QueryRow(`
 		SELECT
-		  COALESCE(SUM(si.subtotal),   0),
-		  COALESCE(SUM(si.tax_amount), 0),
+		  COALESCE(SUM(si.subtotal   * CASE WHEN COALESCE(si.invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END), 0),
+		  COALESCE(SUM(si.tax_amount * CASE WHEN COALESCE(si.invoice_type, 'invoice') = 'credit_note' THEN -1 ELSE 1 END), 0),
 		  COUNT(*)
 		FROM sales_invoices si
 		WHERE si.tenant_id     = $1
@@ -92,8 +92,8 @@ func (h *Handler) GetNdsTax(c *gin.Context) {
 	var purchasesCount int64
 	if err := h.db.QueryRow(`
 		SELECT
-		  COALESCE(SUM(pi.subtotal),   0),
-		  COALESCE(SUM(pi.tax_amount), 0),
+		  COALESCE(SUM(pi.subtotal   * CASE WHEN COALESCE(pi.invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END), 0),
+		  COALESCE(SUM(pi.tax_amount * CASE WHEN COALESCE(pi.invoice_type, 'invoice') = 'debit_note' THEN -1 ELSE 1 END), 0),
 		  COUNT(*)
 		FROM purchase_invoices pi
 		WHERE pi.tenant_id     = $1
