@@ -51,6 +51,17 @@ type stockDeltaArgs struct {
 	CreatedBy   uuid.UUID
 	When        time.Time
 	AllowNeg    bool
+
+	// --- Zaxiralarni baholash (valuation_hook.go) ---
+	// Op overrides the transaction_type → operation mapping when the ledger
+	// type is ambiguous. Leave empty to let valuationOpFor decide.
+	Op StockOperation
+	// Returns are priced from the original issue, not at today's cost (§3.1).
+	OriginalDocType string
+	OriginalDocID   uuid.UUID
+	// SkipValuation opts a movement out of layer tracking entirely. Use only
+	// for movements that are not a change in owned stock.
+	SkipValuation bool
 }
 
 // applyStockDelta upserts the balance row and appends the matching ledger
@@ -113,6 +124,12 @@ func (h *Handler) applyStockDelta(q dbExecQuerier, a stockDeltaArgs) (newBalance
 	if err != nil {
 		return newBalance, valuedCost, err
 	}
+
+	// Baholash qatlamlari. Ombor qoldig'i va daftar qatori yozilgandan keyin,
+	// o'sha tranzaksiya ichida — ya'ni hujjat orqaga qaytsa, qatlam ham
+	// qaytadi. Bu bosqichda provodka yozilmaydi (valuation_hook.go izohi).
+	h.recordValuationForDelta(q, a, valuedCost)
+
 	return newBalance, valuedCost, nil
 }
 
