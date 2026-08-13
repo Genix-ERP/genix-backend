@@ -140,6 +140,7 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	// Pick a journal (cash, then GENERAL, then any), scoped to org.
 	var journalID uuid.UUID
 	var prefix sql.NullString
+	var nextNumber int
 
 	// The web modal makes Jurnal required and blocks submit without it, then
 	// this path threw the choice away — a tenant with two bank journals could
@@ -148,42 +149,54 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	// becoming a cross-tenant write primitive, so it must not be dropped.
 	if input.JournalID != "" {
 		if parsed, perr := uuid.Parse(input.JournalID); perr == nil {
-			_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+			_ = tx.QueryRow(`SELECT id, number_prefix, COALESCE(next_number, 1) FROM journals
 				WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`,
-				parsed, tenantID).Scan(&journalID, &prefix)
+				parsed, tenantID).Scan(&journalID, &prefix, &nextNumber)
 		}
 	}
 	if journalID == uuid.Nil {
-		_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+		_ = tx.QueryRow(`SELECT id, number_prefix, COALESCE(next_number, 1) FROM journals
 			WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
 			ORDER BY CASE WHEN LOWER(COALESCE(type,''))='cash' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
-			tenantID, orgArg).Scan(&journalID, &prefix)
+			tenantID, orgArg).Scan(&journalID, &prefix, &nextNumber)
 	}
 	if journalID == uuid.Nil {
 		response.BadRequest(c, "No journal is configured for this company.")
 		return
 	}
-	var maxNum int
-	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
-		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
-		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&maxNum)
 	px := ""
 	if prefix.Valid {
 		px = prefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", px, maxNum+1)
+	// Entry numbers are unique per (tenant, organization) across ALL journals
+	// (journal_entries_tenant_org_entry_number_key), so the next number must be
+	// computed at that scope. The previous per-journal MAX collided with
+	// entries in sibling journals sharing the (typically empty) prefix and the
+	// INSERT below 500'd — nextEntryNumberSeq carries the correct scope.
+	entryNumber := fmt.Sprintf("%s%06d", px, nextEntryNumberSeq(tx, tenantID, orgPtr, px, nextNumber))
 	pType := "receipt"
 	if !isCustomer {
 		pType = "payment"
 	}
 	desc := fmt.Sprintf("%s payment", input.Direction)
 
+	// The payment id is generated before the JE so the entry can carry it as
+	// source_id, matching ConfirmPayment ('payment_receipt'/'payment' + the
+	// PAYMENT id). This used to store the contact id, which broke JE→payment
+	// tracing and tripped the DUPLICATE_SOURCE diagnostic on a partner's
+	// second registered payment.
+	paymentID := uuid.New()
+	sourceType := "payment"
+	if isCustomer {
+		sourceType = "payment_receipt"
+	}
+
 	// Journal entry header.
 	jeID := uuid.New()
 	if _, err := tx.Exec(`INSERT INTO journal_entries
 		(id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description, source_type, source_id, exchange_rate, total_debit, total_credit, status, created_by, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'payment',$9,$13,$10,$10,'posted',$11,$12,$12)`,
-		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, contactID.String(), baseAmount, userID, now, exchangeRate); err != nil {
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$14,$9,$13,$10,$10,'posted',$11,$12,$12)`,
+		jeID, tenantID, orgArg, journalID, entryNumber, now, nullIfEmpty(input.Notes), desc, paymentID.String(), baseAmount, userID, now, exchangeRate, sourceType); err != nil {
 		h.log.Error("register payment: JE header", "error", err)
 		response.InternalError(c, "Failed to post payment")
 		return
@@ -218,7 +231,6 @@ func (h *Handler) RegisterPartnerPayment(c *gin.Context) {
 	tx.Exec(`UPDATE journals SET next_number = next_number + 1 WHERE id=$1`, journalID)
 
 	// Payment record.
-	paymentID := uuid.New()
 	if _, err := tx.Exec(`INSERT INTO payments
 		(id, tenant_id, organization_id, type, payment_number, contact_id, payment_date, amount, currency_id, exchange_rate, reference, notes, status, journal_entry_id, created_by, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$14,$15,$9,$10,'confirmed',$11,$12,$13,$13)`,
@@ -398,6 +410,7 @@ func partnerBalancesQuery(c *gin.Context, tenantID uuid.UUID) (string, []interfa
 			FROM payments p
 			LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
 			WHERE p.tenant_id=$1 AND p.type=$3 AND p.status IN ('confirmed','posted')
+			  AND p.deleted_at IS NULL
 			  AND ($2::uuid IS NULL OR p.organization_id=$2)
 			GROUP BY p.contact_id
 		)
@@ -619,6 +632,7 @@ func (h *Handler) GetPartnerLedger(c *gin.Context) {
 		FROM payments p
 		LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
 		WHERE p.contact_id=$1 AND p.tenant_id=$2 AND p.type=$3 AND p.status IN ('confirmed','posted')
+		  AND p.deleted_at IS NULL
 		  AND ($4::uuid IS NULL OR p.organization_id=$4)
 		  AND p.amount - COALESCE(al.alloc,0) > 0.001
 		ORDER BY p.payment_date ASC, p.created_at ASC`, contactID, tenantID, payType, orgArg)
@@ -652,7 +666,10 @@ func (h *Handler) GetPartnerLedger(c *gin.Context) {
 // ReconcilePartnerCredit applies a partner's existing unallocated payment credit
 // to one of their open invoices/bills — pure matching, no new GL is posted (the
 // cash and AR/AP legs were booked when each payment was registered). It consumes
-// the partner's unallocated payments oldest-first.
+// the partner's unallocated payments oldest-first, same-currency only, and only
+// against an open (not draft/cancelled) document of the caller's org. The
+// document row and the candidate payment rows are locked FOR UPDATE so
+// concurrent reconciles cannot double-spend credit or overpay the document.
 // Body: { contact_id, direction, document_id, amount }
 func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
@@ -695,12 +712,26 @@ func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 	}
 	defer tx.Rollback()
 
-	// Document due.
+	// Document due — locked FOR UPDATE for the length of the tx, so two
+	// reconciles against the same document serialise instead of both reading
+	// the same due and jointly overpaying it. Status, org and currency are
+	// part of the contract, not cosmetics: the UI only offers open documents
+	// of the caller's org, but the endpoint accepted ANY tenant document —
+	// a draft or cancelled invoice could be flipped straight to 'paid'
+	// (live-reproduced 2026-08-13).
 	var docTotal, docPaid float64
-	if err := tx.QueryRow(fmt.Sprintf(`SELECT total_amount, COALESCE(amount_paid,0)
-		FROM %s WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL`, invTable), docID, tenantID).Scan(&docTotal, &docPaid); err != nil {
-		response.BadRequest(c, "Document not found")
+	var docCurrency sql.NullString
+	if err := tx.QueryRow(fmt.Sprintf(`SELECT total_amount, COALESCE(amount_paid,0), currency_id::text
+		FROM %s WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL
+		  AND status NOT IN ('draft','cancelled')
+		  AND ($3::uuid IS NULL OR organization_id=$3)
+		FOR UPDATE`, invTable), docID, tenantID, orgArg).Scan(&docTotal, &docPaid, &docCurrency); err != nil {
+		response.BadRequest(c, "Document not found or not open for reconciliation")
 		return
+	}
+	var docCurrencyArg interface{}
+	if docCurrency.Valid && docCurrency.String != "" {
+		docCurrencyArg = docCurrency.String
 	}
 	docDue := docTotal - docPaid
 	if docDue <= 0.001 {
@@ -712,20 +743,32 @@ func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 		target = input.Amount
 	}
 
-	// Partner payments with an unallocated remainder, oldest first.
+	// Partner payments, oldest first, locked FOR UPDATE. Reconcile is the only
+	// path that consumes EXISTING confirmed payments' credit, so locking the
+	// payment rows serialises concurrent reconciles for the same partner; the
+	// allocation sums are then computed in a SEPARATE statement, whose fresh
+	// READ COMMITTED snapshot sees everything the lock-holder committed. One
+	// joined query would not: the join's aggregate keeps the pre-wait snapshot
+	// even after the row lock is finally granted.
+	//
+	// Same-currency only (IS NOT DISTINCT FROM — both sides nullable), for the
+	// same reason as the FIFO in RegisterPartnerPayment: due and credit are
+	// raw numbers, and applying a 100 USD payment against a UZS invoice would
+	// record it as 100 so'm paid. Foreign-currency credit simply stays put.
 	type credLine struct {
 		id     uuid.UUID
-		unallo float64
+		amount float64
 	}
 	var creds []credLine
 	rows, err := tx.Query(`
-		SELECT p.id, p.amount - COALESCE(al.alloc,0) AS unallocated
+		SELECT p.id, p.amount
 		FROM payments p
-		LEFT JOIN (SELECT payment_id, SUM(amount) AS alloc FROM payment_allocations GROUP BY payment_id) al ON al.payment_id=p.id
 		WHERE p.contact_id=$1 AND p.tenant_id=$2 AND p.type=$3 AND p.status IN ('confirmed','posted')
+		  AND p.deleted_at IS NULL
 		  AND ($4::uuid IS NULL OR p.organization_id=$4)
-		  AND p.amount - COALESCE(al.alloc,0) > 0.001
-		ORDER BY p.payment_date ASC, p.created_at ASC`, contactID, tenantID, payType, orgArg)
+		  AND p.currency_id IS NOT DISTINCT FROM $5::uuid
+		ORDER BY p.payment_date ASC, p.created_at ASC
+		FOR UPDATE`, contactID, tenantID, payType, orgArg, docCurrencyArg)
 	if err != nil {
 		h.log.Error("reconcile: load credit", "error", err)
 		response.InternalError(c, "Failed to reconcile")
@@ -733,7 +776,7 @@ func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 	}
 	for rows.Next() {
 		var cl credLine
-		if rows.Scan(&cl.id, &cl.unallo) == nil {
+		if rows.Scan(&cl.id, &cl.amount) == nil {
 			creds = append(creds, cl)
 		}
 	}
@@ -744,7 +787,20 @@ func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 		if target-applied <= 0.001 {
 			break
 		}
-		take := cl.unallo
+		// Fresh statement → fresh snapshot: sees allocations committed by any
+		// reconcile we just waited on at the FOR UPDATE above.
+		var alloc float64
+		if err := tx.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM payment_allocations WHERE payment_id=$1`,
+			cl.id).Scan(&alloc); err != nil {
+			h.log.Error("reconcile: allocation sum", "error", err)
+			response.InternalError(c, "Failed to reconcile")
+			return
+		}
+		unallo := cl.amount - alloc
+		if unallo <= 0.001 {
+			continue
+		}
+		take := unallo
 		if take > target-applied {
 			take = target - applied
 		}
@@ -758,17 +814,27 @@ func (h *Handler) ReconcilePartnerCredit(c *gin.Context) {
 	}
 
 	if applied <= 0.001 {
-		response.BadRequest(c, "No available credit to reconcile")
+		response.BadRequest(c, "No available credit to reconcile (payments must match the document's currency)")
 		return
 	}
 
-	if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s
+	// The cap in the WHERE is belt-and-braces under the FOR UPDATE above —
+	// same incremental-claim pattern as the sales-side RecordPayment: if the
+	// arithmetic ever disagrees with the row, the update matches zero rows and
+	// the whole tx (allocations included) rolls back instead of overpaying.
+	updRes, err := tx.Exec(fmt.Sprintf(`UPDATE %s
 		SET amount_paid = COALESCE(amount_paid,0) + $1,
 		    status = CASE WHEN COALESCE(amount_paid,0) + $1 >= total_amount - 0.001 THEN 'paid' ELSE 'partial' END,
 		    updated_at = $2
-		WHERE id = $3 AND tenant_id = $4`, invTable), applied, now, docID, tenantID); err != nil {
+		WHERE id = $3 AND tenant_id = $4
+		  AND COALESCE(amount_paid,0) + $1 <= total_amount + 0.001`, invTable), applied, now, docID, tenantID)
+	if err != nil {
 		h.log.Error("reconcile: update doc", "error", err)
 		response.InternalError(c, "Failed to reconcile")
+		return
+	}
+	if n, _ := updRes.RowsAffected(); n == 0 {
+		response.BadRequest(c, "OVER_PAYMENT: credit exceeds the document's remaining balance")
 		return
 	}
 

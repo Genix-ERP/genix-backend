@@ -20,8 +20,11 @@ package handler
 // bank Debet (money out) -> Cr 5110. amount = Kredit - Debet.
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"io"
 	"regexp"
 	"strconv"
 	"strings"
@@ -119,6 +122,11 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 		response.BadRequest(c, "file is required")
 		return
 	}
+	const maxVipiskaSize = 20 << 20 // 20MB — a real vipiska is well under 1MB
+	if fileHdr.Size > maxVipiskaSize {
+		response.BadRequest(c, "File is too large (max 20MB)")
+		return
+	}
 	f, err := fileHdr.Open()
 	if err != nil {
 		response.InternalError(c, "Failed to open file")
@@ -126,7 +134,36 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 	}
 	defer f.Close()
 
-	xl, err := excelize.OpenReader(f)
+	content, err := io.ReadAll(io.LimitReader(f, maxVipiskaSize+1))
+	if err != nil {
+		response.InternalError(c, "Failed to read file")
+		return
+	}
+	if len(content) > maxVipiskaSize {
+		response.BadRequest(c, "File is too large (max 20MB)")
+		return
+	}
+
+	// Duplicate-statement guard, same contract as the 1C importer: a re-upload
+	// of the same file (double-click, retry after a timeout) must return the
+	// existing import instead of creating every pending line twice — "confirm
+	// all" on a doubled import posts every payment twice into the GL.
+	contentHash := fmt.Sprintf("%x", sha256.Sum256(content))
+	var existingImportID uuid.UUID
+	if err := h.db.QueryRow(
+		`SELECT id FROM bank_statement_imports WHERE tenant_id = $1 AND content_hash = $2 ORDER BY created_at DESC LIMIT 1`,
+		tenantID, contentHash,
+	).Scan(&existingImportID); err == nil {
+		response.Success(c, gin.H{
+			"id":        existingImportID,
+			"import_id": existingImportID,
+			"duplicate": true,
+			"warnings":  []string{"Bu fayl allaqachon import qilingan (dublikat). Mavjud import qaytarildi."},
+		})
+		return
+	}
+
+	xl, err := excelize.OpenReader(bytes.NewReader(content))
 	if err != nil {
 		response.BadRequest(c, "Could not read the Excel file: "+err.Error())
 		return
@@ -233,14 +270,36 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 		}
 	}
 
-	if _, err := h.db.Exec(`
+	// Link the import to the ERP bank account whose account_number matches the
+	// statement's own account line — this is what lets the vipiska world and
+	// the per-account bank screens meet at all.
+	var stmtBankAccountID interface{}
+	if meta.Account != "" {
+		var baID uuid.UUID
+		if e := h.db.QueryRow(`SELECT id FROM bank_accounts WHERE tenant_id = $1 AND account_number = $2 AND deleted_at IS NULL LIMIT 1`,
+			tenantID, meta.Account).Scan(&baID); e == nil {
+			stmtBankAccountID = baID
+		}
+	}
+
+	// Header + lines commit atomically. The old per-line h.db.Exec loop logged
+	// and swallowed failures, so an import could claim N operations while the
+	// review screen showed fewer — and the missing rows could never be posted.
+	dbTx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to save import")
+		return
+	}
+	defer dbTx.Rollback()
+
+	if _, err := dbTx.Exec(`
 		INSERT INTO bank_statement_imports (
-			id, tenant_id, organization_id, format, file_name, file_size,
+			id, tenant_id, organization_id, bank_account_id, format, file_name, file_size, content_hash,
 			statement_date, opening_balance, closing_balance,
 			total_credit, total_debit, transaction_count, matched_count, unmatched_count,
 			status, imported_by, imported_at, created_at
-		) VALUES ($1,$2,$3,'excel_vipiska',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'imported',$14,$15,$15)`,
-		importID, tenantID, orgPtr, fileHdr.Filename, fileHdr.Size,
+		) VALUES ($1,$2,$3,$4,'excel_vipiska',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'imported',$16,$17,$17)`,
+		importID, tenantID, orgPtr, stmtBankAccountID, fileHdr.Filename, fileHdr.Size, contentHash,
 		stmtDate, meta.OpeningBalance, meta.ClosingBalance,
 		meta.TotalKredit, meta.TotalDebet, len(txns), suggested, len(txns)-suggested,
 		userID, now); err != nil {
@@ -254,7 +313,7 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 		if !t.docDateT.IsZero() {
 			docDateArg = t.docDateT
 		}
-		if _, err := h.db.Exec(`
+		if _, err := dbTx.Exec(`
 			INSERT INTO bank_statement_transactions (
 				id, import_id, line_number, doc_number, doc_date,
 				counterparty_name, counterparty_inn, counterparty_account,
@@ -270,7 +329,15 @@ func (h *Handler) ImportBankVipiska(c *gin.Context) {
 			t.debetAcctID, t.kreditAcctID, nullIfEmpty(t.DebetCode), nullIfEmpty(t.KreditCode),
 			t.contactID, t.Status, now); err != nil {
 			h.log.Error("vipiska import: insert line", "error", err, "line", t.LineNumber)
+			response.InternalError(c, fmt.Sprintf("Failed to save operation line %d — import rolled back", t.LineNumber))
+			return
 		}
+	}
+
+	if err := dbTx.Commit(); err != nil {
+		h.log.Error("vipiska import: commit", "error", err)
+		response.InternalError(c, "Failed to save import")
+		return
 	}
 
 	// Balance integrity check (informational warning only).
@@ -426,19 +493,41 @@ func (h *Handler) UpdateBankVipiskaLineAccounts(c *gin.Context) {
 		return
 	}
 
+	// The accounts are written to the line and later POSTED verbatim, so they
+	// must be validated here, not looked up best-effort: the old code fetched
+	// the code for display only and accepted any UUID — including another
+	// tenant's account (bank_statement_transactions has no FK on these
+	// columns), whose balance a confirm would then silently mutate. Each
+	// account must be this tenant's, active, and a leaf (TT §4.2).
+	validated := func(raw string) (interface{}, bool) {
+		if raw == "" {
+			return nil, true
+		}
+		accID, err := uuid.Parse(raw)
+		if err != nil {
+			return nil, false
+		}
+		var cc string
+		var isLeaf bool
+		if e := h.db.QueryRow(`SELECT code, COALESCE(is_leaf, true) FROM accounts
+			WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL AND is_active = true`,
+			accID, tenantID).Scan(&cc, &isLeaf); e != nil || !isLeaf {
+			return nil, false
+		}
+		return nullIfEmpty(cc), true
+	}
+	debCode, debOK := validated(input.DebetAccountID)
+	kreCode, kreOK := validated(input.KreditAccountID)
+	if !debOK || !kreOK {
+		response.BadRequest(c, "Hisob topilmadi yoki guruh hisobiga o'tkazma qilib bo'lmaydi (faqat oxirgi darajadagi faol hisob)")
+		return
+	}
+	if input.DebetAccountID != "" && input.DebetAccountID == input.KreditAccountID {
+		response.BadRequest(c, "Dt va Kt bir xil hisob bo'lishi mumkin emas")
+		return
+	}
 	deb := nullUUID(input.DebetAccountID)
 	kre := nullUUID(input.KreditAccountID)
-	var debCode, kreCode interface{}
-	if input.DebetAccountID != "" {
-		var cc string
-		_ = h.db.QueryRow(`SELECT code FROM accounts WHERE id=$1 AND tenant_id=$2`, input.DebetAccountID, tenantID).Scan(&cc)
-		debCode = nullIfEmpty(cc)
-	}
-	if input.KreditAccountID != "" {
-		var cc string
-		_ = h.db.QueryRow(`SELECT code FROM accounts WHERE id=$1 AND tenant_id=$2`, input.KreditAccountID, tenantID).Scan(&cc)
-		kreCode = nullIfEmpty(cc)
-	}
 	status := "unmatched"
 	if deb.Valid && kre.Valid {
 		status = "suggested"
@@ -472,20 +561,20 @@ func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
 	}
 
 	var (
-		amount                         float64
-		dir, docNum, cpName            string
-		debStr, kreStr, orgStr, conStr sql.NullString
-		docDate                        *time.Time
-		posted                         bool
+		amount                                    float64
+		dir, docNum, cpName                       string
+		debStr, kreStr, orgStr, conStr, bankAccID sql.NullString
+		docDate                                   *time.Time
+		posted                                    bool
 	)
 	err = h.db.QueryRow(`
 		SELECT t.amount, t.direction, COALESCE(t.doc_number,''), COALESCE(t.counterparty_name,''),
 		       t.debet_account_id::text, t.kredit_account_id::text, t.doc_date,
 		       i.organization_id::text, t.matched_contact_id::text,
-		       (t.matched_journal_entry_id IS NOT NULL)
+		       (t.matched_journal_entry_id IS NOT NULL), i.bank_account_id::text
 		FROM bank_statement_transactions t JOIN bank_statement_imports i ON i.id=t.import_id
 		WHERE t.id=$1 AND i.tenant_id=$2`, lineID, tenantID).Scan(
-		&amount, &dir, &docNum, &cpName, &debStr, &kreStr, &docDate, &orgStr, &conStr, &posted)
+		&amount, &dir, &docNum, &cpName, &debStr, &kreStr, &docDate, &orgStr, &conStr, &posted, &bankAccID)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Line not found")
 		return
@@ -509,6 +598,26 @@ func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
 	}
 	debID, _ := uuid.Parse(debStr.String)
 	kreID, _ := uuid.Parse(kreStr.String)
+	if debID == kreID {
+		response.BadRequest(c, "Dt va Kt bir xil hisob bo'lishi mumkin emas")
+		return
+	}
+	// Re-validate BOTH accounts at posting time — the stored ids may predate
+	// the update-endpoint validation (or the account may have been deactivated
+	// since): they must be this tenant's, active, leaf accounts, otherwise the
+	// posting trigger rejects the entry with an opaque 500.
+	for _, acc := range []uuid.UUID{debID, kreID} {
+		var isLeaf bool
+		if e := h.db.QueryRow(`SELECT COALESCE(is_leaf, true) FROM accounts
+			WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL AND is_active = true`,
+			acc, tenantID).Scan(&isLeaf); e != nil {
+			response.BadRequest(c, "Hisob bu kompaniyada topilmadi yoki faol emas — Dt/Kt ni qayta tanlang")
+			return
+		} else if !isLeaf {
+			response.BadRequest(c, "Guruh hisobiga o'tkazma qilib bo'lmaydi — oxirgi darajadagi hisobni tanlang")
+			return
+		}
+	}
 	var orgArg interface{}
 	if orgStr.Valid && orgStr.String != "" {
 		orgArg = orgStr.String
@@ -531,23 +640,31 @@ func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
 
 	var journalID uuid.UUID
 	var jprefix sql.NullString
-	_ = tx.QueryRow(`SELECT id, number_prefix FROM journals
+	var jNextNumber int
+	jerr := tx.QueryRow(`SELECT id, number_prefix, COALESCE(next_number, 1) FROM journals
 		WHERE tenant_id=$1 AND deleted_at IS NULL AND ($2::uuid IS NULL OR organization_id=$2 OR organization_id IS NULL)
 		ORDER BY CASE WHEN LOWER(COALESCE(type,''))='bank' THEN 0 WHEN code='GENERAL' THEN 1 ELSE 2 END LIMIT 1`,
-		tenantID, orgArg).Scan(&journalID, &jprefix)
-	if journalID == uuid.Nil {
+		tenantID, orgArg).Scan(&journalID, &jprefix, &jNextNumber)
+	if jerr != nil || journalID == uuid.Nil {
+		if jerr != nil && jerr != sql.ErrNoRows {
+			h.log.Error("vipiska confirm: journal lookup", "error", jerr)
+			response.InternalError(c, "Failed to post")
+			return
+		}
 		response.BadRequest(c, "No journal is configured for this company.")
 		return
 	}
-	var maxNum int
-	_ = tx.QueryRow(`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number,'[^0-9]','','g'),'') AS BIGINT)),0)
-		FROM journal_entries WHERE tenant_id=$1 AND journal_id=$2 AND deleted_at IS NULL
-		  AND LENGTH(REGEXP_REPLACE(entry_number,'[^0-9]','','g')) <= 9`, tenantID, journalID).Scan(&maxNum)
 	px := ""
 	if jprefix.Valid {
 		px = jprefix.String
 	}
-	entryNumber := fmt.Sprintf("%s%06d", px, maxNum+1)
+	// Numbering MUST go through nextEntryNumberSeq: entry numbers are unique
+	// per (tenant, organization) across ALL journals — the old per-journal
+	// MAX+1 here collided with any other journal's higher number and 500'd on
+	// the unique constraint (and excluding soft-deleted rows re-created the
+	// exact collision the shared helper documents).
+	entrySeq := nextEntryNumberSeq(tx, tenantID, orgArg, px, jNextNumber)
+	entryNumber := fmt.Sprintf("%s%06d", px, entrySeq)
 	desc := "Bank vipiska: " + docNum
 	if cpName != "" {
 		desc += " — " + cpName
@@ -578,11 +695,19 @@ func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
 		return e
 	}
 	if err := jel(debID, debContact, 1, amount, 0); err != nil {
+		if friendly := friendlyPostingError(err); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
 		h.log.Error("vipiska confirm: Dt line", "error", err)
 		response.InternalError(c, "Failed to post")
 		return
 	}
 	if err := jel(kreID, kreContact, 2, 0, amount); err != nil {
+		if friendly := friendlyPostingError(err); friendly != "" {
+			response.BadRequest(c, friendly)
+			return
+		}
 		h.log.Error("vipiska confirm: Cr line", "error", err)
 		response.InternalError(c, "Failed to post")
 		return
@@ -630,6 +755,40 @@ func (h *Handler) ConfirmBankVipiskaLine(c *gin.Context) {
 		// Someone else posted this line between our read and this UPDATE.
 		response.Conflict(c, "This operation is already posted")
 		return
+	}
+
+	// Keep the journal's counter seeding future numbers past ours.
+	if _, err := tx.Exec(`UPDATE journals SET next_number = GREATEST(COALESCE(next_number,1), $1 + 1) WHERE id = $2`,
+		entrySeq, journalID); err != nil {
+		h.log.Error("vipiska confirm: bump next_number", "error", err)
+	}
+
+	// If the import resolved to an ERP bank account (statement account number
+	// matched), mirror the confirmed line as an already-reconciled
+	// bank_transactions row so it appears in the Tranzaksiyalar tab and in
+	// reconciliation history. Without this, the vipiska world and the
+	// per-account bank world never met.
+	if bankAccID.Valid && bankAccID.String != "" {
+		txType := "debit"
+		if dir == "in" {
+			txType = "credit"
+		}
+		// Savepoint: the mirror row is a convenience — a failure must not
+		// poison the posting transaction (a bare failed INSERT would abort it).
+		if _, spErr := tx.Exec(`SAVEPOINT vipiska_mirror`); spErr == nil {
+			if _, err := tx.Exec(`
+				INSERT INTO bank_transactions (tenant_id, organization_id, bank_account_id, transaction_date, reference,
+				                               description, amount, transaction_type, status, is_reconciled, reconciled_date,
+				                               matched_journal_entry_id, created_at, updated_at)
+				VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'reconciled',true,$9,$10,$11,$11)`,
+				tenantID, orgArg, bankAccID.String, entryDate, nullIfEmpty(docNum), desc, amount, txType,
+				now.Format("2006-01-02"), jeID, now); err != nil {
+				h.log.Error("vipiska confirm: mirror bank transaction", "error", err)
+				_, _ = tx.Exec(`ROLLBACK TO SAVEPOINT vipiska_mirror`)
+			} else {
+				_, _ = tx.Exec(`RELEASE SAVEPOINT vipiska_mirror`)
+			}
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -683,13 +842,30 @@ func updateAccountBalanceTx(tx *sql.Tx, accountID uuid.UUID, debit, credit float
 }
 
 // negativeBalanceMessage returns a friendly message if err is the cash/bank
-// negative-balance trigger (CHECK violation), else "".
+// negative-balance trigger (CHECK violation), else "". The account lookup is
+// tenant-agnostic only because every caller has already validated the account
+// belongs to the caller's tenant; a TT-invariant text (which is not about
+// balances at all) is passed through verbatim instead of being mislabeled.
 func negativeBalanceMessage(h *Handler, err error, accountID uuid.UUID) string {
 	if pqErr, ok := err.(*pq.Error); ok && pqErr.Code == "23514" {
+		if strings.Contains(pqErr.Message, "TT §") {
+			return pqErr.Message
+		}
 		var name, code string
 		var bal float64
 		_ = h.db.QueryRow(`SELECT name, code, current_balance FROM accounts WHERE id=$1`, accountID).Scan(&name, &code, &bal)
 		return fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas.", name, code)
+	}
+	return ""
+}
+
+// friendlyPostingError converts the posting triggers' RAISEd violations
+// (ERRCODE 23514: TT §4.2 leaf-only, §4.5 mandatory analytics, period locks)
+// into the message the trigger wrote — actionable text like "account 6010
+// requires contract (shartnoma)" — instead of an opaque 500.
+func friendlyPostingError(err error) string {
+	if pqErr, ok := err.(*pq.Error); ok && (pqErr.Code == "23514" || pqErr.Code == "P0001") {
+		return pqErr.Message
 	}
 	return ""
 }
@@ -878,12 +1054,17 @@ func (h *Handler) loadClassificationRules(tenantID uuid.UUID) []classRule {
 func (h *Handler) resolveAccountIDByCode(tenantID uuid.UUID, orgArg interface{}, code string) (uuid.UUID, string) {
 	var id uuid.UUID
 	var realCode string
+	// Leaf REQUIRED, not merely preferred: suggesting a group account produced
+	// a line that could never be confirmed (the TT §4.2 trigger rejects the
+	// posting) with nothing telling the user why. If only a group node carries
+	// the code, the operation correctly stays unmatched for manual selection.
 	err := h.db.QueryRow(`
 		SELECT id, code FROM accounts
-		WHERE tenant_id = $1 AND deleted_at IS NULL
+		WHERE tenant_id = $1 AND deleted_at IS NULL AND is_active = true
+		  AND COALESCE(is_leaf, true) = true
 		  AND ($2::uuid IS NULL OR organization_id = $2)
 		  AND regexp_replace(code,'[^0-9]','','g') = $3
-		ORDER BY COALESCE(is_leaf,true) DESC
+		ORDER BY code ASC
 		LIMIT 1`, tenantID, orgArg, code).Scan(&id, &realCode)
 	if err != nil {
 		// Account not in this org's chart — leave BLANK (per TZ: undetermined

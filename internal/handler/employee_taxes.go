@@ -492,8 +492,13 @@ func (h *Handler) PreviewPayrollTaxes(c *gin.Context) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // GetEmployeeTaxReport GET /tax-reports/employee-taxes?start_date=...&end_date=...
-// Aggregated by tax code within the date range, using payroll_entries.created_at
-// as the period anchor.
+// Aggregated by tax code within the date range. The period anchor is the
+// PAYROLL PERIOD's end date — not payroll_entries.created_at, which moved a
+// backfilled June payroll into August and skewed by the DB session timezone
+// (soliq audit 2026-08-13). When the tenant has no employee_taxes catalog
+// configured (payroll_entry_taxes empty), the report falls back to the
+// legacy per-entry columns so the tab agrees with the GL, which accrues the
+// same legacy amounts to 6410 (see ProcessPayroll's legacy fallback).
 func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -509,8 +514,8 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 	args := []interface{}{tenantID}
 	argIdx := 2
 	if hasDates {
-		where += fmt.Sprintf(" AND pe.created_at >= $%d AND pe.created_at <= $%d", argIdx, argIdx+1)
-		args = append(args, startDate, endDate+" 23:59:59")
+		where += fmt.Sprintf(" AND pp.end_date >= $%d AND pp.end_date <= $%d", argIdx, argIdx+1)
+		args = append(args, startDate, endDate)
 		argIdx += 2
 	}
 
@@ -524,6 +529,7 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 			COALESCE(SUM(pet.amount), 0)
 		FROM payroll_entry_taxes pet
 		JOIN payroll_entries pe ON pe.id = pet.payroll_entry_id
+		JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
 		WHERE %s
 		GROUP BY pet.tax_code_snapshot, pet.payer_snapshot
 		ORDER BY pet.tax_code_snapshot
@@ -551,37 +557,95 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 		}
 		out = append(out, row)
 	}
+	rows.Close()
+
+	// Legacy fallback: no snapshots at all — read the legacy columns the
+	// payroll UI fills (income_tax / social_security / pension). Codes match
+	// the seeded employee_taxes catalog (migration 330) so recorded payments
+	// still link up.
+	if len(out) == 0 {
+		legacyWhere := "pe.tenant_id = $1 AND pe.deleted_at IS NULL"
+		legacyArgs := []interface{}{tenantID}
+		if hasDates {
+			legacyWhere += " AND pp.end_date >= $2 AND pp.end_date <= $3"
+			legacyArgs = append(legacyArgs, startDate, endDate)
+		}
+		var ndfl, soc, inps, ndflBase, socBase, inpsBase float64
+		var ndflN, socN, inpsN int
+		err := h.db.QueryRow(fmt.Sprintf(`
+			SELECT
+				COALESCE(SUM(pe.income_tax), 0), COALESCE(SUM(pe.social_security), 0), COALESCE(SUM(pe.pension), 0),
+				COALESCE(SUM(pe.gross_salary) FILTER (WHERE COALESCE(pe.income_tax, 0) > 0), 0),
+				COALESCE(SUM(pe.gross_salary) FILTER (WHERE COALESCE(pe.social_security, 0) > 0), 0),
+				COALESCE(SUM(pe.gross_salary) FILTER (WHERE COALESCE(pe.pension, 0) > 0), 0),
+				COUNT(*) FILTER (WHERE COALESCE(pe.income_tax, 0) > 0),
+				COUNT(*) FILTER (WHERE COALESCE(pe.social_security, 0) > 0),
+				COUNT(*) FILTER (WHERE COALESCE(pe.pension, 0) > 0)
+			FROM payroll_entries pe
+			JOIN payroll_periods pp ON pp.id = pe.payroll_period_id
+			WHERE %s
+		`, legacyWhere), legacyArgs...).Scan(&ndfl, &soc, &inps, &ndflBase, &socBase, &inpsBase, &ndflN, &socN, &inpsN)
+		if err != nil {
+			h.log.Error("Failed to aggregate legacy employee taxes", "error", err)
+		} else {
+			legacyRows := []struct {
+				code, name string
+				n          int
+				base, amt  float64
+			}{
+				{"NDFL", "Daromad solig'i (JShDS) — legacy", ndflN, ndflBase, ndfl},
+				{"SOC_TAX", "Ijtimoiy sug'urta — legacy", socN, socBase, soc},
+				{"INPS", "INPS — legacy", inpsN, inpsBase, inps},
+			}
+			for _, lr := range legacyRows {
+				if lr.amt <= 0 {
+					continue
+				}
+				out = append(out, entity.EmployeeTaxSummaryRow{
+					TaxCode: lr.code, TaxName: lr.name, Payer: "employee",
+					EntryCount: lr.n, TotalBase: lr.base, TotalAmount: lr.amt,
+				})
+				totalEmployee += lr.amt
+			}
+		}
+	}
 
 	// Subtract recorded payments to get the "pending" balance per tax.
 	// A payment is recorded via POST /employee-taxes/payments and creates
 	// a journal entry that debits the liability account; this query is
 	// the report-side complement that shows users how much of each tax
 	// is still owed for the same period window.
+	// Keyed by (code, payer) — keying by code alone subtracted one payment
+	// from BOTH rows of a tax carried by employee and employer, and counted
+	// it twice in total_paid. The window anchors on the payment's period_end
+	// (containment), matching the accrual anchor above — the old overlap
+	// test credited a quarterly payment in full against a one-month view
+	// (soliq audit 2026-08-13).
 	paidByCode := map[string]float64{}
 	{
 		paidWhere := "tenant_id = $1 AND deleted_at IS NULL"
 		paidArgs := []interface{}{tenantID}
 		paidIdx := 2
 		if hasDates {
-			paidWhere += fmt.Sprintf(" AND period_start <= $%d AND period_end >= $%d",
+			paidWhere += fmt.Sprintf(" AND period_end >= $%d AND period_end <= $%d",
 				paidIdx, paidIdx+1)
-			paidArgs = append(paidArgs, endDate, startDate)
+			paidArgs = append(paidArgs, startDate, endDate)
 		}
 		paidRows, perr := h.db.Query(`
-			SELECT tax_code, COALESCE(SUM(amount), 0)
+			SELECT tax_code, COALESCE(payer, 'employee'), COALESCE(SUM(amount), 0)
 			FROM employee_tax_payments
 			WHERE `+paidWhere+`
-			GROUP BY tax_code
+			GROUP BY tax_code, COALESCE(payer, 'employee')
 		`, paidArgs...)
 		if perr != nil {
 			h.log.Error("Failed to aggregate employee_tax_payments", "error", perr)
 		} else {
 			defer paidRows.Close()
 			for paidRows.Next() {
-				var code string
+				var code, payer string
 				var amt float64
-				if scanErr := paidRows.Scan(&code, &amt); scanErr == nil {
-					paidByCode[code] = amt
+				if scanErr := paidRows.Scan(&code, &payer, &amt); scanErr == nil {
+					paidByCode[code+"|"+payer] = amt
 				}
 			}
 		}
@@ -591,7 +655,7 @@ func (h *Handler) GetEmployeeTaxReport(c *gin.Context) {
 	totalPending := 0.0
 	enriched := make([]map[string]interface{}, 0, len(out))
 	for _, r := range out {
-		paid := paidByCode[r.TaxCode]
+		paid := paidByCode[r.TaxCode+"|"+r.Payer]
 		pending := r.TotalAmount - paid
 		if pending < 0 {
 			pending = 0
@@ -674,6 +738,10 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 		response.BadRequest(c, "Invalid period_end")
 		return
 	}
+	if periodEnd.Before(periodStart) {
+		response.BadRequest(c, "period_end davri period_start dan oldin bo'lishi mumkin emas")
+		return
+	}
 
 	// Look up the tax catalog row to grab the canonical name + the GL
 	// liability account to debit. If the operator deactivated / renamed
@@ -683,13 +751,16 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 	var taxName string
 	var payer string
 	var liabilityAcctID sql.NullString
+	// Prefer the caller's org row, then the tenant-wide (NULL org) row —
+	// never a row belonging to a DIFFERENT org (soliq audit 2026-08-13).
 	err = h.db.QueryRow(`
 		SELECT id::text, name, payer, COALESCE(account_id::text, '')
 		FROM employee_taxes
 		WHERE tenant_id = $1 AND code = $2 AND deleted_at IS NULL
+		  AND (organization_id IS NULL OR organization_id IS NOT DISTINCT FROM $3)
 		ORDER BY (organization_id IS NULL) ASC
 		LIMIT 1
-	`, tenantID, in.TaxCode).Scan(&taxID, &taxName, &payer, &liabilityAcctID)
+	`, tenantID, in.TaxCode, orgIDPtr).Scan(&taxID, &taxName, &payer, &liabilityAcctID)
 	if err == sql.ErrNoRows {
 		// Fall back: derive from the most recent snapshot.
 		err = h.db.QueryRow(`
@@ -698,6 +769,25 @@ func (h *Handler) RecordEmployeeTaxPayment(c *gin.Context) {
 			FROM payroll_entry_taxes
 			WHERE tenant_id = $1 AND tax_code_snapshot = $2
 		`, tenantID, in.TaxCode).Scan(&taxName, &payer, &liabilityAcctID)
+	}
+	if err != nil || taxName == "" {
+		// Last resort: the legacy codes the report's legacy fallback emits
+		// when no employee_taxes catalog is configured. The GL accrues these
+		// to 6410 (ProcessPayroll legacy fallback), so the payment debits
+		// the same account (soliq audit 2026-08-13).
+		legacyNames := map[string]string{
+			"NDFL":    "Daromad solig'i (JShDS) — legacy",
+			"SOC_TAX": "Ijtimoiy sug'urta — legacy",
+			"INPS":    "INPS — legacy",
+		}
+		if name, isLegacy := legacyNames[in.TaxCode]; isLegacy {
+			taxName = name
+			payer = "employee"
+			if acct := findAccount(h.db, tenantID, orgIDPtr, "byudjetga to'lovlar", "6410"); acct != uuid.Nil {
+				liabilityAcctID = sql.NullString{String: acct.String(), Valid: true}
+			}
+			err = nil
+		}
 	}
 	if err != nil {
 		h.log.Error("Failed to resolve tax for payment", "error", err, "code", in.TaxCode)

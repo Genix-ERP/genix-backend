@@ -17,20 +17,26 @@ type entryNumberQuerier interface {
 //
 // seed is the journal's next_number counter; the result is never below it so
 // existing sequences keep advancing.
+//
+// Soft-deleted entries are deliberately INCLUDED in the MAX: the unique
+// constraint is full, not partial, so a deleted entry still owns its number —
+// excluding it made the very next insert collide with the deleted row and 500
+// (live-reproduced 2026-08-13). Never reusing a deleted document's number is
+// also the auditable behaviour.
 func nextEntryNumberSeq(q entryNumberQuerier, tenantID, orgID interface{}, prefix string, seed int) int {
 	var maxNum int
 	if prefix != "" {
 		_ = q.QueryRow(
 			`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0)
 			 FROM journal_entries
-			 WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3 AND deleted_at IS NULL`,
+			 WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND entry_number LIKE $3`,
 			tenantID, orgID, prefix+"%",
 		).Scan(&maxNum)
 	} else {
 		_ = q.QueryRow(
 			`SELECT COALESCE(MAX(CAST(NULLIF(REGEXP_REPLACE(entry_number, '[^0-9]', '', 'g'), '') AS BIGINT)), 0)
 			 FROM journal_entries
-			 WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2 AND deleted_at IS NULL`,
+			 WHERE tenant_id = $1 AND organization_id IS NOT DISTINCT FROM $2`,
 			tenantID, orgID,
 		).Scan(&maxNum)
 	}

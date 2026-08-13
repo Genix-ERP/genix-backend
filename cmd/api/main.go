@@ -113,6 +113,22 @@ func main() {
 	})))
 	router.Use(middleware.Timeout(cfg.App.RequestTimeout))
 
+	// A 404 written INSIDE the handler chain, not gin's default. The default
+	// NoRoute body is written AFTER the middlewares return — by then the gzip
+	// middleware has closed its compressor, so the body vanished into the
+	// closed writer, the status line was never flushed, and net/http defaulted
+	// the reply to an empty 200. Every unknown path answered 200 to every
+	// gzip-accepting client (i.e. every browser) while curl saw the real 404.
+	router.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{
+			"success": false,
+			"error": gin.H{
+				"code":    "NOT_FOUND",
+				"message": "So'ralgan manzil topilmadi",
+			},
+		})
+	})
+
 	// Health check endpoints (no auth required)
 	router.GET("/health", handler.HealthCheck(db, redisClient))
 	router.GET("/ready", handler.ReadinessCheck(db, redisClient))
