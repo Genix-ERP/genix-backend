@@ -48,6 +48,52 @@ func TestDurationFromProductivityNorm(t *testing.T) {
 	}
 }
 
+// Davomiylik REJA (NORMA) emas, FAKT (JAMI) hajmidan hisoblanadi.
+// Ekrandagi 451-ish: NORMA 0,1 / FAKT 0,1, mehnat JAMI = 323,01 × 0,1 = 32,301.
+func TestDurationUsesFaktQuantityNotNorma(t *testing.T) {
+	p := schedParams{CrewSize: 2, HoursPerShift: 8, Shifts: 1} // 16 kishi-soat/kun
+	norms := []productivityNorm{{name: "beton", uom: "m3", manHours: 4}}
+
+	// REJA 10, FAKT 6 → FAKT bo'yicha: 6 × 4 = 24 / 16 = 1,5 → 2 kun.
+	// REJA bo'yicha bo'lganda 40/16 = 2,5 → 3 kun chiqardi.
+	w := &autoWork{Name: "BETON qoplama", Uom: "m3", Quantity: 10, QuantityFakt: 6}
+	if got, src, _ := computeDuration(w, p, norms); got != 2 || src != "productivity" {
+		t.Errorf("FAKT 6 → (%d,%q), want (2,productivity)", got, src)
+	}
+
+	// FAKT kiritilmagan (0) → rejaga qaytadi, aks holda ish davomiyliksiz qolardi.
+	w2 := &autoWork{Name: "BETON qoplama", Uom: "m3", Quantity: 10, QuantityFakt: 0}
+	if got, _, _ := computeDuration(w2, p, norms); got != 3 {
+		t.Errorf("FAKT yo'q → %d, want 3 (reja hajmiga qaytish)", got)
+	}
+}
+
+// Quvvat = brigada (kishi) × smena (soat) × smenalar soni — kishi-soat/kun.
+// Mehnat sarfi ЧЕЛ.-Ч da bo'lgani uchun o'lchov birliklari mos tushadi.
+func TestCapacityFromCrewShiftHours(t *testing.T) {
+	cases := []struct {
+		crew, shifts int
+		hours        float64
+		manHours     float64
+		wantDays     int
+		note         string
+	}{
+		{4, 1, 8, 32, 1, "4×8×1 = 32 kishi-soat/kun, aynan bir kun"},
+		{4, 1, 8, 32.301, 2, "ekrandagi 451-ish: 0,3% oshsa ham butun kun qo'shiladi"},
+		{4, 2, 8, 64, 1, "ikkinchi smena quvvatni ikki barobar oshiradi"},
+		{8, 1, 8, 64, 1, "brigada ikki barobar — xuddi shu natija"},
+		{4, 1, 12, 48, 1, "uzaytirilgan smena"},
+		{1, 1, 8, 108, 14, "108 kishi-soat, yolg'iz ishchi: 13,5 → 14"},
+	}
+	for _, c := range cases {
+		p := schedParams{CrewSize: c.crew, HoursPerShift: c.hours, Shifts: c.shifts}
+		got, src, _ := computeDuration(&autoWork{ManHours: c.manHours}, p, nil)
+		if got != c.wantDays || src != "norm" {
+			t.Errorf("%s: (%d,%q), want (%d,norm)", c.note, got, src, c.wantDays)
+		}
+	}
+}
+
 // Yaxlitlash doim yuqoriga, minimum 1 kun.
 func TestDurationRoundsUpMinimumOne(t *testing.T) {
 	p := schedParams{CrewSize: 10, HoursPerShift: 8, Shifts: 1}
