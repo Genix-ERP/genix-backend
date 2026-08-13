@@ -1410,18 +1410,23 @@ func (h *Handler) GetCashBalance(c *gin.Context) {
 		args = append(args, *orgID)
 	}
 
+	// Account set = the canonical cash predicate (cash_engine.go), matching
+	// the dashboard's cashBalancesAsOf — the hand-rolled at.code='CASH' +
+	// bare is_leaf pair here dropped is_bank_account accounts and NULL-leaf
+	// rows the dashboard counts (moliya chuqur audit 2026-08-13).
 	rows, err := h.db.Query(`
-		SELECT a.id, a.code, COALESCE(a.name_uz, a.name), COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
+		SELECT a.id, a.code, COALESCE(a.name_uz, a.name),
+		       COALESCE(a.opening_balance, 0) + COALESCE(SUM(l.debit_amount - l.credit_amount), 0) AS bal
 		FROM accounts a
-		JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'
+		JOIN account_types at ON at.id = a.account_type_id
 		LEFT JOIN (
 			journal_entry_lines l
 			JOIN journal_entries je ON je.id = l.journal_entry_id
 				AND je.status = 'posted' AND je.deleted_at IS NULL
 				AND je.entry_date <= $2`+orgFilter+`
 		) ON l.account_id = a.id
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true AND a.is_leaf = true
-		GROUP BY a.id, a.code, COALESCE(a.name_uz, a.name)
+		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND `+cashAccountPredicate("a", "at")+`
+		GROUP BY a.id, a.code, COALESCE(a.name_uz, a.name), a.opening_balance
 		ORDER BY a.code`, args...)
 	if err != nil {
 		h.log.Error("Failed to compute cash balance", "error", err)
@@ -2235,8 +2240,12 @@ func getUzDescription(sourceType, originalDescription string) string {
 		// Ishlab chiqarish (Manufacturing)
 		"production_complete": "Ishlab chiqarish yakunlandi",
 		// Ish haqi (Payroll)
-		"payroll":          "Ish haqi hisoblash",
-		"salary_deduction": "Ish haqidan ushlab qolish",
+		"payroll":               "Ish haqi hisoblash",
+		"payroll_payment":       "Ish haqi to'lovi",
+		"payroll_avans_reclass": "Ish haqi avansi reklassifikatsiyasi",
+		"salary_deduction":      "Ish haqidan ushlab qolish",
+		// Kassa
+		"cash_order": "Kassa orderi (PKO/RKO)",
 		// Buyurtmalar (Orders)
 		"purchase_order": "Xarid buyurtmasi",
 		// Tizim (System)
@@ -2283,6 +2292,10 @@ func getUzDescription(sourceType, originalDescription string) string {
 		{"goods receipt", "Tovar qabul qilish"},
 		{"purchase invoice", "Xarid fakturasi"},
 		{"debit note", "Debet nota"},
+		// "salary payment" must match BEFORE the generic "payment" pattern —
+		// otherwise every "Salary Payment: …" JE rendered as a bare "To'lov"
+		// (moliya chuqur audit 2026-08-13).
+		{"salary", "Ish haqi"},
 		{"payment", "To'lov"},
 		{"expense", "Xarajat"},
 		{"invoice", "Faktura"},
@@ -2292,7 +2305,6 @@ func getUzDescription(sourceType, originalDescription string) string {
 		{"transfer", "O'tkazma"},
 		{"advance", "Oldindan to'lov"},
 		{"depreciation", "Amortizatsiya"},
-		{"salary", "Ish haqi"},
 	}
 	for _, p := range descPatterns {
 		if strings.Contains(descLower, p.pattern) {
