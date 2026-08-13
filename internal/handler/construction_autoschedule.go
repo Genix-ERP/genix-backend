@@ -149,17 +149,25 @@ type autoWork struct {
 	Name       string
 	Section    string
 	Uom        string
-	Quantity   float64
-	DoneQty    float64
-	Approval   string
-	Start, End *time.Time
-	Source     string // none | auto | manual
-	IsFixed    bool
-	Duration   int
-	DurSource  string // norm | productivity | default | manual
-	NormSnap   []byte
-	SortOrder  int
-	ManHours   float64 // mehnat sublinelaridan (0 → norma topilmadi)
+	// Quantity — workQtyCase: ВОР importi → NORMA langari → jonli hisob.
+	// Bu REJA (smetadagi) hajm.
+	Quantity float64
+	// QuantityFakt — el.quantity, ya'ni UI'dagi FAKT maydoni: obyektda
+	// haqiqatda bajariladigan hajm. Resurs sublinelarining JAMI ustuni ham
+	// shundan chiqadi (JAMI = ota-ish FAKT × NORMA), shuning uchun davomiylik
+	// ham shu bazaga tayanishi kerak — aks holda mehnat sarfi bor ish FAKT
+	// bo'yicha, normadan hisoblangani esa REJA bo'yicha o'lchanardi.
+	QuantityFakt float64
+	DoneQty      float64
+	Approval     string
+	Start, End   *time.Time
+	Source       string // none | auto | manual
+	IsFixed      bool
+	Duration     int
+	DurSource    string // norm | productivity | default | manual
+	NormSnap     []byte
+	SortOrder    int
+	ManHours     float64 // mehnat sublinelaridan (0 → norma topilmadi)
 	// Yuklashdagi asl qiymatlar — delta/undo uchun (hisob paytida Source va
 	// Duration qayta yoziladi, shuning uchun "oldin" ni alohida saqlaymiz).
 	OrigSource   string
@@ -233,6 +241,7 @@ func (h *Handler) loadSchedWorks(tenantID uuid.UUID, projectID int64) ([]*autoWo
 		SELECT el.id, COALESCE(el.item_number,''), COALESCE(el.name,''),
 		       COALESCE(el.parent_item_number,''), COALESCE(el.uom,''),
 		       `+workQtyCase+` AS quantity,
+		       COALESCE(el.quantity,0) AS quantity_fakt,
 		       COALESCE(el.done_quantity,0), COALESCE(el.approval_status,'pending'),
 		       el.sched_start, el.sched_end,
 		       COALESCE(el.schedule_source,'none'), COALESCE(el.is_fixed,false),
@@ -262,6 +271,7 @@ func (h *Handler) loadSchedWorks(tenantID uuid.UUID, projectID int64) ([]*autoWo
 		w := &autoWork{}
 		var st, en nullableTime
 		if err := rows.Scan(&w.ID, &w.ItemNumber, &w.Name, &w.Section, &w.Uom, &w.Quantity,
+			&w.QuantityFakt,
 			&w.DoneQty, &w.Approval, &st, &en, &w.Source, &w.IsFixed,
 			&w.Duration, &w.DurSource, &w.SortOrder, &w.ManHours); err != nil {
 			continue
@@ -331,7 +341,17 @@ func computeDuration(w *autoWork, p schedParams, norms []productivityNorm) (int,
 	}
 
 	// 2. Unumdorlik spravochnigi (rastsenkasiz pozitsiyalar).
-	if w.Quantity > 0 {
+	//
+	// Hajm FAKT dan olinadi — 1-yo'l bilan bir xil baza. JAMI ustuni
+	// (ota-ish FAKT × NORMA) shundan chiqadi, shuning uchun normadan
+	// hisoblangan ish ham REJA emas, FAKT hajmi bo'yicha o'lchanishi kerak.
+	// FAKT nol bo'lsa (hali kiritilmagan) — reja hajmiga qaytamiz, aks holda
+	// ish umuman davomiylik olmay qolardi.
+	qty := w.QuantityFakt
+	if qty <= 0 {
+		qty = w.Quantity
+	}
+	if qty > 0 {
 		lowName, lowUom := strings.ToLower(w.Name), strings.ToLower(w.Uom)
 		for _, n := range norms {
 			match := false
@@ -345,16 +365,16 @@ func computeDuration(w *autoWork, p schedParams, norms []productivityNorm) (int,
 				match = false // birlik mos kelmasa — bu norma emas
 			}
 			if match {
-				mh := w.Quantity * n.manHours
+				mh := qty * n.manHours
 				days := int(math.Ceil(mh / capacity))
 				if days < 1 {
 					days = 1
 				}
 				snap, _ := json.Marshal(map[string]interface{}{
 					"source": "productivity", "man_hours_per_unit": n.manHours,
-					"quantity": w.Quantity, "man_hours": mh, "capacity_per_day": capacity,
+					"quantity": qty, "man_hours": mh, "capacity_per_day": capacity,
 					"formula": fmt.Sprintf("%.3f × %.2f kishi-soat / (%d × %.0f × %d) = %d kun",
-						w.Quantity, n.manHours, p.CrewSize, p.HoursPerShift, p.Shifts, days),
+						qty, n.manHours, p.CrewSize, p.HoursPerShift, p.Shifts, days),
 				})
 				return days, "productivity", snap
 			}
