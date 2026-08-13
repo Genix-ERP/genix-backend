@@ -1316,7 +1316,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			revenueLineID, journalEntryID, lineNumber, incomeAcct, "Sales Revenue",
 			0.0, amount, 1.0, now,
 		)
-		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
 		lineNumber++
 	}
 
@@ -1331,7 +1331,7 @@ func (h *Handler) SendInvoice(c *gin.Context) {
 			taxLineID, journalEntryID, lineNumber, taxAccountID, "Sales Tax Payable",
 			0.0, taxAmount, 1.0, now,
 		)
-		tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+		tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 		lineNumber++
 	}
 
@@ -1469,6 +1469,13 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		response.BadRequest(c, "Cannot record payment for cancelled invoice")
 		return
 	}
+	if currentStatus == string(entity.InvoiceStatusDraft) {
+		// A draft has no AR posted yet — a payment here would credit AR that
+		// was never debited, and the paid status then locks the invoice out
+		// of /send (which only accepts drafts) forever.
+		response.BadRequest(c, "Only sent invoices can accept payments — send the invoice first")
+		return
+	}
 	if currentStatus == string(entity.InvoiceStatusPaid) {
 		response.BadRequest(c, "Invoice is already fully paid")
 		return
@@ -1494,7 +1501,19 @@ func (h *Handler) RecordPayment(c *gin.Context) {
 		effectiveAmountDue = 0
 	}
 
-	if input.Amount+input.WriteOffAmount > amountDue+0.01 {
+	// The bound must be the DISCOUNTED due, because the claim below counts the
+	// discount as credit too: with a live 50k discount on a 1M invoice, paying
+	// the face 1M made totalCredited 1.05M — the claim matched 0 rows and the
+	// customer was told "overpayment" for paying exactly what the paper said.
+	// Only amounts up to (due − discount) can succeed, so refuse the rest here
+	// with a message that names the discounted figure.
+	if input.Amount+input.WriteOffAmount > effectiveAmountDue+0.01 {
+		if earlyDiscountApplied > 0 {
+			response.BadRequest(c, fmt.Sprintf(
+				"Chegirma bilan to'lanadigan qoldiq %.2f — undan ortiq summa kiritilmasin (chegirma: %.2f)",
+				effectiveAmountDue, earlyDiscountApplied))
+			return
+		}
 		response.BadRequest(c, fmt.Sprintf("Payment + write-off exceeds amount due (%.2f)", amountDue))
 		return
 	}
@@ -2261,10 +2280,10 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 			// Update account balances
 			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, arAccountID)
 			if revenueAccountID != uuid.Nil {
-				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", cnSubtotal, now, revenueAccountID)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", cnSubtotal, now, revenueAccountID)
 			}
 			if taxAccountID != uuid.Nil && taxAmount > 0 {
-				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+				tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 			}
 
 			tx.Exec("UPDATE sales_invoices SET journal_entry_id = $1 WHERE id = $2", journalEntryID, creditNoteID)
@@ -2283,11 +2302,23 @@ func (h *Handler) ConfirmCreditNote(c *gin.Context) {
 
 	// Reduce the original invoice balance
 	if originalInvoiceID != nil {
-		tx.Exec(`
+		// Capped in the WHERE like RecordPayment's claim: a credit note is a
+		// settlement, and settlements must never push amount_paid past the
+		// invoice total (uncapped, three confirmations drove amount_paid to
+		// 4x the invoice and amount_due to a negative that silently drops
+		// the row from every open-AR card).
+		cnRes, cnErr := tx.Exec(`
 			UPDATE sales_invoices SET amount_paid = amount_paid + $1, updated_at = $2
-			WHERE id = $3 AND tenant_id = $4`,
+			WHERE id = $3 AND tenant_id = $4
+			  AND amount_paid + $1 <= total_amount + 0.01`,
 			totalAmount, now, *originalInvoiceID, tenantID,
 		)
+		if cnErr == nil {
+			if n, _ := cnRes.RowsAffected(); n == 0 {
+				response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
+				return
+			}
+		}
 		tx.Exec(`
 			UPDATE sales_invoices SET status = CASE
 				WHEN amount_paid >= total_amount THEN 'paid'
@@ -2554,7 +2585,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				uuid.New(), jeID, lineNumber, incomeAcct, "Sales Revenue",
 				0.0, amount, 1.0, now,
 			)
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct)
 			lineNumber++
 		}
 
@@ -2566,7 +2597,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				uuid.New(), jeID, lineNumber, taxAccountID, "Sales Tax Payable",
 				0.0, taxAmount, 1.0, now,
 			)
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID)
 			lineNumber++
 		}
 
@@ -2661,7 +2692,7 @@ func (h *Handler) RepairRevenueJournalEntries(c *gin.Context) {
 				tx.Rollback()
 				continue
 			}
-			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", missingRevenue, now, revenueAccountID)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", missingRevenue, now, revenueAccountID)
 			if err := tx.Commit(); err != nil {
 				continue
 			}

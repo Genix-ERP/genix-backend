@@ -126,8 +126,11 @@ func (h *Handler) GetPurchaseOrderStats(c *gin.Context) {
 		mRows.Close()
 	}
 	monthlySeries := make([]monthPoint, monthsBack)
+	// Day-1 anchor — see inventory_stats.go: stepping months from the 31st
+	// duplicates one month and drops another.
+	monthAnchor := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, nowT.Location())
 	for i := 0; i < monthsBack; i++ {
-		key := nowT.AddDate(0, -i, 0).Format("2006-01")
+		key := monthAnchor.AddDate(0, -i, 0).Format("2006-01")
 		mp := byMonth[key]
 		mp.Month = key
 		monthlySeries[monthsBack-1-i] = mp

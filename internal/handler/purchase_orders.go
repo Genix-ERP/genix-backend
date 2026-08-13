@@ -2415,7 +2415,7 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 			subtotal, tax_amount, total_amount, amount_paid,
 			status, payment_status, three_way_match_status,
 			notes, created_by, created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'confirmed', 'unpaid', 'matched', $12, $13, $14, $14)`,
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, 'confirmed', 'unpaid', 'pending', $12, $13, $14, $14)`,
 		billID, tenantID, organizationID, invoiceNumber, vendorID,
 		poID, now, dueDate,
 		subtotal, taxAmount, totalAmount,
@@ -2834,7 +2834,7 @@ func (h *Handler) CreateBillFromPO(c *gin.Context) {
 				response.InternalError(c, "Failed to create AP journal entry line: "+err.Error())
 				return
 			}
-			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID); err != nil {
 				h.log.Error("CreateBillFromPO: failed to update AP account balance", "error", err)
 				response.InternalError(c, "Failed to update AP account balance: "+err.Error())
 				return

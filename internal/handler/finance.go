@@ -4243,9 +4243,10 @@ func (h *Handler) ConfirmPayment(c *gin.Context) {
 			res, updErr := tx.Exec(`
 				UPDATE sales_invoices SET
 					amount_paid = amount_paid + $1,
-					status = CASE WHEN amount_paid + $1 >= total_amount THEN 'paid' ELSE 'partial' END,
+					status = CASE WHEN amount_paid + $1 >= total_amount - 0.01 THEN 'paid' ELSE 'partial' END,
 					updated_at = $2
 				WHERE id = $3 AND tenant_id = $4
+				  AND amount_paid + $1 <= total_amount + 0.01
 			`, a.Amount, now, a.DocID, tenantID)
 			if updErr != nil {
 				h.log.Error("Failed to update sales invoice amount_paid", "error", updErr, "invoice_id", a.DocID, "amount", a.Amount)

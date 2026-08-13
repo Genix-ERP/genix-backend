@@ -410,7 +410,7 @@ func (h *Handler) GetIncomeStatement(c *gin.Context) {
 				AND je.entry_date >= $2 AND je.entry_date <= $3
 				AND je.deleted_at IS NULL` + jeOrgFilter + `
 		) ON a.id = jel.account_id
-		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL AND a.is_active = true
+		WHERE a.tenant_id = $1 AND a.deleted_at IS NULL
 			AND at.category IN ('revenue', 'expense')
 	`
 	if jeOrgFilter != "" {
@@ -1234,7 +1234,7 @@ func (h *Handler) GetAgingReceivables(c *gin.Context) {
 		WHERE sr.tenant_id = $1 AND sr.deleted_at IS NULL
 		  AND sr.status IN ('approved', 'completed')
 		  AND sr.customer_id IS NOT NULL
-		  AND COALESCE(sr.approved_at, sr.return_date) <= $2::date
+		  AND COALESCE(sr.approved_at::date, sr.return_date::date) <= $2::date
 	`
 	retArgs := []interface{}{tenantID, asOfDate}
 	if orgID, orgOk := middleware.GetOrganizationID(c); orgOk && orgID != uuid.Nil {

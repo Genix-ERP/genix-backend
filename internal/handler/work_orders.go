@@ -2593,10 +2593,9 @@ func (h *Handler) RemoveWorkOrderMaterial(c *gin.Context) {
 			if len(touched) > 0 {
 				if _, recErr := tx.Exec(`
 					UPDATE accounts a
-					SET current_balance = CASE
-						WHEN at.normal_balance = 'debit' THEN s.dt - s.kt
-						ELSE                                  s.kt - s.dt
-					END,
+					-- 448 convention: dt - kt unconditionally (see the
+					-- matching recompute in manufacturing.go).
+					SET current_balance = s.dt - s.kt,
 					    updated_at = NOW()
 					FROM account_types at,
 					     (SELECT acc.id AS account_id,

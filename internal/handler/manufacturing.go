@@ -2088,12 +2088,18 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 			  AND reference_id = $2
 			  AND transaction_type IN ('issue', 'production_out', 'transfer_out')
 			  AND deleted_at IS NULL
+		), per_row AS (
+			-- Postgres UPDATE..FROM applies ONE arbitrary matching source row
+			-- per target row: three 10kg issues against one inventory row
+			-- restored +10, not +30, while all three ledger rows were
+			-- soft-deleted — 20kg vanished unreconstructibly. Aggregate first.
+			SELECT inventory_id, SUM(qty) AS qty FROM issues GROUP BY inventory_id
 		), restore AS (
 			UPDATE inventory inv
 			SET quantity_on_hand = inv.quantity_on_hand + i.qty,
 			    last_movement_date = $3,
 			    updated_at = $3
-			FROM issues i
+			FROM per_row i
 			WHERE inv.id = i.inventory_id
 			RETURNING inv.id
 		)
@@ -2118,12 +2124,15 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 			  AND reference_id = $2
 			  AND transaction_type IN ('receipt', 'production_in', 'return', 'production_scrap', 'transfer_in')
 			  AND deleted_at IS NULL
+		), per_row AS (
+			-- Same one-source-row-per-target trap as step 5 — aggregate first.
+			SELECT inventory_id, SUM(qty) AS qty FROM receipts GROUP BY inventory_id
 		), restore AS (
 			UPDATE inventory inv
 			SET quantity_on_hand = GREATEST(inv.quantity_on_hand - r.qty, 0),
 			    last_movement_date = $3,
 			    updated_at = $3
-			FROM receipts r
+			FROM per_row r
 			WHERE inv.id = r.inventory_id
 			RETURNING inv.id
 		)
@@ -2151,10 +2160,11 @@ func (h *Handler) DeleteProductionOrder(c *gin.Context) {
 	if len(touchedAccounts) > 0 {
 		if _, err := tx.Exec(`
 			UPDATE accounts a
-			SET current_balance = CASE
-				WHEN at.normal_balance = 'debit' THEN s.dt - s.kt
-				ELSE                                  s.kt - s.dt
-			END,
+			-- 448 convention: current_balance = SUM(debit) - SUM(credit) for
+			-- EVERY account. The old normal_balance CASE negated every
+			-- credit-normal account this recompute touched (a -45M payable
+			-- became +45M the moment a production order was deleted).
+			SET current_balance = s.dt - s.kt,
 			    updated_at = NOW()
 			FROM account_types at,
 			     (SELECT acc.id AS account_id,

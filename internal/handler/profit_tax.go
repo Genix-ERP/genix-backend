@@ -187,6 +187,11 @@ func (h *Handler) GetProfitTax(c *gin.Context) {
 	accountingProfit := income - total
 	taxBase := income - recognized // key difference — unrecognized NOT deducted
 	taxAmount := round2(taxBase * rate / 100)
+	if taxAmount < 0 {
+		// A loss period owes zero tax — a negative here read as the state
+		// owing the company money and was even snapshotted as such.
+		taxAmount = 0
+	}
 	netProfit := accountingProfit - taxAmount
 
 	snap := h.lookupProfitTaxSnapshot(tenantID, periodType, periodKey)
@@ -258,6 +263,11 @@ func (h *Handler) SnapshotProfitTax(c *gin.Context) {
 	accountingProfit := input.Income - total
 	taxBase := input.Income - recognized
 	taxAmount := round2(taxBase * rate / 100)
+	if taxAmount < 0 {
+		// A loss period owes zero tax — a negative here read as the state
+		// owing the company money and was even snapshotted as such.
+		taxAmount = 0
+	}
 	netProfit := accountingProfit - taxAmount
 
 	var orgIDPtr *uuid.UUID

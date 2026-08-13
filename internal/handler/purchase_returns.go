@@ -1081,7 +1081,7 @@ func (h *Handler) ShipPurchaseReturn(c *gin.Context) {
 			}
 
 			// Update account balances
-			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", grossValue, now, apAccountID); err != nil {
+			if _, err = tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", grossValue, now, apAccountID); err != nil {
 				h.log.Error("Failed to update AP account balance for debit note JE", "error", err)
 				return
 			}
