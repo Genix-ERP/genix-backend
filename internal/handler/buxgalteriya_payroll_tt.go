@@ -742,6 +742,20 @@ func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr
 		return ""
 	}
 
+	// Cross-flow guard (moliya chuqur audit 2026-08-13): if the whole period
+	// was already paid via the period-level flow (source_id = period id),
+	// this leg's money has already left the till — flipping the flag is
+	// bookkeeping only, don't credit cash a second time.
+	var periodPaid int
+	_ = tx.QueryRow(`
+		SELECT COUNT(*) FROM journal_entries
+		WHERE tenant_id = $1 AND source_type = 'payroll_payment' AND source_id = $2
+		  AND status = 'posted' AND reversed_entry_id IS NULL AND deleted_at IS NULL
+	`, tenantID, periodID.String()).Scan(&periodPaid)
+	if periodPaid > 0 {
+		return ""
+	}
+
 	// Debit account: 6710 if the period is accrued, else 9420 (simple mode).
 	var accrued int
 	if err := tx.QueryRow(`
@@ -784,10 +798,10 @@ func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr
 		return "To'lov hisobi topilmadi — kassa/bank schyotini sozlang (5010/5110)"
 	}
 
-	// Balance guard (same standard as expenses' /pay).
-	var balance float64
-	_ = tx.QueryRow(`SELECT COALESCE(current_balance, 0) FROM accounts WHERE id = $1`, creditAcct).Scan(&balance)
-	if balance < amount {
+	// Balance guard (same standard as expenses' /pay) — GL ledger balance,
+	// the same figure the Moliya dashboard cash card shows, NOT the
+	// accounts.current_balance cache (moliya chuqur audit 2026-08-13).
+	if balance := payrollCashBalance(tx, tenantID, creditAcct); balance < amount {
 		return fmt.Sprintf("Hisobda mablag' yetarli emas: mavjud %.0f, to'lov %.0f", balance, amount)
 	}
 
@@ -817,8 +831,11 @@ func (h *Handler) postTTSalaryPaymentJE(tx *sql.Tx, tenantID uuid.UUID, orgIDPtr
 	}
 	entryNumber := fmt.Sprintf("PAYPMT%05d", nextEntryNumberSeq(tx, tenantID, orgVal, "PAYPMT", nextNumber))
 	kindLabel := "avans"
-	if kind == "remainder" {
+	switch kind {
+	case "remainder":
 		kindLabel = "qoldiq"
+	case "confirm":
+		kindLabel = "yakuniy"
 	}
 	description := fmt.Sprintf("Ish haqi to'lovi (%s): %s — %s", kindLabel, employeeName, periodName)
 

@@ -270,20 +270,30 @@ class TestPayment:
 class TestTTMarkPaid:
     @pytest.fixture(scope="class")
     def tt_entry(self, api_client, db_read, tenant_id):
-        resp = api_client.post("/payroll/periods/current-or-create", json={})
-        if resp.status_code not in (200, 201):
-            pytest.skip(f"TT current-or-create failed: {resp.status_code} {resp.text[:200]}")
-        period = resp.json().get("data", resp.json()).get("period")
-        assert period and period.get("id")
+        # A FRESH period: the shared current-month TT period may already be
+        # paid at period level, and since the cross-flow guard (moliya
+        # chuqur audit 2026-08-13) a per-entry leg on a period-paid period
+        # intentionally posts no second cash JE. The mark/unmark GL
+        # mechanics need a period whose money has NOT left yet.
+        emp = _mk_employee(api_client, salary=2_000_000)
+        period = _mk_period(api_client, "T21TT")
+        resp = api_client.post(f"/payroll-periods/{period['id']}/entries", json={
+            "employee_id": emp["id"],
+            "base_salary": 2_000_000,
+        })
+        assert resp.status_code in (200, 201), resp.text
+        created = resp.json().get("data", resp.json())
+        # The create response echoes zero advance fields — re-read the list,
+        # where the stored advance_amount (base × advance_percent) is real.
         resp = api_client.get(f"/payroll-periods/{period['id']}/entries")
         assert resp.status_code == 200
         entries = resp.json().get("data", resp.json())
         if isinstance(entries, dict):
             entries = entries.get("items", entries.get("entries", []))
-        candidates = [e for e in entries if float(e.get("advance_amount") or 0) > 0]
-        if not candidates:
-            pytest.skip("no TT entry with a positive advance_amount")
-        return {"period": period, "entry": candidates[0]}
+        entry = next(e for e in entries if e["id"] == created["id"])
+        assert float(entry.get("advance_amount") or 0) > 0, \
+            f"entry has no advance_amount: {entry}"
+        return {"period": period, "entry": entry}
 
     def test_advance_paid_posts_je_and_unmark_reverses(
         self, api_client, db_read, tenant_id, accounts, tt_entry
@@ -346,6 +356,36 @@ class TestTTMarkPaid:
         assert len(active) == 1, f"double-marking left {len(active)} active JEs"
         # cleanup
         api_client.post(f"/payroll/entries/{eid}/advance-paid", json={"paid": False})
+
+    def test_period_paid_blocks_second_cash_leg(
+        self, api_client, db_read, tenant_id, accounts
+    ):
+        """Cross-flow guard (moliya chuqur audit 2026-08-13): once the whole
+        period is paid at period level, marking an entry's avans paid flips
+        the flag but must NOT credit cash a second time."""
+        emp = _mk_employee(api_client, salary=1_200_000)
+        period = _mk_period(api_client, "T21XG")
+        resp = api_client.post(f"/payroll-periods/{period['id']}/entries", json={
+            "employee_id": emp["id"],
+            "base_salary": 1_200_000,
+        })
+        assert resp.status_code in (200, 201), resp.text
+        entry = resp.json().get("data", resp.json())
+        eid = entry["id"]
+
+        _fund_cash_accounts(db_read, tenant_id, 5_000_000)
+        r = api_client.post(f"/payroll-periods/{period['id']}/process", json={})
+        assert r.status_code == 200, r.text
+        r = api_client.put(f"/payroll-periods/{period['id']}",
+                           json={"status": "paid", "payment_method": "cash"})
+        assert r.status_code == 200, r.text
+        assert len(_je_rows(db_read, tenant_id, "payroll_payment", period["id"])) == 1
+
+        r = api_client.post(f"/payroll/entries/{eid}/advance-paid", json={"paid": True})
+        assert r.status_code == 200, r.text
+        entry_jes = _je_rows(db_read, tenant_id, "payroll_payment", eid)
+        assert entry_jes == [], \
+            f"period already paid — avans mark must post no cash JE, got {len(entry_jes)}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

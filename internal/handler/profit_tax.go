@@ -119,6 +119,36 @@ func (h *Handler) computeProfitTaxExpenses(tenantID uuid.UUID, orgID uuid.UUID, 
 	if err := h.db.QueryRow(q, args...).Scan(&recognized, &unrecognized); err != nil {
 		return 0, 0, err
 	}
+
+	// Payroll (moliya chuqur audit 2026-08-13): salaries never touch the
+	// expenses table — they post straight to GL 9420 from the Ish haqi
+	// module — so the tax base used to be overstated by the entire payroll.
+	// Deduct the period's net 9420 movement from payroll-source JEs:
+	// accruals (Dt gross), cash-basis payments (Dt), avans reclasses (Kt)
+	// and their storno reversals, so mark/unmark cycles net out.
+	payrollQ := fmt.Sprintf(`
+		SELECT COALESCE(SUM(l.debit_amount - l.credit_amount), 0)
+		FROM journal_entry_lines l
+		JOIN journal_entries je ON je.id = l.journal_entry_id
+		JOIN accounts a ON a.id = l.account_id
+		WHERE je.tenant_id = $1 AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.entry_date BETWEEN $2 AND $3
+		  AND a.code = '9420'
+		  AND (je.source_type IN ('payroll', 'payroll_payment', 'payroll_avans_reclass')
+		       OR (je.source_type = 'reversal' AND EXISTS (
+		             SELECT 1 FROM journal_entries o
+		             WHERE o.tenant_id = je.tenant_id AND o.reversed_entry_id = je.id
+		               AND o.source_type IN ('payroll', 'payroll_payment', 'payroll_avans_reclass'))))
+		  %s
+	`, strings.ReplaceAll(orgClause, "organization_id", "je.organization_id"))
+	var payrollExpense float64
+	if err := h.db.QueryRow(payrollQ, args...).Scan(&payrollExpense); err != nil {
+		return 0, 0, err
+	}
+	if payrollExpense > 0 {
+		recognized += payrollExpense
+	}
+
 	return recognized, unrecognized, nil
 }
 
