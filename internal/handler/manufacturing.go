@@ -2938,20 +2938,28 @@ func (h *Handler) StartProductionOrder(c *gin.Context) {
 			response.InternalError(c, "Failed to post journal entry")
 			return
 		}
+		// Stock accounts (1010 family) carry mandatory 'ombor' analytics on
+		// older tenants (TT §4.5, migrations 317/326), so the lines MUST
+		// carry warehouse_id or the invariant trigger rejects them — the
+		// exact failure 496 fixed for sales invoices. Migration 497 also
+		// enriches from production_orders as a net, but pass it explicitly
+		// and surface a rejection as 422, not an opaque 500.
 		if _, jeErr := tx.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-			VALUES ($1, $2, $3, $4, $5, 0, 1, $6)
-		`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, now); jeErr != nil {
+			INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, warehouse_id, created_at)
+			VALUES ($1, $2, $3, $4, $5, 0, 1, $6, $7)
+		`, uuid.New(), entryID, wipAcct, "WIP: raw materials consumed", totalMaterialCost, warehouseID, now); jeErr != nil {
 			h.log.Error("StartProductionOrder: failed to insert WIP debit line", "error", jeErr, "po_id", id)
-			response.InternalError(c, "Failed to post journal entry")
+			response.Error(c, http.StatusUnprocessableEntity, "JE_REJECTED",
+				"Buxgalteriya provodkasi rad etildi: "+jeErr.Error())
 			return
 		}
 		if _, jeErr := tx.Exec(`
-			INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, created_at)
-			VALUES ($1, $2, $3, $4, 0, $5, 2, $6)
-		`, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, now); jeErr != nil {
+			INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, description, debit_amount, credit_amount, line_number, warehouse_id, created_at)
+			VALUES ($1, $2, $3, $4, 0, $5, 2, $6, $7)
+		`, uuid.New(), entryID, rawAcct, "Raw materials issued to production", totalMaterialCost, warehouseID, now); jeErr != nil {
 			h.log.Error("StartProductionOrder: failed to insert raw materials credit line", "error", jeErr, "po_id", id)
-			response.InternalError(c, "Failed to post journal entry")
+			response.Error(c, http.StatusUnprocessableEntity, "JE_REJECTED",
+				"Buxgalteriya provodkasi rad etildi: "+jeErr.Error())
 			return
 		}
 		if _, jeErr := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, totalMaterialCost, now, wipAcct); jeErr != nil {
