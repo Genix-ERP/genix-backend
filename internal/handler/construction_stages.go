@@ -442,6 +442,7 @@ func (h *Handler) GetConstructionStagesOverview(c *gin.Context) {
 			WHERE e.project_id = $1
 			  AND el.tenant_id = $2
 			  AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+			  AND e.subcontract_id IS NULL
 			  AND COALESCE(el.resource_type, '') = ''
 			  AND COALESCE(el.parent_line_id, 0) = 0
 		)
@@ -543,6 +544,7 @@ func (h *Handler) GetConstructionStageWorks(c *gin.Context) {
 		el.tenant_id = $1
 		AND e.project_id = $2
 		AND LOWER(COALESCE(e.source_type, '')) = 'edinich'
+		AND e.subcontract_id IS NULL
 		AND COALESCE(el.resource_type, '') = ''
 		AND COALESCE(el.parent_line_id, 0) = 0
 		AND $3 = ANY(string_to_array(el.parent_item_number, ' › '))`

@@ -37,7 +37,16 @@ END`
 
 // workRowFilter selects top-level work rows in the project's edinich
 // estimates — keep in sync with construction_stages.go GetConstructionStageWorks.
+//
+// `subcontract_id IS NULL` keeps the grafik on the SAME estimate set the
+// Smetalar ro'yxati shows: ListEstimates hides subcontractor estimates behind
+// an explicit `scope=subcontract`, but a subcontract estimate is a copy of the
+// main one carrying the same source_type='edinich' work rows. Without this
+// clause the Gantt drew every subcontracted work twice — once from the
+// project's own smeta, once from the subcontractor's copy — with nothing on
+// the bar to tell them apart.
 const workRowFilter = `LOWER(COALESCE(e.source_type, '')) = 'edinich'
+	AND e.subcontract_id IS NULL
 	AND COALESCE(el.resource_type, '') = ''
 	AND COALESCE(el.parent_line_id, 0) = 0`
 
@@ -98,9 +107,11 @@ func (h *Handler) GetWorkSchedule(c *gin.Context) {
 		       COALESCE(el.done_quantity, 0),
 		       COALESCE(el.unit_rate, 0), COALESCE(el.total_amount, 0),
 		       el.sched_start, el.sched_end, el.baseline_start, el.baseline_end,
-		       COALESCE(el.approval_status, 'pending')
+		       COALESCE(el.approval_status, 'pending'),
+		       COALESCE(e.building_id, 0), COALESCE(b.name, '')
 		FROM construction_estimate_line el
 		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
+		LEFT JOIN construction_buildings b ON b.id = e.building_id
 		WHERE `+where+`
 		ORDER BY el.sort_order ASC, el.id ASC
 	`, args...)
@@ -116,13 +127,14 @@ func (h *Handler) GetWorkSchedule(c *gin.Context) {
 
 	works := []map[string]interface{}{}
 	for rows.Next() {
-		var id, estimateID int64
-		var itemNumber, name, sectionPath, uom, approvalStatus string
+		var id, estimateID, buildingID int64
+		var itemNumber, name, sectionPath, uom, approvalStatus, buildingName string
 		var quantity, doneQty, unitRate, totalAmount float64
 		var schedStart, schedEnd, baseStart, baseEnd nullableTime
 		if err := rows.Scan(&id, &estimateID, &itemNumber, &name, &sectionPath, &uom,
 			&quantity, &doneQty, &unitRate, &totalAmount,
-			&schedStart, &schedEnd, &baseStart, &baseEnd, &approvalStatus); err != nil {
+			&schedStart, &schedEnd, &baseStart, &baseEnd, &approvalStatus,
+			&buildingID, &buildingName); err != nil {
 			h.log.Error("work schedule: scan failed", "error", err)
 			continue
 		}
@@ -137,8 +149,13 @@ func (h *Handler) GetWorkSchedule(c *gin.Context) {
 			}
 		}
 		works = append(works, map[string]interface{}{
-			"id":              id,
-			"estimate_id":     estimateID,
+			"id":          id,
+			"estimate_id": estimateID,
+			// Blocks are usually clones of one another, so the same work name
+			// repeats once per block. Ship the block so the grafik can label
+			// and filter the bars instead of showing N identical rows.
+			"building_id":     buildingID,
+			"building_name":   buildingName,
 			"item_number":     itemNumber,
 			"name":            name,
 			"section":         sectionLeaf(sectionPath),
