@@ -1078,9 +1078,11 @@ func (h *Handler) UpdatePayrollEntry(c *gin.Context) {
 		curAdvancePercentUsed                                                       float64
 		curPaymentMethod, curStatus                                                 string
 		curBankAccount, curNotes                                                    sql.NullString
+		curAdvancePaid, curRemainderPaid                                            bool
 	)
 	err = h.db.QueryRow(`
 		SELECT base_salary, overtime_hours, overtime_amount, bonus, allowances,
+		       COALESCE(advance_paid, false), COALESCE(remainder_paid, false),
 		       income_tax, social_security, pension, other_deductions,
 		       COALESCE(advance_percent_used, 40),
 		       payment_method, status, bank_account, notes
@@ -1088,6 +1090,7 @@ func (h *Handler) UpdatePayrollEntry(c *gin.Context) {
 		WHERE id = $1 AND payroll_period_id = $2 AND tenant_id = $3
 	`, entryID, periodID, tenantID).Scan(
 		&curBaseSalary, &curOvertimeHours, &curOvertimeAmount, &curBonus, &curAllowances,
+		&curAdvancePaid, &curRemainderPaid,
 		&curIncomeTax, &curSocialSecurity, &curPension, &curOtherDeductions,
 		&curAdvancePercentUsed,
 		&curPaymentMethod, &curStatus, &curBankAccount, &curNotes,
@@ -1102,9 +1105,17 @@ func (h *Handler) UpdatePayrollEntry(c *gin.Context) {
 		return
 	}
 
-	// Block edits on entries that have already been processed
+	// Block edits on entries that have already been processed. The TT payment
+	// flow flips advance_paid/remainder_paid WITHOUT changing status, so a
+	// status-only guard let an entry whose avans was already handed out be
+	// re-edited — raising base_salary after the advance recomputes the
+	// remainder against money that has already left the kassa.
 	if curStatus == "paid" || curStatus == "approved" {
 		response.BadRequest(c, "Cannot edit a payroll entry that has already been approved or paid")
+		return
+	}
+	if curAdvancePaid || curRemainderPaid {
+		response.BadRequest(c, "To'lovi boshlangan yozuvni tahrirlab bo'lmaydi — avval to'lovni bekor qiling")
 		return
 	}
 
