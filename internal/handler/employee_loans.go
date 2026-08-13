@@ -650,7 +650,7 @@ func (h *Handler) MarkLoanPaymentPaid(c *gin.Context) {
 	// (Dt cash / Kt 4720). Only posts if the disbursement JE exists — loans
 	// granted without a cash account never hit the GL, so their repayments
 	// must not either.
-	if err := h.postLoanRepaymentJE(tx, tenantID, loanID, paymentID, payAmount); err != nil {
+	if err := h.postLoanRepaymentJE(tx, tenantID, loanID, paymentID, payAmount, payrollEntryID != nil); err != nil {
 		h.log.Error("MarkLoanPaymentPaid: repayment JE", "error", err)
 		response.InternalError(c, "Failed to post repayment journal entry")
 		return
@@ -733,7 +733,7 @@ func (h *Handler) getEmployeeIDFromUser(c *gin.Context, tenantID uuid.UUID) uuid
 // postLoanRepaymentJE posts Dt cash / Kt 4720 for a loan repayment inside the
 // caller's transaction, mirroring the disbursement entry. Skips (nil) when the
 // loan never hit the GL — no disbursement JE, no cash account, or no 4720.
-func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uuid.UUID, amount float64) error {
+func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uuid.UUID, amount float64, viaPayroll bool) error {
 	var loanNumber, empName string
 	var orgIDStr, cashAcctStr sql.NullString
 	err := tx.QueryRow(`
@@ -748,6 +748,25 @@ func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uu
 	cashAccountID, err := uuid.Parse(cashAcctStr.String)
 	if err != nil {
 		return nil
+	}
+
+	// A withholding repayment (linked to a payroll entry) brings no cash in —
+	// it reduces what we owe the employee. Debiting the kassa for it inflated
+	// the drawer by every withheld installment; the correct debit is wages
+	// payable (6710). Walk-in cash repayments keep the cash debit.
+	debitAccountID := cashAccountID
+	debitDesc := fmt.Sprintf("Qarz qaytarildi: %s", empName)
+	if viaPayroll {
+		var orgIDPtr *uuid.UUID
+		if orgIDStr.Valid {
+			if oid, oerr := uuid.Parse(orgIDStr.String); oerr == nil {
+				orgIDPtr = &oid
+			}
+		}
+		if payableAcct := findAccount(tx, tenantID, orgIDPtr, "wages payable", "6710"); payableAcct != uuid.Nil {
+			debitAccountID = payableAcct
+			debitDesc = fmt.Sprintf("Qarz ish haqidan ushlab qolindi: %s", empName)
+		}
 	}
 
 	// Only relieve 4720 if the disbursement actually posted.
@@ -794,7 +813,7 @@ func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uu
 	if _, err := tx.Exec(`
 		INSERT INTO journal_entry_lines (id, journal_entry_id, account_id, line_number, description, debit_amount, credit_amount, created_at)
 		VALUES ($1, $2, $3, 1, $4, $5, 0, $6)
-	`, uuid.New(), jeID, cashAccountID, fmt.Sprintf("Qarz qaytarildi: %s", empName), amount, now); err != nil {
+	`, uuid.New(), jeID, debitAccountID, debitDesc, amount, now); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`
@@ -803,7 +822,7 @@ func (h *Handler) postLoanRepaymentJE(tx *sql.Tx, tenantID, loanID, paymentID uu
 	`, uuid.New(), jeID, loanAccountID, fmt.Sprintf("Qarz qoldig'i kamaydi: %s", empName), amount, now); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, cashAccountID); err != nil {
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, amount, now, debitAccountID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, amount, now, loanAccountID); err != nil {
