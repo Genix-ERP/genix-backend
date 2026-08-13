@@ -2531,6 +2531,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		constructionProjects.POST("/:id/schedule/baseline", h.perm.Require("construction", "estimate", "update"), h.FreezeScheduleBaseline)
 		constructionProjects.POST("/:id/dependencies", h.perm.Require("construction", "estimate", "update"), h.CreateWorkDependency)
 
+		// Avtomatik rejalashtirish (TZ: Ish grafigini avtomatik rejalashtirish).
+		// Preview hech narsa yozmaydi — read huquqi yetarli; apply/undo yozadi.
+		constructionProjects.GET("/:id/schedule/params", h.GetScheduleParams)
+		constructionProjects.PUT("/:id/schedule/params", h.perm.Require("construction", "estimate", "update"), h.UpdateScheduleParams)
+		constructionProjects.POST("/:id/schedule/auto/preview", h.PreviewAutoSchedule)
+		constructionProjects.POST("/:id/schedule/auto/apply", h.perm.Require("construction", "estimate", "update"), h.ApplyAutoSchedule)
+		constructionProjects.GET("/:id/schedule/runs", h.ListScheduleRuns)
+
 		// Subcontracts
 		constructionProjects.GET("/:id/subcontracts", h.ListSubcontracts)
 		constructionProjects.POST("/:id/subcontracts", h.perm.Require("construction", "project", "update"), h.CreateSubcontract)
@@ -2781,6 +2789,14 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 	scheduleDeps.Use(h.perm.Require("construction", "estimate", "update"))
 	{
 		scheduleDeps.DELETE("/:id", h.DeleteWorkDependency)
+	}
+
+	// Yurgizishni orqaga qaytarish (TZ §6.5) — sanalarni yozadi, shuning uchun
+	// grafik yozish huquqi ostida.
+	scheduleRuns := rg.Group("/construction/schedule-runs")
+	scheduleRuns.Use(h.perm.Require("construction", "estimate", "update"))
+	{
+		scheduleRuns.POST("/:runId/undo", h.UndoScheduleRun)
 	}
 
 	// Estimate Summary (direct access)
