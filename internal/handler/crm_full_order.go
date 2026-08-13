@@ -441,7 +441,7 @@ func (h *Handler) createInvoiceAndPostIssuance(
 		args []interface{}
 	}{
 		{`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, arAccountID}},
-		{`UPDATE accounts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, revenueAccountID}},
+		{`UPDATE accounts SET current_balance = current_balance - $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, revenueAccountID}},
 		{`UPDATE contacts SET current_balance = current_balance + $1, updated_at=$2 WHERE id=$3`, []interface{}{total, now, customerID}},
 		{`UPDATE sales_invoices SET journal_entry_id=$1 WHERE id=$2`, []interface{}{jeID, invoiceID}},
 		{`UPDATE journals SET next_number = GREATEST(COALESCE(next_number,1), $1) WHERE id=$2`, []interface{}{nextNumber + 1, journalID}},

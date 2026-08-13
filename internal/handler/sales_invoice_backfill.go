@@ -272,7 +272,7 @@ func (h *Handler) backfillOneInvoice(tenantID, invoiceID uuid.UUID) bool {
 		); err != nil {
 			return false
 		}
-		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`,
 			amount, now, acct); err != nil {
 			return false
 		}
@@ -289,7 +289,7 @@ func (h *Handler) backfillOneInvoice(tenantID, invoiceID uuid.UUID) bool {
 		); err != nil {
 			return false
 		}
-		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`,
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`,
 			creditTax, now, taxAccountID); err != nil {
 			return false
 		}

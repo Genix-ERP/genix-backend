@@ -1812,7 +1812,7 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 			}
 
 			// Update account balances
-			tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
+			tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", totalAmount, now, apAccountID)
 			for creditAcct, amount := range creditGrouped {
 				tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, creditAcct)
 			}
@@ -1836,11 +1836,20 @@ func (h *Handler) ConfirmDebitNote(c *gin.Context) {
 
 	// Reduce the original bill balance
 	if originalInvoiceID != nil {
-		tx.Exec(`
+		// Capped like PayPurchaseInvoice's in-WHERE claim — a debit note must
+		// not settle more than the bill still owes.
+		dnRes, dnErr := tx.Exec(`
 			UPDATE purchase_invoices SET amount_paid = amount_paid + $1, updated_at = $2
-			WHERE id = $3 AND tenant_id = $4`,
+			WHERE id = $3 AND tenant_id = $4
+			  AND amount_paid + $1 <= total_amount + 0.01`,
 			totalAmount, now, *originalInvoiceID, tenantID,
 		)
+		if dnErr == nil {
+			if n, _ := dnRes.RowsAffected(); n == 0 {
+				response.BadRequest(c, "OVER_PAYMENT: amount exceeds the invoice's remaining balance")
+				return
+			}
+		}
 		tx.Exec(`
 			UPDATE purchase_invoices SET status = CASE
 				WHEN amount_paid >= total_amount THEN 'paid'

@@ -3672,7 +3672,7 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 	}
 
 	// Update scrap order status
-	_, err = tx.Exec(`
+	scrapClaim, err := tx.Exec(`
 		UPDATE scrap_orders SET
 			status = 'completed',
 			approved_by = $1,
@@ -3680,12 +3680,19 @@ func (h *Handler) ConfirmScrapOrder(c *gin.Context) {
 			completed_at = $2,
 			inventory_transaction_id = $3,
 			updated_at = $2
-		WHERE id = $4
-	`, userID, now, txnID, orderID)
+		WHERE id = $4 AND tenant_id = $5 AND status <> 'completed'
+	`, userID, now, txnID, orderID, tenantID)
 
 	if err != nil {
 		h.log.Error("Failed to update scrap order", "error", err)
 		response.InternalError(c, "Failed to confirm scrap order")
+		return
+	}
+	// Atomic claim: two concurrent confirms both passed the read-side status
+	// check and scrapped the stock twice; the loser now matches 0 rows and
+	// the whole tx (including its stock deduction) rolls back.
+	if n, _ := scrapClaim.RowsAffected(); n == 0 {
+		response.BadRequest(c, "This operation is already posted")
 		return
 	}
 
@@ -5812,7 +5819,7 @@ func (h *Handler) CompleteStockCount(c *gin.Context) {
 				total_counted_value = COALESCE((SELECT SUM(COALESCE(counted_value, counted_quantity * COALESCE(unit_cost,0), 0)) FROM stock_count_lines WHERE stock_count_id = $3), 0),
 				total_variance_value = COALESCE((SELECT SUM(ABS(variance_quantity) * COALESCE(unit_cost,0)) FROM stock_count_lines WHERE stock_count_id = $3 AND variance_quantity != 0), 0),
 				updated_at = $1
-			WHERE id = $3
+			WHERE id = $3 AND status <> 'completed'
 		`, now, userID, countID); uErr != nil {
 			return uErr
 		}
@@ -7031,6 +7038,22 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 				h.rollbackStep(id, op.CurrentStep, tenantID)
 				c.JSON(422, gin.H{"success": false, "message": why})
 				return
+			}
+		}
+
+		// Cross-path dedupe for PO receipts — the guard the other two receipt
+		// paths (POST /receive, goods-receipt complete) have always run and
+		// this one lacked. approvePOAndCreateReceipt pre-fills this operation
+		// with the FULL ordered quantity, so validating it after a /receive
+		// or a goods receipt added the whole PO to stock a second time. The
+		// operation still completes as a paper document; only the physical
+		// stock write is skipped.
+		if !skipInventory && movesStock && op.Direction == "receipt" &&
+			op.SourceType != nil && *op.SourceType == "purchase_order" && op.SourceID != nil {
+			if h.poStockReceivedVia(tenantID, *op.SourceID, "purchase_order", "goods_receipt") {
+				skipInventory = true
+				h.log.Info("stock operation validate: PO stock already received via another path — skipping physical stock",
+					"operation_id", id, "purchase_order_id", *op.SourceID)
 			}
 		}
 

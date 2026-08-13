@@ -274,7 +274,7 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 		response.InternalError(c, "Failed to post dividend")
 		return
 	}
-	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, in.Amount, now, retainedID); err != nil {
+	if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, in.Amount, now, retainedID); err != nil {
 		h.log.Error("Failed to update retained earnings balance", "error", err)
 		response.InternalError(c, "Failed to post dividend")
 		return
@@ -315,7 +315,7 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 			response.InternalError(c, "Failed to post dividend")
 			return
 		}
-		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3`, taxAmount, now, taxLiabID); err != nil {
+		if _, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3`, taxAmount, now, taxLiabID); err != nil {
 			h.log.Error("Failed to update tax liability balance for dividend", "error", err)
 			response.InternalError(c, "Failed to post dividend")
 			return

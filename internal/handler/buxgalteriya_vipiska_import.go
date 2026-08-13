@@ -672,14 +672,12 @@ func (h *Handler) RejectBankVipiskaLine(c *gin.Context) {
 // account's normal balance side (debit-normal: +debit-credit; credit-normal:
 // +credit-debit) — identical to PostJournalEntry.
 func updateAccountBalanceTx(tx *sql.Tx, accountID uuid.UUID, debit, credit float64) error {
-	var nb string
-	if err := tx.QueryRow(`SELECT at.normal_balance FROM accounts a JOIN account_types at ON a.account_type_id=at.id WHERE a.id=$1`, accountID).Scan(&nb); err != nil {
-		nb = "debit"
-	}
+	// 448 convention: current_balance = SUM(debit) - SUM(credit) for EVERY
+	// account, no normal_balance branch. The old branch here flipped
+	// credit-normal accounts the opposite way from PostJournalEntry while its
+	// comment claimed parity — every imported statement line that touched a
+	// payable drifted the balance by 2x the amount.
 	change := debit - credit
-	if nb != "debit" {
-		change = credit - debit
-	}
 	_, err := tx.Exec(`UPDATE accounts SET current_balance = current_balance + $1, updated_at = now() WHERE id=$2`, change, accountID)
 	return err
 }

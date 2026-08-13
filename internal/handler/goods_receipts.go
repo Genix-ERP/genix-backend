@@ -789,10 +789,19 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 
 	now := time.Now()
 
-	// Update receipt status
-	_, err = h.db.Exec("UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4", GRStatusCompleted, now, grID, tenantID)
+	// Atomic claim: the status check above was a plain read, so two
+	// concurrent completes both passed it and ran the stock loop twice
+	// (+80 on hand for a 40-unit delivery). The WHERE re-checks under the
+	// write; the loser matches 0 rows and stops here.
+	claimRes, err := h.db.Exec(
+		"UPDATE goods_receipts SET status = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4 AND status NOT IN ($5, $6)",
+		GRStatusCompleted, now, grID, tenantID, GRStatusCompleted, GRStatusCancelled)
 	if err != nil {
 		response.InternalError(c, "Failed to complete goods receipt")
+		return
+	}
+	if n, _ := claimRes.RowsAffected(); n == 0 {
+		response.BadRequest(c, "Goods receipt already completed")
 		return
 	}
 
@@ -817,7 +826,9 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 			if _, execErr := h.db.Exec(`
 				UPDATE purchase_order_lines pol
 				SET quantity_received = COALESCE(quantity_received, 0) + $1, updated_at = $2
-				WHERE pol.id = $3 AND EXISTS (
+				WHERE pol.id = $3
+				  AND COALESCE(pol.quantity_received, 0) + $1 <= pol.quantity + 0.0001
+				  AND EXISTS (
 					SELECT 1 FROM purchase_orders po
 					WHERE po.id = pol.purchase_order_id AND po.tenant_id = $4
 				)`,

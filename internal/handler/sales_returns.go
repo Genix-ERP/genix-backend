@@ -671,12 +671,12 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			}
 
 			// Update account balances
-			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", revenueReversal, now, revenueAccountID); err != nil {
+			if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", revenueReversal, now, revenueAccountID); err != nil {
 				h.log.Error("Failed to update revenue balance for credit note", "error", err)
 				return
 			}
 			if splitVAT {
-				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", returnTaxAmount, now, vatAccountID); err != nil {
+				if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", returnTaxAmount, now, vatAccountID); err != nil {
 					h.log.Error("Failed to update VAT balance for credit note", "error", err)
 					return
 				}
@@ -950,7 +950,20 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 			var applied float64
 
 			if len(explicit) > 0 {
+				// The allocations are client input. Two invariants the loop
+				// below must hold, because nothing upstream checks them:
+				//   1. Σ(applied) ≤ the return's own total — the FIFO branch
+				//      has always carried this budget; without it here, one
+				//      300k return with two 1M allocations erased 2M of AR.
+				//   2. One entry per invoice — two allocations naming the same
+				//      invoice each read the pre-loop snapshot, so both
+				//      "fit" and the second one over-applied.
+				remaining := totalAmount
+				seenInvoices := make(map[uuid.UUID]float64)
 				for _, a := range explicit {
+					if remaining <= 0.005 {
+						break
+					}
 					var invTotal, invPaid float64
 					var invCustomer uuid.UUID
 					err := h.db.QueryRow(`
@@ -969,7 +982,7 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 							"return_id", returnID, "invoice_id", a.id)
 						continue
 					}
-					balance := invTotal - invPaid
+					balance := invTotal - invPaid - seenInvoices[a.id]
 					if balance <= 0.005 {
 						continue
 					}
@@ -977,7 +990,12 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 					if apply > balance {
 						apply = balance
 					}
+					if apply > remaining {
+						apply = remaining
+					}
 					updates = append(updates, invUpdate{id: a.id, apply: apply})
+					seenInvoices[a.id] += apply
+					remaining -= apply
 					applied += apply
 				}
 				h.log.Info("Applied explicit allocations for sales return",
@@ -1150,6 +1168,16 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 	}
 	if currentStatus != "approved" && currentStatus != "completed" {
 		response.BadRequest(c, "Return must be approved before processing refund")
+		return
+	}
+	// Approve already settles the return (status completed + refund_status
+	// processed). Without this check a second call re-booked the same money —
+	// cash out for goods that were never paid for.
+	var refundStatusNow sql.NullString
+	_ = h.db.QueryRow(`SELECT refund_status FROM sales_returns WHERE id = $1 AND tenant_id = $2`,
+		returnID, tenantID).Scan(&refundStatusNow)
+	if refundStatusNow.Valid && refundStatusNow.String == "processed" {
+		response.BadRequest(c, "Refund has already been processed for this return")
 		return
 	}
 

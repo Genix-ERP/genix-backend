@@ -123,9 +123,13 @@ func (h *Handler) GetInventoryStats(c *gin.Context) {
 	}
 	valueSeries := make([]monthPoint, monthsBack)
 	nowT := time.Now()
+	// Anchor to day 1 before stepping months: AddDate from the 31st
+	// normalizes "Feb 31" to March, so the same month appeared twice and
+	// another vanished — and its delta was subtracted twice.
+	monthAnchor := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, nowT.Location())
 	running := totalValue
 	for i := 0; i < monthsBack; i++ {
-		m := nowT.AddDate(0, -i, 0)
+		m := monthAnchor.AddDate(0, -i, 0)
 		key := m.Format("2006-01")
 		valueSeries[monthsBack-1-i] = monthPoint{Month: key, Value: running}
 		running -= deltas[key] // stepping back past month i removes its delta

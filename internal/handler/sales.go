@@ -1871,10 +1871,19 @@ func (h *Handler) ConfirmSalesOrder(c *gin.Context) {
 	}
 
 	// Update sales order status to confirmed
-	_, err = h.db.Exec(
-		"UPDATE sales_orders SET status = $1, approved_by = $2, approved_at = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6",
+	// Atomic claim: without the status arm, two concurrent confirms both ran
+	// reserveSalesOrderStock and doubled quantity_reserved — half of which no
+	// release path ever gave back.
+	confirmRes, err := h.db.Exec(
+		"UPDATE sales_orders SET status = $1, approved_by = $2, approved_at = $3, updated_at = $4 WHERE id = $5 AND tenant_id = $6 AND status IN ('draft', 'quotation')",
 		entity.OrderStatusConfirmed, userID, now, now, orderID, tenantID,
 	)
+	if err == nil {
+		if n, _ := confirmRes.RowsAffected(); n == 0 {
+			response.BadRequest(c, "This operation is already posted")
+			return
+		}
+	}
 	if err != nil {
 		response.InternalError(c, "Failed to confirm sales order")
 		return
@@ -3032,7 +3041,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: revenue journal line failed", "error", err, "incomeAcct", incomeAcct, "amount", amount)
 					}
-					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct); err != nil {
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, incomeAcct); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: update revenue account balance failed", "error", err, "incomeAcct", incomeAcct)
 					}
 					jeLineNumber++
@@ -3050,7 +3059,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: tax payable journal line failed", "error", err, "taxAccountID", taxAccountID)
 					}
-					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", taxAmount, now, taxAccountID); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: update tax account balance failed", "error", err, "taxAccountID", taxAccountID)
 					}
 					jeLineNumber++
@@ -3069,7 +3078,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 					); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: discount journal line failed", "error", err)
 					}
-					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", discountAmount, now, fallbackRevenue); err != nil {
+					if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", discountAmount, now, fallbackRevenue); err != nil {
 						h.log.Error("CreateInvoiceFromOrder: update discount account balance failed", "error", err)
 					}
 					jeLineNumber++
@@ -3092,7 +3101,7 @@ func (h *Handler) CreateInvoiceFromOrder(c *gin.Context) {
 						); err != nil {
 							h.log.Error("CreateInvoiceFromOrder: shipping income journal line failed", "error", err)
 						}
-						if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", shippingAmount, now, shippingIncomeAcct); err != nil {
+						if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", shippingAmount, now, shippingIncomeAcct); err != nil {
 							h.log.Error("CreateInvoiceFromOrder: update shipping income balance failed", "error", err)
 						}
 						jeLineNumber++
