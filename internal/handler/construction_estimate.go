@@ -1897,7 +1897,16 @@ func (h *Handler) CloneEstimateLineByCode(c *gin.Context) {
 		JOIN construction_estimate e ON e.id = l.estimate_id
 		WHERE e.tenant_id = $1
 		  AND e.project_id = $2
-		  AND UPPER(TRIM(COALESCE(l.code, ''))) = UPPER(TRIM($3))
+		  -- Homoglyph-insensitive match. ШРНК codes are stored with CYRILLIC
+		  -- letters (in the audited project all 3000 codes start with Cyrillic
+		  -- Е U+0415, never Latin E U+0045). The two render identically, so a
+		  -- user on a Latin keyboard — or pasting from a Latin source — never
+		  -- matched anything and silently got an empty stage with no resources.
+		  -- Fold the 12 Cyrillic/Latin uppercase lookalikes onto Latin on BOTH
+		  -- sides. Letters only: digits are deliberately untouched (Cyrillic З
+		  -- vs 3 would risk false matches inside real code numbers).
+		  AND translate(UPPER(TRIM(COALESCE(l.code, ''))), 'АВЕКМНОРСТУХ', 'ABEKMHOPCTYX')
+		    = translate(UPPER(TRIM(COALESCE($3, ''))),     'АВЕКМНОРСТУХ', 'ABEKMHOPCTYX')
 		ORDER BY child_count DESC, l.id ASC
 		LIMIT 1
 	`, tenantID, destProjectID, srcCode).Scan(
