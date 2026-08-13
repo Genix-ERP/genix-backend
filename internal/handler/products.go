@@ -1579,6 +1579,10 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		StockValuationAccountID *string `json:"stock_valuation_account_id,omitempty"`
 		StockInputAccountID     *string `json:"stock_input_account_id,omitempty"`
 		StockOutputAccountID    *string `json:"stock_output_account_id,omitempty"`
+		// Baholash usuli (reja §2.1). Yangi kategoriyada hali harakat yo'q,
+		// shuning uchun bu yerda qulf tekshiruvi kerak emas — faqat qiymat
+		// validatsiyasi. Bo'sh = kompaniya hisob siyosatidan meros.
+		CostMethod string `json:"cost_method,omitempty"`
 	}
 
 	var input Input
@@ -1628,6 +1632,17 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 	stockInAcctID := parseOptionalUUID(input.StockInputAccountID)
 	stockOutAcctID := parseOptionalUUID(input.StockOutputAccountID)
 
+	// cost_method: bo'sh → NULL (meros), aks holda faqat tanilgan usul.
+	var costMethod interface{}
+	if m := strings.TrimSpace(input.CostMethod); m != "" {
+		parsed, perr := ParseCostMethod(m)
+		if perr != nil {
+			response.BadRequest(c, "Noto'g'ri baholash usuli: "+m)
+			return
+		}
+		costMethod = string(parsed)
+	}
+
 	id := uuid.New()
 	now := time.Now()
 
@@ -1640,10 +1655,12 @@ func (h *Handler) CreateProductCategory(c *gin.Context) {
 		INSERT INTO product_categories (
 			id, tenant_id, origin_organization_id, parent_id, code, name, description, is_active,
 			income_account_id, expense_account_id, stock_valuation_account_id, stock_input_account_id, stock_output_account_id,
+			cost_method,
 			created_at, updated_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 	`, id, tenantID, orgIDPtr, parentID, input.Code, input.Name, description, true,
 		incomeAcctID, expenseAcctID, stockValAcctID, stockInAcctID, stockOutAcctID,
+		costMethod,
 		now, now)
 
 	if err != nil {
