@@ -367,3 +367,76 @@ func applyStorno(tx *sql.Tx, plan StornoPlan) error {
 	}
 	return nil
 }
+
+// StornoStockDocument — §2.6 ni HTTP orqali ochadi.
+//
+// POST /inventory/valuation/storno  {"source_type": "...", "source_id": "..."}
+//
+// NIMA UCHUN ALOHIDA ENDPOINT
+// Reja §2.6 stornoni birinchi darajali amal deb belgilaydi: "Hujjatni bekor
+// qilish = storno, o'chirish emas". Mexanizm (planStorno + applyStorno)
+// yozilgan edi, lekin StornoDocument ni hech kim chaqirmasdi — ya'ni amal
+// mavjud, ammo yetib bo'lmaydigan edi.
+//
+// Nega hujjat bekor qilish yo'llariga ulanmadi: hozir bironta ham yo'l
+// o'tkazilgan hujjatning zaxirasini stornosiz bekor qila olmaydi —
+// tekshirildi, oltitasining hammasi (skrap, ombor amali, tovar qabuli,
+// kompaniyalararo ko'chirish, dropshipping, landed cost) yo o'tkazilgandan
+// keyin bekor qilishni RAD etadi, yoki qarama-qarshi harakat yozadi. Ya'ni
+// bugun qatlamlar "osilib" qolmaydi. Ularning ichiga storno qo'shish esa ikki
+// karra tuzatish bo'lardi: qarama-qarshi harakat allaqachon yangi qatlam
+// yaratadi, storno esa eskisini tiklaydi.
+//
+// Shuning uchun storno aniq, qo'lda chaqiriladigan tuzatish amali sifatida
+// ochiladi. U provodkalar konveyerga o'tgach (§6, 2-bosqich) kerak bo'ladi:
+// o'shanda bekor qilish qarama-qarshi harakat emas, aynan storno bo'lishi
+// kerak, aks holda FIFO da qaytgan qiymat asl qatlamga emas, bugungi narxdagi
+// yangi qatlamga tushadi.
+//
+// planStorno iste'mol qilingan kirim qatlamini bekor qilishni RAD etadi
+// (Blocked) — avval unga bog'liq chiqimlar stornolanishi kerak.
+func (h *Handler) StornoStockDocument(c *gin.Context) {
+	tenantID, ok := middleware.GetTenantID(c)
+	if !ok || tenantID == uuid.Nil {
+		response.Unauthorized(c, "Tenant not found")
+		return
+	}
+
+	var in struct {
+		SourceType string `json:"source_type" binding:"required"`
+		SourceID   string `json:"source_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&in); err != nil {
+		response.BadRequest(c, "source_type va source_id majburiy")
+		return
+	}
+	sourceID, err := uuid.Parse(in.SourceID)
+	if err != nil {
+		response.BadRequest(c, "source_id noto'g'ri")
+		return
+	}
+
+	tx, err := h.db.Begin()
+	if err != nil {
+		response.InternalError(c, "Failed to start transaction")
+		return
+	}
+	defer tx.Rollback()
+
+	if err := h.StornoDocument(tx, tenantID, in.SourceType, sourceID); err != nil {
+		// planStorno'ning "Blocked" sababi ham shu yerdan chiqadi — u
+		// foydalanuvchiga tushunarli matn, ichki xato emas.
+		response.BadRequest(c, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		response.InternalError(c, "Failed to commit storno")
+		return
+	}
+
+	response.Success(c, gin.H{
+		"source_type": in.SourceType,
+		"source_id":   sourceID,
+		"stornoed":    true,
+	})
+}

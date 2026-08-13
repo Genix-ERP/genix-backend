@@ -522,6 +522,10 @@ func (h *Handler) registerProtectedRoutes(rg *gin.RouterGroup) {
 		inventory.GET("/valuation/margin", h.GetStockMarginReport)
 		// §6 Qoldiqlarni kiritish — the changeover gate. POST locks every
 		// affected category's method, so it needs warehouse-manage.
+		// §2.6 — "bekor qilish = storno, o'chirish emas". Qatlamlarni tiklaydi
+		// yoki kirim qatlamini stornolangan deb belgilaydi; pul harakati
+		// bo'lgani uchun warehouse-manage huquqi bilan.
+		inventory.POST("/valuation/storno", h.perm.Require("inventory", "warehouse", "manage"), h.StornoStockDocument)
 		inventory.GET("/valuation/opening-balance", h.GetStockOpeningPreview)
 		inventory.POST("/valuation/opening-balance", h.perm.Require("inventory", "warehouse", "manage"), h.PostStockOpeningBalance)
 		inventory.GET("/cogs", h.GetCOGSData)
