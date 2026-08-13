@@ -230,15 +230,15 @@ func (h *Handler) CreateGoodsReceipt(c *gin.Context) {
 			ProductName      string  `json:"product_name" binding:"required"`
 			ProductCode      string  `json:"product_code,omitempty"`
 			OrderedQuantity  float64 `json:"ordered_quantity"`
-			ReceivedQuantity float64 `json:"received_quantity" binding:"required"`
+			ReceivedQuantity float64 `json:"received_quantity" binding:"omitempty,gte=0"`
 			Unit             string  `json:"unit,omitempty"`
-			UnitPrice        float64 `json:"unit_price,omitempty"`
+			UnitPrice        float64 `json:"unit_price,omitempty" binding:"omitempty,gte=0"`
 			BatchNumber      string  `json:"batch_number,omitempty"`
 			ExpiryDate       string  `json:"expiry_date,omitempty"`
 			SerialNumbers    string  `json:"serial_numbers,omitempty"`
 			StorageLocation  string  `json:"storage_location,omitempty"`
 			Notes            string  `json:"notes,omitempty"`
-		} `json:"lines" binding:"required,min=1"`
+		} `json:"lines" binding:"required,min=1,dive"`
 	}
 
 	if err := c.ShouldBindJSON(&input); err != nil {

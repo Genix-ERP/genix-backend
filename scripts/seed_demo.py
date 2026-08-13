@@ -14,7 +14,7 @@ script can be re-run: duplicates are skipped, not doubled.
 import json, os, random, sys, urllib.request, urllib.error
 from datetime import date, timedelta
 
-BASE = os.environ.get("GENIX_BASE", "http://localhost:8099/api/v1")
+BASE = os.environ.get("GENIX_BASE", "http://localhost:8080/api/v1")
 EMAIL = os.environ.get("GENIX_EMAIL", "demo@test.uz")
 PASSWORD = os.environ.get("GENIX_PASSWORD", "Passw0rd!234")
 TENANT = os.environ.get("GENIX_TENANT", "demoseed")

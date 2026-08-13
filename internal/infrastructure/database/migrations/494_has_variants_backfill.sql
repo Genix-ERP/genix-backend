@@ -1,3 +1,8 @@
+-- (Was 492_has_variants_backfill; renumbered — a sibling migration landed on
+-- 492 in the same release and the integer-keyed runner crash-loops fresh DBs
+-- on duplicate versions while silently skipping one twin on live ones.
+-- Safe to re-run: the recompute is a no-op when the flag already agrees and
+-- the index is IF NOT EXISTS.)
 -- products.has_variants was added by 053_product_variants.sql but never
 -- backfilled, and nothing cleared it when a variant was deleted. So the flag
 -- disagreed with product_variants in both directions:

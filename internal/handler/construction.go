@@ -5296,7 +5296,7 @@ func (h *Handler) GetConstructionPortfolioDashboard(c *gin.Context) {
 		       COALESCE(SUM(amount), 0)
 		FROM construction_expense_lines
 		WHERE tenant_id = $1 AND status = 'approved' AND deleted_at IS NULL
-		  AND expense_date >= CURRENT_DATE - INTERVAL '12 months'
+		  AND expense_date >= date_trunc('month', CURRENT_DATE) - INTERVAL '11 months'
 		GROUP BY DATE_TRUNC('month', expense_date)
 		ORDER BY DATE_TRUNC('month', expense_date) ASC
 	`, tenantID)

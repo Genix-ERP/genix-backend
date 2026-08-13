@@ -51,7 +51,10 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 	}
 	if s := c.Query("to"); s != "" {
 		if t, err := time.Parse("2006-01-02", s); err == nil {
-			to = t.Add(24*time.Hour - time.Nanosecond) // inclusive end of day
+			// Microsecond, not Nanosecond: postgres timestamps carry microsecond
+			// precision, so ...999999999 was ROUNDED UP to the next midnight and
+			// `?to=2026-08-13` also counted the 14th's documents.
+			to = t.Add(24*time.Hour - time.Microsecond) // inclusive end of day
 		}
 	}
 
@@ -105,6 +108,7 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 	}
 	series := make([]monthPoint, 0, 6)
 	seriesStart := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, nowT.Location()).AddDate(0, -5, 0)
+	seriesEnd := seriesStart.AddDate(0, 6, 0)
 	byMonth := map[string]*monthPoint{}
 	for i := 0; i < 6; i++ {
 		m := seriesStart.AddDate(0, i, 0)
@@ -116,9 +120,10 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 		SELECT TO_CHAR(DATE_TRUNC('month', order_date), 'YYYY-MM'), COALESCE(SUM(total_amount), 0)
 		FROM sales_orders
 		WHERE tenant_id = $1 AND deleted_at IS NULL AND `+realSalesOrderFilter+`
-		  AND order_date >= $2 AND ($3::uuid IS NULL OR organization_id = $3)
+		  AND order_date >= $2 AND order_date < $4
+		  AND ($3::uuid IS NULL OR organization_id = $3)
 		GROUP BY 1
-	`, tenantID, seriesStart, orgArg)
+	`, tenantID, seriesStart, orgArg, seriesEnd)
 	if oErr == nil {
 		for oRows.Next() {
 			var key string
@@ -137,9 +142,10 @@ func (h *Handler) GetSalesOrderStats(c *gin.Context) {
 		JOIN payments p ON p.id = pa.payment_id
 		WHERE p.tenant_id = $1 AND p.status = 'confirmed' AND p.type = 'receipt'
 		  AND pa.document_type = 'sales_invoice'
-		  AND p.payment_date >= $2 AND ($3::uuid IS NULL OR p.organization_id = $3)
+		  AND p.payment_date >= $2 AND p.payment_date < $4
+		  AND ($3::uuid IS NULL OR p.organization_id = $3)
 		GROUP BY 1
-	`, tenantID, seriesStart, orgArg)
+	`, tenantID, seriesStart, orgArg, seriesEnd)
 	if pErr == nil {
 		for pRows.Next() {
 			var key string
