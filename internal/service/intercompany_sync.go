@@ -158,9 +158,16 @@ func (s *IntercompanySyncService) SyncSaleOrderToPurchaseOrder(tenantID uuid.UUI
 
 	// Create purchase order in target organization
 	poID := uuid.New()
+	// Same numbering scheme as CreatePurchaseOrder: MAX over `PO-` + up to six
+	// digits, %03d so the width grows on its own. COUNT(*) re-issued a number
+	// after any deletion.
 	var poCount int
-	s.db.QueryRow("SELECT COUNT(*) FROM purchase_orders WHERE tenant_id = $1", tenantID).Scan(&poCount)
-	poNumber := fmt.Sprintf("PO-%05d", poCount+1)
+	s.db.QueryRow(`
+		SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
+		FROM purchase_orders
+		WHERE tenant_id = $1 AND order_number ~ '^PO-[0-9]{1,6}$'`,
+		tenantID).Scan(&poCount)
+	poNumber := fmt.Sprintf("PO-%03d", poCount+1)
 	now := time.Now()
 
 	notes := fmt.Sprintf("Auto-created from intercompany SO: %s", so.OrderNumber)

@@ -454,6 +454,16 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 	// (including soft-deleted), so excluding them would hand out numbers
 	// that are already taken and loop forever on collision retry. Mirrors
 	// the sales-orders fix.
+	//
+	// `{1,6}` (not `+`) is load-bearing. A single row whose number came from
+	// an epoch-ms timestamp — PO-1771931368439 — used to poison MAX forever:
+	// every later order inherited that 13-digit base and counted up from it,
+	// which is how this tenant ended up with PO-1771931368440..445. Capping
+	// the pattern at six digits means such a row can never seed the sequence
+	// again; migration 498 renumbered the ones already in the table.
+	//
+	// %03d gives PO-001 … PO-999 and then grows on its own — PO-1000,
+	// PO-10000 — so the width only ever increases when the count demands it.
 	nextOrderNumber := func() string {
 		var maxNum int
 		if orgIDPtr != nil {
@@ -461,7 +471,7 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
 				FROM purchase_orders
 				WHERE tenant_id = $1 AND organization_id = $2
-				  AND order_number ~ '^PO-[0-9]+$'`,
+				  AND order_number ~ '^PO-[0-9]{1,6}$'`,
 				tenantID, *orgIDPtr,
 			).Scan(&maxNum)
 		} else {
@@ -469,11 +479,11 @@ func (h *Handler) CreatePurchaseOrder(c *gin.Context) {
 				SELECT COALESCE(MAX(CAST(REGEXP_REPLACE(order_number, '[^0-9]', '', 'g') AS BIGINT)), 0)
 				FROM purchase_orders
 				WHERE tenant_id = $1 AND organization_id IS NULL
-				  AND order_number ~ '^PO-[0-9]+$'`,
+				  AND order_number ~ '^PO-[0-9]{1,6}$'`,
 				tenantID,
 			).Scan(&maxNum)
 		}
-		return fmt.Sprintf("PO-%05d", maxNum+1)
+		return fmt.Sprintf("PO-%03d", maxNum+1)
 	}
 
 	// Insert purchase order — done OUTSIDE the transaction so we can retry
