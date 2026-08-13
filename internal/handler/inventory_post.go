@@ -24,6 +24,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"time"
 
@@ -33,6 +34,10 @@ import (
 // errInsufficientStock is returned when a negative delta would push the
 // balance below zero and the caller did not opt into negative stock.
 var errInsufficientStock = errors.New("insufficient stock")
+
+// errPeriodLocked is returned when the movement's date falls inside a closed
+// or locked accounting period (plan §2.4).
+var errPeriodLocked = errors.New("davr yopilgan")
 
 type stockDeltaArgs struct {
 	TenantID    uuid.UUID
@@ -71,6 +76,22 @@ type stockDeltaArgs struct {
 func (h *Handler) applyStockDelta(q dbExecQuerier, a stockDeltaArgs) (newBalance, valuedCost float64, err error) {
 	if a.When.IsZero() {
 		a.When = time.Now()
+	}
+
+	// §2.4 backdating: "Har qanday ombor hujjatining sanasi ≥ period_lock_date".
+	//
+	// Enforced HERE rather than inside the valuation conveyor, because the
+	// conveyor deliberately swallows its errors (valuation_hook.go) — a check
+	// there would log the violation and let the document through, which is not
+	// what "taqiqlanadi" means. This is the central stock write and it already
+	// refuses work (errInsufficientStock), so it is the one place a refusal
+	// actually reaches the user.
+	//
+	// Same helper the fixed-assets module uses, so one lock governs every
+	// module. It returns "" when no fiscal/accounting period is configured, so
+	// tenants that never set periods up are unaffected.
+	if msg := h.checkPeriodLock(a.TenantID, a.When); msg != "" {
+		return 0, 0, fmt.Errorf("%w: %s", errPeriodLocked, msg)
 	}
 
 	var invID uuid.UUID

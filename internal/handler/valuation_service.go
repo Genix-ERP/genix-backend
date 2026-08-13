@@ -83,6 +83,17 @@ func (h *Handler) RecordStockMovement(tx *sql.Tx, m StockMovement) (StockMovemen
 	}
 	res.Method = method
 
+	// §2.4 backdating: "Har qanday ombor hujjatining sanasi ≥ period_lock_date".
+	// Reuses the ledger's own period lock (fiscal periods / fiscal year /
+	// accounting periods) rather than a second, stock-only rule — a stock
+	// movement whose date sits in a closed period would post a cost into books
+	// that are already signed off, which is exactly what closing a period is
+	// for. Same helper the fixed-assets module calls, so one lock governs
+	// every module.
+	if msg := h.checkPeriodLock(m.TenantID, m.Date); msg != "" {
+		return res, errors.New(msg)
+	}
+
 	// §2.4: under AVCO a document dated before this product's last movement
 	// would have had to change every average computed after it, and those costs
 	// are already posted. Checked here rather than in each document handler,

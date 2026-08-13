@@ -773,12 +773,34 @@ func (h *Handler) ApproveSalesReturn(c *gin.Context) {
 				return fmt.Errorf("no warehouse available to restock product %s", productID)
 			}
 
+			// §3.1/§3.2: qaytarilgan tovar ASL CHIQIM tannarxida qaytadi, bugungi
+			// narxda emas. Aks holda bitta tovarni sotib, keyin qaytarib olish
+			// narx o'zgargan davrda sof "foyda" yaratardi — hech qanday
+			// iqtisodiy voqea bo'lmasa ham.
+			//
+			// Asl hujjat — sotuv buyurtmasi. Turi ATAYLAB bo'sh qoldiriladi:
+			// originalIssue bo'sh turni "har qanday tur" deb qabul qiladi va
+			// hujjat id si bo'yicha qidiradi. Chiqim sotuv yo'liga qarab
+			// 'sales_order' yoki 'sales_delivery' turi bilan yozilgan bo'lishi
+			// mumkin; id UUID bo'lgani uchun faqat id bo'yicha moslash ham
+			// aniq, ham ikkala yo'lga bardoshli.
+			//
+			// Buyurtma bog'lanmagan bo'lsa maydon bo'sh qoladi va oddiy hisob
+			// ishlaydi — qaytarish baribir yoziladi, faqat bugungi tannarxda.
+			var origID uuid.UUID
+			if returnSalesOrderID.Valid && returnSalesOrderID.String != "" {
+				if parsed, pErr := uuid.Parse(returnSalesOrderID.String); pErr == nil {
+					origID = parsed
+				}
+			}
+
 			if _, _, dErr := h.applyStockDelta(tx, stockDeltaArgs{
 				TenantID: tenantID, OrgID: returnOrgID, ProductID: productID,
 				WarehouseID: whID, Qty: quantity, UnitCost: costPrice,
 				TxType: "return", RefType: "sales_return", RefID: returnID.String(),
 				Reason: "Sales Return - Customer Return", ToWH: &whID,
 				CreatedBy: userID, When: now,
+				OriginalDocID: origID,
 			}); dErr != nil {
 				return dErr
 			}
