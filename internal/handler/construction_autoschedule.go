@@ -164,6 +164,12 @@ type autoWork struct {
 	// Duration qayta yoziladi, shuning uchun "oldin" ni alohida saqlaymiz).
 	OrigSource   string
 	OrigDuration int
+	// outOfScope — scope filtri (unplanned/overdue/section) chetlab o'tgan ish.
+	// Sanasi o'zgarmaydi, ammo davomchilariga tayanch bo'lib qoladi. Ilgari
+	// buni Source = "manual" deb belgilash orqali qilingan edi; endi alohida
+	// bayroq, chunki "qo'lda qo'yilgan" va "qamrovdan tashqarida" — ikki xil
+	// narsa va release_manual faqat birinchisini bo'shatadi.
+	outOfScope bool
 	// hisob natijalari
 	newStart, newEnd *time.Time
 	critical         bool
@@ -184,8 +190,19 @@ func (w *autoWork) finished() bool {
 }
 
 // immutable — rejalashtiruvchi tegmaydigan ish.
-func (w *autoWork) immutable() bool {
-	return w.IsFixed || w.Source == "manual" || w.started()
+//
+// releaseManual = true bo'lsa, faqat "qo'lda qo'yilgan sana" himoyasi olib
+// tashlanadi. Muzlatilgan (is_fixed), boshlangan va qamrovdan tashqaridagi
+// ishlar baribir joyida qoladi — ular boshqa sabablar bilan daxlsiz.
+//
+// Bu kerak, chunki 495-migratsiya sanasi bor HAR BIR ishni 'manual' deb
+// belgilagan (avtoreja paydo bo'lishidan oldingi barcha sanalar). Shu sababli
+// eski loyihalarda "Barcha ishlar" qamrovi ham hech narsani siljita olmasdi.
+func (w *autoWork) immutable(releaseManual bool) bool {
+	if w.outOfScope || w.IsFixed || w.started() {
+		return true
+	}
+	return !releaseManual && w.Source == "manual"
 }
 
 // loadSchedWorks — loyihaning barcha ish qatorlari + mehnat sarfi (kishi-soat).
@@ -477,7 +494,7 @@ type schedConflict struct {
 
 // forwardPass — sanalarni generatsiya qiladi. Daxlsiz ishlar o'z sanasida
 // qoladi va davomchilariga tayanch bo'ladi; ular bilan konflikt ro'yxatga tushadi.
-func forwardPass(order []*autoWork, deps []autoDep, cal schedCalendar, anchor time.Time) []schedConflict {
+func forwardPass(order []*autoWork, deps []autoDep, cal schedCalendar, anchor time.Time, releaseManual bool) []schedConflict {
 	predsOf := map[int64][]autoDep{}
 	for _, d := range deps {
 		predsOf[d.Succ] = append(predsOf[d.Succ], d)
@@ -510,7 +527,7 @@ func forwardPass(order []*autoWork, deps []autoDep, cal schedCalendar, anchor ti
 		}
 		es = cal.nextWorkday(es)
 
-		if w.immutable() {
+		if w.immutable(releaseManual) {
 			// Sanasi bor daxlsiz ish o'z joyida qoladi; talab qilingan boshlanish
 			// undan keyin bo'lsa — bu konflikt (fixed siljimaydi, TZ §4).
 			if w.Start != nil {
@@ -519,11 +536,17 @@ func forwardPass(order []*autoWork, deps []autoDep, cal schedCalendar, anchor ti
 					if label == "" {
 						label = w.Name
 					}
+					// Sabab aniqligi muhim: foydalanuvchi "manual" ni ko'rib
+					// kimdir sanani qo'lda qo'ygan deb o'ylaydi, aslida ish
+					// shunchaki qamrovdan tashqarida bo'lishi mumkin.
 					reason := "manual"
-					if w.IsFixed {
+					switch {
+					case w.IsFixed:
 						reason = "fixed"
-					} else if w.started() {
+					case w.started():
 						reason = "started"
+					case w.outOfScope:
+						reason = "scope"
 					}
 					conflicts = append(conflicts, schedConflict{
 						LineID: w.ID, Label: label, Reason: reason,
@@ -657,7 +680,7 @@ func fmtDate(t *time.Time) string {
 
 // runAutoSchedule — to'liq hisob, HECH NARSA YOZMAYDI (TZ §4).
 // scope: "unplanned" (faqat sanasizlar) | "all" | "overdue" (qolgan qismni qayta hisob)
-func (h *Handler) runAutoSchedule(tenantID uuid.UUID, projectID int64, p schedParams, scope string, sectionFilter string) (*schedResult, error) {
+func (h *Handler) runAutoSchedule(tenantID uuid.UUID, projectID int64, p schedParams, scope string, sectionFilter string, releaseManual bool) (*schedResult, error) {
 	works, err := h.loadSchedWorks(tenantID, projectID)
 	if err != nil {
 		return nil, err
@@ -713,11 +736,13 @@ func (h *Handler) runAutoSchedule(tenantID uuid.UUID, projectID int64, p schedPa
 		}
 		if out {
 			// Daxlsiz sifatida ko'rsatamiz — forwardPass uni siljitmaydi.
-			w.Source = "manual"
+			// Source ga tegmaymiz: u "kim sanani qo'ygan" degan haqiqiy holat,
+			// qamrov esa shu yugurishning filtri.
+			w.outOfScope = true
 		}
 	}
 
-	conflicts := forwardPass(order, deps, cal, anchor)
+	conflicts := forwardPass(order, deps, cal, anchor, releaseManual)
 	backwardPass(order, deps, cal)
 
 	// Delta va loyiha tugashi.

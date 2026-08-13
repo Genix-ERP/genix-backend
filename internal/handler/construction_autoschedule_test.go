@@ -100,7 +100,7 @@ func TestForwardPassSequentialFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("topoSort: %v", err)
 	}
-	forwardPass(order, deps, cal, d("2026-08-10")) // dushanba
+	forwardPass(order, deps, cal, d("2026-08-10"), false) // dushanba
 	if got := works[0].newStart.Format(schedDateLayout); got != "2026-08-10" {
 		t.Errorf("w1 start %s", got)
 	}
@@ -130,7 +130,7 @@ func TestParallelLanes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("topoSort: %v", err)
 	}
-	forwardPass(order, deps, testCal(), d("2026-08-10"))
+	forwardPass(order, deps, testCal(), d("2026-08-10"), false)
 	if works[0].newStart.Format(schedDateLayout) != works[1].newStart.Format(schedDateLayout) {
 		t.Error("ikki yo'lakcha bir kunda boshlanishi kerak")
 	}
@@ -187,7 +187,7 @@ func TestImmutableWorksNotMoved(t *testing.T) {
 	}
 	deps := []autoDep{}
 	order, _ := topoSort(works, deps)
-	forwardPass(order, deps, cal, d("2026-08-10"))
+	forwardPass(order, deps, cal, d("2026-08-10"), false)
 	for _, w := range works[1:] {
 		if w.newStart != nil {
 			t.Errorf("daxlsiz ish %d siljitildi", w.ID)
@@ -209,12 +209,69 @@ func TestFixedConflictReported(t *testing.T) {
 	}
 	deps := []autoDep{{Pred: 1, Succ: 2}}
 	order, _ := topoSort(works, deps)
-	conflicts := forwardPass(order, deps, cal, d("2026-08-10"))
+	conflicts := forwardPass(order, deps, cal, d("2026-08-10"), false)
 	if len(conflicts) != 1 || conflicts[0].Reason != "fixed" {
 		t.Fatalf("fixed konflikt kutilgandi, got %+v", conflicts)
 	}
 	if works[1].newStart != nil {
 		t.Error("fixed ish siljitilmasligi kerak")
+	}
+}
+
+// release_manual: qo'lda qo'yilgan sana bo'shatiladi, fixed/started/qamrovdan
+// tashqaridagilar esa baribir joyida qoladi.
+func TestReleaseManualOnlyFreesManual(t *testing.T) {
+	cal := testCal()
+	s := d("2026-08-10")
+	e := d("2026-08-10")
+
+	newWork := func(id int64, mutate func(*autoWork)) *autoWork {
+		st, en := s, e
+		w := &autoWork{ID: id, Duration: 1, Start: &st, End: &en, Source: "manual"}
+		mutate(w)
+		return w
+	}
+	manual := newWork(2, func(*autoWork) {})
+	fixed := newWork(3, func(w *autoWork) { w.IsFixed = true })
+	started := newWork(4, func(w *autoWork) { w.DoneQty = 5 })
+	scoped := newWork(5, func(w *autoWork) { w.outOfScope = true })
+
+	// 1-ish 10 kun davom etadi, shuning uchun hamma davomchining sanasi kech
+	// bo'lishi kerak — ya'ni har biri siljishi kerak bo'ladi.
+	driver := &autoWork{ID: 1, Duration: 10}
+	works := []*autoWork{driver, manual, fixed, started, scoped}
+	deps := []autoDep{{Pred: 1, Succ: 2}, {Pred: 1, Succ: 3}, {Pred: 1, Succ: 4}, {Pred: 1, Succ: 5}}
+
+	order, err := topoSort(works, deps)
+	if err != nil {
+		t.Fatalf("topoSort: %v", err)
+	}
+	conflicts := forwardPass(order, deps, cal, d("2026-08-10"), true)
+
+	if manual.newStart == nil {
+		t.Error("release_manual yoqilganda qo'lda qo'yilgan ish siljishi kerak")
+	}
+	for _, tc := range []struct {
+		name string
+		w    *autoWork
+	}{{"fixed", fixed}, {"started", started}, {"outOfScope", scoped}} {
+		if tc.w.newStart != nil {
+			t.Errorf("%s ish release_manual bilan ham siljimasligi kerak", tc.name)
+		}
+	}
+
+	// Siljimaganlarning uchalasi ham konflikt sifatida, TO'G'RI sabab bilan.
+	got := map[string]bool{}
+	for _, c := range conflicts {
+		got[c.Reason] = true
+	}
+	for _, want := range []string{"fixed", "started", "scope"} {
+		if !got[want] {
+			t.Errorf("%q sababli konflikt kutilgandi, got %+v", want, conflicts)
+		}
+	}
+	if got["manual"] {
+		t.Errorf("bo'shatilgan ish konfliktga tushmasligi kerak, got %+v", conflicts)
 	}
 }
 

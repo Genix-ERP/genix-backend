@@ -28,6 +28,10 @@ type autoScheduleInput struct {
 	Scope         string  `json:"scope"`   // unplanned | all | overdue | section
 	Section       string  `json:"section"` // scope=section uchun
 	SaveParams    bool    `json:"save_params"`
+	// ReleaseManual — qo'lda qo'yilgan sanalarni ham qayta hisoblashga ruxsat.
+	// Muzlatilgan va boshlangan ishlarga baribir tegilmaydi. Saqlanmaydi:
+	// bu bitta yugurishning qarori, doimiy parametr emas.
+	ReleaseManual bool `json:"release_manual"`
 }
 
 // resolveParams — saqlangan loyiha parametrlari ustiga so'rov qiymatlarini qo'yadi.
@@ -82,7 +86,7 @@ func (h *Handler) PreviewAutoSchedule(c *gin.Context) {
 	_ = c.ShouldBindJSON(&in)
 
 	p := h.resolveParams(tenantID, projectID, in)
-	res, err := h.runAutoSchedule(tenantID, projectID, p, scopeOrDefault(in.Scope), in.Section)
+	res, err := h.runAutoSchedule(tenantID, projectID, p, scopeOrDefault(in.Scope), in.Section, in.ReleaseManual)
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
@@ -128,7 +132,7 @@ func (h *Handler) ApplyAutoSchedule(c *gin.Context) {
 
 	p := h.resolveParams(tenantID, projectID, in)
 	scope := scopeOrDefault(in.Scope)
-	res, err := h.runAutoSchedule(tenantID, projectID, p, scope, in.Section)
+	res, err := h.runAutoSchedule(tenantID, projectID, p, scope, in.Section, in.ReleaseManual)
 	if err != nil {
 		response.BadRequest(c, err.Error())
 		return
