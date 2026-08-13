@@ -205,6 +205,28 @@ func (w *autoWork) immutable(releaseManual bool) bool {
 	return !releaseManual && w.Source == "manual"
 }
 
+// labourResourceFilter — resurs sublinesi mehnat sarfimi?
+//
+// Lug'at construction_reports.go:855 dagi klassifikator bilan bir xil bo'lishi
+// SHART. Avval bu yerda faqat ('employee','labor','labour') turardi, holbuki
+// smetalarda resource_type = 'mehnat' (UI'dagi MEHNAT beyji). Natijada
+// ЗАТРАТЫ ТРУДА qatorlari topilmay, man_hours = 0 bo'lib chiqardi va deyarli
+// har bir ish "normasiz → default 1 kun" yo'liga tushardi. Ya'ni smetada
+// normalar to'liq bo'lsa ham, avtoreja ularni ko'rmasdi.
+//
+// UOM bo'yicha zaxira ham reports bilan bir xil tartibda: resource_type
+// tanish qiymatlardan biri bo'lmasa (masalan bo'sh), o'lchov birligida ЧЕЛ
+// bo'lsa — bu kishi-soat.
+const labourResourceFilter = `
+	LOWER(COALESCE(sub.resource_type, '')) IN
+	    ('labor', 'labour', 'employee', 'mehnat', 'ish', 'ishchi', 'worker', 'трудовой', 'трудовые')
+	OR (
+	    LOWER(COALESCE(sub.resource_type, '')) NOT IN
+	        ('equipment', 'mashina', 'masina', 'mexanizm', 'mexanizmlar', 'machinery', 'машина',
+	         'material', 'materialy', 'mat', 'materiallar', 'материал', 'материалы')
+	    AND UPPER(COALESCE(sub.uom, '')) LIKE '%ЧЕЛ%'
+	)`
+
 // loadSchedWorks — loyihaning barcha ish qatorlari + mehnat sarfi (kishi-soat).
 func (h *Handler) loadSchedWorks(tenantID uuid.UUID, projectID int64) ([]*autoWork, error) {
 	rows, err := h.db.Query(`
@@ -223,7 +245,8 @@ func (h *Handler) loadSchedWorks(tenantID uuid.UUID, projectID int64) ([]*autoWo
 		                    ELSE COALESCE(sub.quantity,0) END)
 		           FROM construction_estimate_line sub
 		           WHERE sub.parent_line_id = el.id
-		             AND LOWER(COALESCE(sub.resource_type,'')) IN ('employee','labor','labour')
+		             AND sub.tenant_id = el.tenant_id
+		             AND (`+labourResourceFilter+`)
 		       ), 0) AS man_hours
 		FROM construction_estimate_line el
 		JOIN construction_estimate e ON e.id = el.estimate_id AND e.tenant_id = el.tenant_id
