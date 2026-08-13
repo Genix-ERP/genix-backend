@@ -8114,17 +8114,28 @@ func (h *Handler) CreateCashTransaction(c *gin.Context) {
 	// to the till the money is actually leaving, and the error is no longer
 	// swallowed: a balance we could not compute must not read as zero.
 	if input.Type == "expense" {
-		scope := ""
+		// Same balance definition as ConfirmCashOrder's RKO guard: the GL
+		// ledger balance of the register's cash account. The previous
+		// kassaBalance union (PKO/RKO + cash_transactions) ignored
+		// journal-posted outflows — payroll payments among them — so the
+		// same till reported two different "available" figures depending on
+		// which door you knocked on (moliya chuqur audit 2026-08-13).
+		var regID uuid.UUID
 		if rid, isUUID := registerArg.(uuid.UUID); isUUID {
-			scope = rid.String()
+			regID = rid
 		}
-		cashBalance, balErr := h.kassaBalance(tenantID, scope)
-		if balErr != nil {
-			h.log.Error("cash balance check failed", "error", balErr)
+		tenantUUID, tErr := uuid.Parse(tenantID)
+		if tErr != nil {
 			response.InternalError(c, "Failed to verify cash balance")
 			return
 		}
-		if cashBalance < input.Amount {
+		cashAcct := registerCashAccount(h.db, tenantUUID, orgIDPtr, regID)
+		if cashAcct == uuid.Nil {
+			h.log.Error("cash balance check failed: no cash account resolvable", "register", regID)
+			response.InternalError(c, "Failed to verify cash balance")
+			return
+		}
+		if cashBalance := ledgerAccountBalance(h.db, tenantUUID, nil, cashAcct); cashBalance < input.Amount {
 			response.BadRequest(c, fmt.Sprintf("Kassada mablag' yetarli emas (balans: %.2f, so'ralgan: %.2f)", cashBalance, input.Amount))
 			return
 		}
@@ -11713,7 +11724,7 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 	// view rendered zeros forever.
 	accountRows, err := h.db.Query(`
 		SELECT a.id, a.code, a.name, COALESCE(cur.code, 'UZS') as currency,
-		       COALESCE((
+		       COALESCE(a.opening_balance, 0) + COALESCE((
 		           SELECT SUM(jl.debit_amount - jl.credit_amount)
 		           FROM journal_entry_lines jl
 		           JOIN journal_entries je ON je.id = jl.journal_entry_id
@@ -11726,10 +11737,8 @@ func (h *Handler) GetBudgetCashFlow(c *gin.Context) {
 		JOIN account_types at2 ON at2.id = a.account_type_id
 		LEFT JOIN currencies cur ON cur.id = a.currency_id
 		WHERE a.tenant_id = $1
-		  AND at2.code = 'CASH'
-		  AND a.is_active = true
 		  AND a.deleted_at IS NULL
-		  AND a.is_leaf = true
+		  AND `+cashAccountPredicate("a", "at2")+`
 		ORDER BY a.code
 	`, tenantID)
 	if err != nil {

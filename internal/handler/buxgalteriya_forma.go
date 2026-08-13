@@ -367,6 +367,39 @@ func (h *Handler) GetForma2(c *gin.Context) {
 // Forma 3 — Pul mablag'lari harakati (Cash Flow, direct method)
 // ---------------------------------------------------------------------------
 
+// payrollCashBasisOutflow — salary payments that debited 9420 straight
+// against cash (unaccrued "simple mode" TT / period payments). Economically
+// they are Forma-3 line 030 "xodimlarga to'lov", but the 6710↔5% pair never
+// sees them, so simple-mode tenants showed an empty employee-payments row
+// (moliya chuqur audit 2026-08-13). Restricted by source_type so ordinary
+// admin-expense postings on 9420 stay out, and reversed (storno'd) payments
+// are excluded so mark/unmark cycles net out.
+func (h *Handler) payrollCashBasisOutflow(tenantID uuid.UUID, orgID *uuid.UUID, start, end time.Time) float64 {
+	q := `
+		SELECT COALESCE(SUM(jel.debit_amount), 0)
+		FROM journal_entry_lines jel
+		JOIN accounts a ON jel.account_id = a.id
+		JOIN journal_entries je ON jel.journal_entry_id = je.id
+		WHERE je.tenant_id = $1 AND je.status = 'posted' AND je.deleted_at IS NULL
+		  AND je.source_type = 'payroll_payment' AND je.reversed_entry_id IS NULL
+		  AND je.entry_date BETWEEN $2 AND $3
+		  AND a.code LIKE '9420'
+		  AND EXISTS (
+			  SELECT 1 FROM journal_entry_lines jel2
+			  JOIN accounts a2 ON jel2.account_id = a2.id
+			  WHERE jel2.journal_entry_id = jel.journal_entry_id
+			    AND jel2.id <> jel.id
+			    AND a2.code LIKE '5%')`
+	args := []interface{}{tenantID, start.Format("2006-01-02"), end.Format("2006-01-02")}
+	if orgID != nil && *orgID != uuid.Nil {
+		q += " AND je.organization_id = $4"
+		args = append(args, *orgID)
+	}
+	var v float64
+	_ = h.db.QueryRow(q, args...).Scan(&v)
+	return v
+}
+
 func (h *Handler) loadForma3(tenantID uuid.UUID, orgPtr *uuid.UUID, periodFromStr, periodToStr string) (formaResponse, error) {
 	start, err := time.Parse("2006-01-02", periodFromStr)
 	if err != nil {
@@ -383,7 +416,8 @@ func (h *Handler) loadForma3(tenantID uuid.UUID, orgPtr *uuid.UUID, periodFromSt
 	opInflow := h.pairedMovement(tenantID, orgPtr, "5%", "4010", start, end, "debit") +
 		h.pairedMovement(tenantID, orgPtr, "5%", "9010", start, end, "debit")
 	opOutSupp := h.pairedMovement(tenantID, orgPtr, "6010", "5%", start, end, "debit")
-	opOutEmp := h.pairedMovement(tenantID, orgPtr, "6710", "5%", start, end, "debit")
+	opOutEmp := h.pairedMovement(tenantID, orgPtr, "6710", "5%", start, end, "debit") +
+		h.payrollCashBasisOutflow(tenantID, orgPtr, start, end)
 	opOutTax := h.pairedMovement(tenantID, orgPtr, "64%", "5%", start, end, "debit")
 	opNet := opInflow - opOutSupp - opOutEmp - opOutTax
 

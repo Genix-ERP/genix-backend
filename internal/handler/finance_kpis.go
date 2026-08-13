@@ -117,13 +117,17 @@ func (h *Handler) GetFinanceKPIs(c *gin.Context) {
 			filter = " AND je.organization_id = $3"
 			args = append(args, orgID)
 		}
+		// Cash bucket uses the canonical predicate (cash_engine.go) — the
+		// bare at.code='CASH' check missed custom bank accounts flagged
+		// is_bank_account whose type isn't CASH (moliya chuqur audit
+		// 2026-08-13).
 		_ = h.db.QueryRow(`
 			SELECT
 				COALESCE(SUM(CASE WHEN at.category IN ('asset', 'contra_asset') THEN l.debit_amount - l.credit_amount END), 0),
 				COALESCE(SUM(CASE WHEN at.category = 'liability' THEN l.credit_amount - l.debit_amount END), 0),
 				COALESCE(SUM(CASE WHEN at.category IN ('asset', 'contra_asset') AND left(a.code, 1) IN ('1', '2', '4', '5') THEN l.debit_amount - l.credit_amount END), 0),
 				COALESCE(SUM(CASE WHEN at.category = 'liability' AND left(a.code, 1) = '6' THEN l.credit_amount - l.debit_amount END), 0),
-				COALESCE(SUM(CASE WHEN at.code = 'CASH' THEN l.debit_amount - l.credit_amount END), 0)
+				COALESCE(SUM(CASE WHEN `+cashAccountPredicate("a", "at")+` THEN l.debit_amount - l.credit_amount END), 0)
 			FROM journal_entry_lines l
 			JOIN journal_entries je ON je.id = l.journal_entry_id
 				AND je.status = 'posted' AND je.deleted_at IS NULL
@@ -165,7 +169,8 @@ func (h *Handler) GetFinanceKPIs(c *gin.Context) {
 			AND je.status = 'posted' AND je.deleted_at IS NULL
 			AND je.entry_date >= $2 AND je.entry_date < $3`+cfOrgFilter+`
 		JOIN accounts a ON a.id = l.account_id AND a.tenant_id = $1 AND a.deleted_at IS NULL
-		JOIN account_types at ON at.id = a.account_type_id AND at.code = 'CASH'
+		JOIN account_types at ON at.id = a.account_type_id
+		WHERE `+cashAccountPredicate("a", "at")+`
 		GROUP BY 1
 	`, cfArgs...)
 	if err == nil {
