@@ -666,15 +666,15 @@ type BankAccount struct {
 
 // CreateBankAccountInput is the input for creating a bank account
 type CreateBankAccountInput struct {
-	Name          string  `json:"name" binding:"required,min=1,max=255"`
-	BankName      string  `json:"bank_name" binding:"required,min=1,max=255"`
-	AccountNumber string  `json:"account_number" binding:"required,min=1,max=50"`
-	Currency      string  `json:"currency" binding:"required,min=1,max=10"`
+	Name          string `json:"name" binding:"required,min=1,max=255"`
+	BankName      string `json:"bank_name" binding:"required,min=1,max=255"`
+	AccountNumber string `json:"account_number" binding:"required,min=1,max=50"`
+	Currency      string `json:"currency" binding:"required,min=1,max=10"`
 	// 'deposit' included: the Pul oqimi create/edit form has always offered it
 	// and every save with that choice 400'd against this list.
-	AccountType   string  `json:"account_type" binding:"required,oneof=checking savings deposit money_market certificate"`
-	Balance       float64 `json:"balance"`
-	AccountID     *string `json:"account_id"`
+	AccountType string  `json:"account_type" binding:"required,oneof=checking savings deposit money_market certificate"`
+	Balance     float64 `json:"balance"`
+	AccountID   *string `json:"account_id"`
 }
 
 // UpdateBankAccountInput is the input for updating a bank account
@@ -1145,6 +1145,22 @@ type Budget struct {
 	PlannedAmount float64 `json:"planned_amount"`
 	ActualAmount  float64 `json:"actual_amount"`
 	Variance      float64 `json:"variance"`
+
+	// The same rollup split by direction, under the names /budgets/summary
+	// already uses. Spending control is an EXPENSE-side question: the summed
+	// pair above marks a budget whose revenue beat plan as "over 100% used"
+	// while its spending is still well inside the limit. Both clients were
+	// working around that on their own — the web recomputed it in the browser
+	// from budget_lines, mobile just showed the mixed number — so one rule had
+	// three answers. Raw, exactly as the lines sum: planned_* stays 0 for a
+	// budget with no lines, which is what tells a client "no lines" apart from
+	// "lines that sum to zero". The total_amount fallback belongs to whoever
+	// applies it (Variance here, the CTE in GetBudgetsSummary) and is
+	// deliberately not baked in.
+	PlannedExpense float64 `json:"planned_expense"`
+	ActualExpense  float64 `json:"actual_expense"`
+	PlannedRevenue float64 `json:"planned_revenue"`
+	ActualRevenue  float64 `json:"actual_revenue"`
 
 	// New spec fields
 	Approach             string     `json:"approach" db:"approach"`                         // fixed, flexible, zero_based, rolling
