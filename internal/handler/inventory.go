@@ -7155,23 +7155,19 @@ func (h *Handler) AdvanceStockOperationStep(c *gin.Context) {
 							return lErr
 						}
 
-						// FIFO: set cost_price to the OLDEST available lot's cost (not latest purchase)
-						fifoCost := l.UnitPrice
-						var oldestCost float64
-						if tx.QueryRow(`
-							SELECT unit_cost FROM inventory_lots
-							WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
-							ORDER BY received_date ASC LIMIT 1
-						`, tenantID, l.ProdID).Scan(&oldestCost) == nil && oldestCost > 0 {
-							fifoCost = oldestCost
-						}
+						// Displayed cost by the product's effective valuation
+						// method (AVCO → running average, FIFO → oldest lot,
+						// standard → standard_cost). Was hard-coded to the
+						// oldest lot, which froze an AVCO product's card on
+						// its first purchase price.
+						displayCost := h.methodCostPrice(tx, tenantID, op.OrgID, l.ProdID, l.UnitPrice)
 						if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-							fifoCost, now, l.ProdID, tenantID); pErr != nil {
+							displayCost, now, l.ProdID, tenantID); pErr != nil {
 							return pErr
 						}
 						if op.OrgID != nil {
 							if _, pErr := tx.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-								fifoCost, now, l.ProdID, *op.OrgID); pErr != nil {
+								displayCost, now, l.ProdID, *op.OrgID); pErr != nil {
 								return pErr
 							}
 						}

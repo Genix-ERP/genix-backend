@@ -1860,19 +1860,16 @@ func (h *Handler) approvePOAndCreateReceipt(tenantID, userID, poID uuid.UUID) er
 			var pid uuid.UUID
 			var uprice float64
 			if poLineRows.Scan(&pid, &uprice) == nil && uprice > 0 {
-				// FIFO: set cost_price to oldest available lot's cost
-				var fifoCost float64
-				if h.db.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
-					tenantID, pid).Scan(&fifoCost) != nil || fifoCost <= 0 {
-					fifoCost = uprice
-				}
+				// Displayed cost by the product's effective valuation method
+				// (see methodCostPrice) — was hard-coded FIFO oldest-lot.
+				displayCost := h.methodCostPrice(h.db, tenantID, orgID, pid, uprice)
 				if _, execErr := h.db.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-					fifoCost, now, pid, tenantID); execErr != nil {
+					displayCost, now, pid, tenantID); execErr != nil {
 					h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE products", "error", execErr)
 				}
 				if orgID != nil {
 					if _, execErr := h.db.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-						fifoCost, now, pid, *orgID); execErr != nil {
+						displayCost, now, pid, *orgID); execErr != nil {
 						h.log.Error("write failed (was silently discarded)", "stmt", "UPDATE product_organization_settings", "error", execErr)
 					}
 				}
@@ -2283,15 +2280,11 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 				return lErr
 			}
 
-			// FIFO: set cost_price to oldest available lot's cost (not latest purchase)
-			fifoCostRcv := unitPrice
-			var oldestCost float64
-			if tx.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
-				tenantID, productID).Scan(&oldestCost) == nil && oldestCost > 0 {
-				fifoCostRcv = oldestCost
-			}
+			// Displayed cost by the product's effective valuation method
+			// (see methodCostPrice) — was hard-coded FIFO oldest-lot.
+			displayCost := h.methodCostPrice(tx, tenantID, poOrgID, productID, unitPrice)
 			if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-				fifoCostRcv, now, productID, tenantID); pErr != nil {
+				displayCost, now, productID, tenantID); pErr != nil {
 				return pErr
 			}
 			return tx.Commit()

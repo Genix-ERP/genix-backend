@@ -1119,7 +1119,11 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 			}
 
 			// FIFO only: roll product cost_price forward to the next
-			// available lot's cost
+			// available lot's cost. methodCostPrice re-resolves the
+			// product's EFFECTIVE method, because useFIFO is the tenant
+			// default — a category overridden to AVCO must keep showing its
+			// average (issues never move an average, §3.2), not the next
+			// lot this block would have written.
 			if useFIFO {
 				var nextLotCost float64
 				if tx.QueryRow(`
@@ -1127,13 +1131,14 @@ func (h *Handler) ValidateDeliveryOrder(c *gin.Context) {
 					WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0
 					ORDER BY received_date ASC LIMIT 1
 				`, tenantID, action.Line.ProductID).Scan(&nextLotCost) == nil && nextLotCost > 0 {
+					displayCost := h.methodCostPrice(tx, tenantID, doOrgPtr, action.Line.ProductID, nextLotCost)
 					if _, uErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-						nextLotCost, now, action.Line.ProductID, tenantID); uErr != nil {
+						displayCost, now, action.Line.ProductID, tenantID); uErr != nil {
 						return uErr
 					}
 					if doOrgPtr != nil {
 						if _, uErr := tx.Exec(`UPDATE product_organization_settings SET cost_price = $1, updated_at = $2 WHERE product_id = $3 AND organization_id = $4`,
-							nextLotCost, now, action.Line.ProductID, *doOrgPtr); uErr != nil {
+							displayCost, now, action.Line.ProductID, *doOrgPtr); uErr != nil {
 							return uErr
 						}
 					}

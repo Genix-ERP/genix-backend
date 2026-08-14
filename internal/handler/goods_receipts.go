@@ -974,17 +974,13 @@ func (h *Handler) CompleteGoodsReceipt(c *gin.Context) {
 							return lErr
 						}
 
-						// FIFO: cost_price tracks the OLDEST available lot
-						// (consistent with the PO-receive paths — the old code
-						// overwrote with the latest price here)
-						fifoCost := l.UnitPrice
-						var oldestCost float64
-						if tx.QueryRow(`SELECT unit_cost FROM inventory_lots WHERE tenant_id = $1 AND product_id = $2 AND status = 'available' AND remaining_quantity > 0 ORDER BY received_date ASC LIMIT 1`,
-							tenantID, l.ProductID).Scan(&oldestCost) == nil && oldestCost > 0 {
-							fifoCost = oldestCost
-						}
+						// Displayed cost by the product's effective valuation
+						// method (see methodCostPrice) — was hard-coded FIFO
+						// oldest-lot, which froze an AVCO product's card on
+						// its first purchase price.
+						displayCost := h.methodCostPrice(tx, tenantID, whOrgID, l.ProductID, l.UnitPrice)
 						if _, pErr := tx.Exec(`UPDATE products SET cost_price = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
-							fifoCost, now, l.ProductID, tenantID); pErr != nil {
+							displayCost, now, l.ProductID, tenantID); pErr != nil {
 							return pErr
 						}
 					}
