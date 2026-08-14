@@ -9,6 +9,14 @@
 -- disbursement, dividend payout, sales-return cash refund — all fixed in the
 -- same release as this migration).
 --
+-- The legacy codes are DROPPED rather than kept alongside: in the BHMS chart
+-- 1000 is "Tovar-moddiy zaxiralar" and 1010 is "Xom ashyo va materiallar" —
+-- inventory, not cash. Guarding them as cash blocked ordinary consumption
+-- postings: issuing raw material credits 1010, and the old trigger refused it
+-- outright, which aborted the surrounding transaction and killed the COGS
+-- entry for the delivery ("postInventoryConsumptionJE: commit failed"). Cash
+-- and bank are 50xx/51xx here and nowhere else.
+--
 -- Two deliberate softenings, so restoring the guard cannot brick a live DB:
 --
 --   1. Only a DECREASE is refused. A tenant that already carries a negative
@@ -35,10 +43,7 @@ BEGIN
 
     IF NEW.current_balance < -0.001
        AND NEW.current_balance < OLD.current_balance
-       AND (
-            NEW.code LIKE '50%' OR NEW.code LIKE '51%'
-         OR NEW.code LIKE '1000%' OR NEW.code LIKE '1010%' OR NEW.code LIKE '1100%'
-       ) THEN
+       AND (NEW.code LIKE '50%' OR NEW.code LIKE '51%') THEN
         RAISE EXCEPTION '% (%) hisobida mablag'' yetarli emas. Joriy balans: %',
             NEW.name, NEW.code, ROUND(OLD.current_balance::numeric, 2)
             USING ERRCODE = 'check_violation';
