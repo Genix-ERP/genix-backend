@@ -14,11 +14,118 @@ import (
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/lib/pq"
 )
 
 // =====================================================
 // CONTACT HANDLERS
 // =====================================================
+
+// contactSearchFilter builds the WHERE fragment for the ?search= term, which
+// every customer/supplier picker in Sales and Purchase now types into.
+//
+// It deliberately matches the person as well as the company. Buyers and sales
+// staff remember who they talk to long before they remember how the company is
+// registered — "Alisher" finds "OOO YUKSALISH SAVDO" when Alisher is the
+// contact there. The person's name lives in three different places for
+// historical reasons, so all three are searched:
+//
+//   - contacts.contact_person — what the supplier form posts (migration 506)
+//   - contacts.legal_name     — what the customer form has always written
+//   - contact_persons         — the normalised table, for API-created contacts
+//
+// tax_id is in here too: an accountant reconciling a bill has the INN in front
+// of them and nothing else.
+//
+// The caller passes the 1-based placeholder number of the already-appended
+// "%term%" argument; every column reuses that single placeholder.
+func contactSearchFilter(argNum int) string {
+	return fmt.Sprintf(` AND (
+		c.name ILIKE $%[1]d
+		OR c.code ILIKE $%[1]d
+		OR c.email ILIKE $%[1]d
+		OR c.phone ILIKE $%[1]d
+		OR c.tax_id ILIKE $%[1]d
+		OR c.contact_person ILIKE $%[1]d
+		OR c.legal_name ILIKE $%[1]d
+		OR EXISTS (
+			SELECT 1 FROM contact_persons cp
+			WHERE cp.contact_id = c.id
+			  AND (
+				cp.first_name ILIKE $%[1]d
+				OR cp.last_name ILIKE $%[1]d
+				OR (COALESCE(cp.first_name, '') || ' ' || COALESCE(cp.last_name, '')) ILIKE $%[1]d
+				OR cp.email ILIKE $%[1]d
+				OR cp.phone ILIKE $%[1]d
+				OR cp.mobile ILIKE $%[1]d
+			  )
+		)
+	)`, argNum)
+}
+
+// insertContactPersons writes the contact_persons rows supplied alongside a new
+// contact and returns what it stored.
+//
+// The contact itself is already committed by the time this runs, so a failure
+// here is logged and skipped rather than failing the request: losing a contact
+// the user just filled in would be worse than losing one of its people, and the
+// people can be added afterwards through /contacts/:id/persons.
+func (h *Handler) insertContactPersons(contactID uuid.UUID, inputs []entity.CreateContactPersonInput) []entity.ContactPerson {
+	if len(inputs) == 0 {
+		return nil
+	}
+
+	now := time.Now()
+	created := make([]entity.ContactPerson, 0, len(inputs))
+
+	for _, in := range inputs {
+		personID := uuid.New()
+		_, err := h.db.Exec(`
+			INSERT INTO contact_persons (
+				id, contact_id, first_name, last_name, title, email, phone, mobile,
+				is_primary, department, notes, created_at, updated_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		`, personID, contactID, in.FirstName, in.LastName,
+			optionalText(in.Title), optionalText(in.Email), optionalText(in.Phone),
+			optionalText(in.Mobile), in.IsPrimary, optionalText(in.Department),
+			optionalText(in.Notes), now, now)
+		if err != nil {
+			h.log.Error("Failed to create contact person",
+				"contact_id", contactID, "error", err)
+			continue
+		}
+
+		cp := entity.ContactPerson{
+			ID:        personID,
+			ContactID: contactID,
+			FirstName: in.FirstName,
+			LastName:  in.LastName,
+			IsPrimary: in.IsPrimary,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		cp.Title = optionalText(in.Title)
+		cp.Email = optionalText(in.Email)
+		cp.Phone = optionalText(in.Phone)
+		cp.Mobile = optionalText(in.Mobile)
+		cp.Department = optionalText(in.Department)
+		created = append(created, cp)
+	}
+
+	return created
+}
+
+// optionalText keeps optional text columns NULL instead of storing "", so
+// ILIKE filters and COALESCE fallbacks treat a field that was never filled in
+// the same as one that does not exist. finance.go already has two neighbours
+// of this (nullIfEmpty returns interface{}, strPtrOrNil takes a *string), and
+// neither can both accept a string and fill the entity's *string fields.
+func optionalText(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
 
 // ListContacts returns a paginated list of contacts
 func (h *Handler) ListContacts(c *gin.Context) {
@@ -50,7 +157,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 
 	// Build query - LEFT JOIN supplier_performance to get average rating for vendors
 	baseQuery := `
-		SELECT c.id, c.tenant_id, c.type, c.code, c.name, c.legal_name, c.tax_id,
+		SELECT c.id, c.tenant_id, c.type, c.code, c.name, c.legal_name, c.contact_person, c.tax_id,
 			   c.registration_number, c.industry, c.website, c.email, c.phone, c.fax,
 			   c.billing_address, c.shipping_address, c.payment_terms, c.credit_limit,
 			   c.current_balance, c.currency_id, c.tax_exempt, c.tags, c.notes, c.expected_revenue,
@@ -105,13 +212,15 @@ func (h *Handler) ListContacts(c *gin.Context) {
 
 	if search != "" {
 		argCount++
-		searchFilter := fmt.Sprintf(" AND (c.name ILIKE $%d OR c.code ILIKE $%d OR c.email ILIKE $%d OR c.phone ILIKE $%d)", argCount, argCount, argCount, argCount)
+		searchFilter := contactSearchFilter(argCount)
 		baseQuery += searchFilter
 		countQuery += searchFilter
 		args = append(args, "%"+search+"%")
 	}
 
-	// Get count
+	// Get count. Must happen before the ordering argument below is appended:
+	// countQuery does not reference it, and Postgres rejects a bind with more
+	// parameters than the statement uses.
 	var total int
 	err := h.db.QueryRow(countQuery, args...).Scan(&total)
 	if err != nil {
@@ -120,8 +229,21 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		return
 	}
 
-	// Add ordering and pagination
-	baseQuery += " ORDER BY c.created_at DESC"
+	// Add ordering and pagination.
+	if search != "" {
+		// Newest-first is the right default for browsing the contacts page, but
+		// it is the wrong answer for someone who just typed a name into a
+		// picker: "AVTO" would list a company merely containing the word above
+		// the one actually called AVTO. Put the companies whose name starts
+		// with the term first, then everything else alphabetically.
+		argCount++
+		baseQuery += fmt.Sprintf(
+			" ORDER BY (c.name ILIKE $%d) DESC, c.name ASC, c.created_at DESC",
+			argCount)
+		args = append(args, search+"%")
+	} else {
+		baseQuery += " ORDER BY c.created_at DESC"
+	}
 	baseQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(baseQuery, args...)
@@ -135,7 +257,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 	contacts := make([]*entity.ContactResponse, 0)
 	for rows.Next() {
 		var ct entity.Contact
-		var legalName, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
+		var legalName, contactPerson, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
 		var currencyID, createdBy sql.NullString
 		var billingAddr, shippingAddr, tags, customFields []byte
 		var avgRating float64
@@ -145,7 +267,7 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
 
 		err := rows.Scan(
-			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
+			&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &contactPerson, &taxID,
 			&regNum, &industry, &website, &email, &phone, &fax,
 			&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 			&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
@@ -181,6 +303,9 @@ func (h *Handler) ListContacts(c *gin.Context) {
 
 		if legalName.Valid {
 			resp.LegalName = &legalName.String
+		}
+		if contactPerson.Valid {
+			resp.ContactPerson = &contactPerson.String
 		}
 		if taxID.Valid {
 			resp.TaxID = &taxID.String
@@ -242,10 +367,80 @@ func (h *Handler) ListContacts(c *gin.Context) {
 		contacts = append(contacts, resp)
 	}
 
+	h.attachContactPersons(contacts)
+
 	pagination := entity.NewPagination(page, limit)
 	pagination.Calculate(total)
 
 	response.SuccessWithPagination(c, contacts, pagination)
+}
+
+// attachContactPersons fills in ContactPersons for an already-built page of
+// contacts, in one round trip rather than one per row.
+//
+// The picker needs these to explain itself: when a search for "Alisher" returns
+// a company whose own name contains no "Alisher", the dropdown has to show the
+// person underneath the company or the match looks like a bug. Only the page
+// currently being returned is queried — at most `limit` (<=100) contacts.
+//
+// A failure here is not fatal: the list is still correct without the persons,
+// so it logs and leaves the field empty rather than failing the request.
+func (h *Handler) attachContactPersons(contacts []*entity.ContactResponse) {
+	if len(contacts) == 0 {
+		return
+	}
+
+	ids := make([]uuid.UUID, 0, len(contacts))
+	byID := make(map[uuid.UUID]*entity.ContactResponse, len(contacts))
+	for _, ct := range contacts {
+		ids = append(ids, ct.ID)
+		byID[ct.ID] = ct
+	}
+
+	rows, err := h.db.Query(`
+		SELECT contact_id, id, first_name, last_name, title, email, phone, mobile,
+		       is_primary, department
+		FROM contact_persons
+		WHERE contact_id = ANY($1)
+		ORDER BY is_primary DESC, last_name, first_name
+	`, pq.Array(ids))
+	if err != nil {
+		h.log.Error("Failed to load contact persons", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var contactID uuid.UUID
+		var cp entity.ContactPerson
+		var title, email, phone, mobile, department sql.NullString
+
+		if err := rows.Scan(&contactID, &cp.ID, &cp.FirstName, &cp.LastName,
+			&title, &email, &phone, &mobile, &cp.IsPrimary, &department); err != nil {
+			h.log.Error("Failed to scan contact person", "error", err)
+			continue
+		}
+		cp.ContactID = contactID
+		if title.Valid {
+			cp.Title = &title.String
+		}
+		if email.Valid {
+			cp.Email = &email.String
+		}
+		if phone.Valid {
+			cp.Phone = &phone.String
+		}
+		if mobile.Valid {
+			cp.Mobile = &mobile.String
+		}
+		if department.Valid {
+			cp.Department = &department.String
+		}
+
+		if target, ok := byID[contactID]; ok {
+			target.ContactPersons = append(target.ContactPersons, cp)
+		}
+	}
 }
 
 // CreateContact creates a new contact
@@ -290,9 +485,12 @@ func (h *Handler) CreateContact(c *gin.Context) {
 	}
 
 	// Prepare optional strings
-	var legalName, taxID, regNum, industry, website, email, phone, fax, notes *string
+	var legalName, contactPerson, taxID, regNum, industry, website, email, phone, fax, notes *string
 	if input.LegalName != "" {
 		legalName = &input.LegalName
+	}
+	if input.ContactPerson != "" {
+		contactPerson = &input.ContactPerson
 	}
 	if input.TaxID != "" {
 		taxID = &input.TaxID
@@ -374,18 +572,18 @@ func (h *Handler) CreateContact(c *gin.Context) {
 
 	query := `
 		INSERT INTO contacts (
-			id, tenant_id, organization_id, type, code, name, legal_name, tax_id,
+			id, tenant_id, organization_id, type, code, name, legal_name, contact_person, tax_id,
 			registration_number, industry, website, email, phone, fax,
 			billing_address, shipping_address, payment_terms, credit_limit,
 			current_balance, tax_exempt, tags, notes, expected_revenue, custom_fields,
 			is_active, created_by, created_at, updated_at,
 			default_receivable_account_id, default_payable_account_id
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
 		RETURNING id
 	`
 
 	err := h.db.QueryRow(query,
-		id, tenantID, orgIDPtr, input.Type, input.Code, input.Name, legalName, taxID,
+		id, tenantID, orgIDPtr, input.Type, input.Code, input.Name, legalName, contactPerson, taxID,
 		regNum, industry, website, email, phone, fax,
 		billingAddr, shippingAddr, input.PaymentTerms, input.CreditLimit,
 		0, input.TaxExempt, tags, notes, input.ExpectedRevenue, customFields,
@@ -399,13 +597,20 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		return
 	}
 
+	// CreateContactInput has advertised contact_persons since it was written but
+	// nothing ever read it, so a caller sending the array got a contact with no
+	// people attached and no error to explain it. The picker searches this
+	// table, so a dropped person is now a person nobody can find.
+	createdPersons := h.insertContactPersons(id, input.ContactPersons)
+
 	resp := &entity.ContactResponse{
 		ID:           id,
 		Type:         input.Type,
 		Code:         input.Code,
-		Name:         input.Name,
-		LegalName:    legalName,
-		TaxID:        taxID,
+		Name:          input.Name,
+		LegalName:     legalName,
+		ContactPerson: contactPerson,
+		TaxID:         taxID,
 		Email:        email,
 		Phone:        phone,
 		PaymentTerms: input.PaymentTerms,
@@ -433,6 +638,7 @@ func (h *Handler) CreateContact(c *gin.Context) {
 		s := receivableAccountID.String()
 		resp.DefaultReceivableAccountID = &s
 	}
+	resp.ContactPersons = createdPersons
 	if payableAccountID != nil {
 		s := payableAccountID.String()
 		resp.DefaultPayableAccountID = &s
@@ -457,7 +663,7 @@ func (h *Handler) GetContact(c *gin.Context) {
 	}
 
 	query := `
-		SELECT id, tenant_id, type, code, name, legal_name, tax_id,
+		SELECT id, tenant_id, type, code, name, legal_name, contact_person, tax_id,
 			   registration_number, industry, website, email, phone, fax,
 			   billing_address, shipping_address, payment_terms, credit_limit,
 			   current_balance, currency_id, tax_exempt, tags, notes, expected_revenue,
@@ -468,14 +674,14 @@ func (h *Handler) GetContact(c *gin.Context) {
 	`
 
 	var ct entity.Contact
-	var legalName, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
+	var legalName, contactPerson, taxID, regNum, industry, website, email, phone, fax, notes sql.NullString
 	var currencyID, createdBy sql.NullString
 	var billingAddr, shippingAddr, tags, customFields []byte
 	var expectedRevenue sql.NullFloat64
 	var defaultReceivableAccountID, defaultPayableAccountID sql.NullString
 
 	err = h.db.QueryRow(query, id, tenantID).Scan(
-		&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &taxID,
+		&ct.ID, &ct.TenantID, &ct.Type, &ct.Code, &ct.Name, &legalName, &contactPerson, &taxID,
 		&regNum, &industry, &website, &email, &phone, &fax,
 		&billingAddr, &shippingAddr, &ct.PaymentTerms, &ct.CreditLimit,
 		&ct.CurrentBalance, &currencyID, &ct.TaxExempt, &tags, &notes, &expectedRevenue,
@@ -509,6 +715,9 @@ func (h *Handler) GetContact(c *gin.Context) {
 
 	if legalName.Valid {
 		resp.LegalName = &legalName.String
+	}
+	if contactPerson.Valid {
+		resp.ContactPerson = &contactPerson.String
 	}
 	if taxID.Valid {
 		resp.TaxID = &taxID.String
@@ -561,6 +770,8 @@ func (h *Handler) GetContact(c *gin.Context) {
 		resp.DefaultPayableAccountID = &defaultPayableAccountID.String
 	}
 
+	h.attachContactPersons([]*entity.ContactResponse{resp})
+
 	response.Success(c, resp)
 }
 
@@ -600,6 +811,11 @@ func (h *Handler) UpdateContact(c *gin.Context) {
 		argCount++
 		updates = append(updates, fmt.Sprintf("legal_name = $%d", argCount))
 		args = append(args, *input.LegalName)
+	}
+	if input.ContactPerson != nil {
+		argCount++
+		updates = append(updates, fmt.Sprintf("contact_person = $%d", argCount))
+		args = append(args, *input.ContactPerson)
 	}
 	if input.TaxID != nil {
 		argCount++

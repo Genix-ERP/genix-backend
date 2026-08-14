@@ -27,6 +27,7 @@ type Contact struct {
 	Code               string          `json:"code" db:"code"`
 	Name               string          `json:"name" db:"name"`
 	LegalName          *string         `json:"legal_name,omitempty" db:"legal_name"`
+	ContactPerson      *string         `json:"contact_person,omitempty" db:"contact_person"`
 	TaxID              *string         `json:"tax_id,omitempty" db:"tax_id"`
 	RegistrationNumber *string         `json:"registration_number,omitempty" db:"registration_number"`
 	Industry           *string         `json:"industry,omitempty" db:"industry"`
@@ -83,6 +84,7 @@ type CreateContactInput struct {
 	Code                       string                     `json:"code" binding:"required,min=1,max=50"`
 	Name                       string                     `json:"name" binding:"required,min=1,max=255"`
 	LegalName                  string                     `json:"legal_name,omitempty"`
+	ContactPerson              string                     `json:"contact_person,omitempty" binding:"omitempty,max=255"`
 	TaxID                      string                     `json:"tax_id,omitempty"`
 	RegistrationNumber         string                     `json:"registration_number,omitempty"`
 	Industry                   string                     `json:"industry,omitempty"`
@@ -109,6 +111,7 @@ type CreateContactInput struct {
 type UpdateContactInput struct {
 	Name                       *string                `json:"name,omitempty"`
 	LegalName                  *string                `json:"legal_name,omitempty"`
+	ContactPerson              *string                `json:"contact_person,omitempty"`
 	TaxID                      *string                `json:"tax_id,omitempty"`
 	RegistrationNumber         *string                `json:"registration_number,omitempty"`
 	Industry                   *string                `json:"industry,omitempty"`
@@ -161,6 +164,7 @@ type ContactResponse struct {
 	Code                       string                 `json:"code"`
 	Name                       string                 `json:"name"`
 	LegalName                  *string                `json:"legal_name,omitempty"`
+	ContactPerson              *string                `json:"contact_person,omitempty"`
 	TaxID                      *string                `json:"tax_id,omitempty"`
 	Industry                   *string                `json:"industry,omitempty"`
 	Email                      *string                `json:"email,omitempty"`
