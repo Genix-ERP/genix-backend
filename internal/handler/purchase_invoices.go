@@ -1289,6 +1289,15 @@ func (h *Handler) PayPurchaseInvoice(c *gin.Context) {
 		return
 	}
 
+	// Paying a vendor from an account that has no money used to drive the
+	// kassa/bank straight through zero. The refusal belongs here, before the
+	// entry is written, so the user gets the same sentence every other
+	// money-out screen shows instead of a 500 from the database guard.
+	if msg, bad := insufficientFunds(tx, cashAcctID, paymentAmount); bad {
+		response.BadRequest(c, msg)
+		return
+	}
+
 	prefix := ""
 	if numberPrefix.Valid {
 		prefix = numberPrefix.String

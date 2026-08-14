@@ -2310,6 +2310,14 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 	if !skipStockUpdate {
 		recvUserID, _ := middleware.GetUserID(c)
 		h.addPOReceiptToObjectCost(tenantID, id, objectCostLines, recvUserID)
+		// ...and the goods have to reach the LEDGER too, not just the bin.
+		// This path moved stock without posting anything, so in the ordinary
+		// PO → receive → bill flow inventory never got debited: the bill's
+		// Dt 6015 (GRNI) had no matching credit and sat there forever, while
+		// COGS kept crediting 2910 until the inventory account went negative
+		// and the balance sheet showed no stock at all. The goods-receipt
+		// endpoint has always posted this entry; /receive simply never did.
+		h.postPOReceiptStockJE(tenantID, poOrgID, id, poWarehouseID, poVendorID, objectCostLines, now)
 	}
 
 	notifyUserID, _ := middleware.GetUserID(c)
@@ -2350,6 +2358,153 @@ func (h *Handler) ReceivePurchaseOrder(c *gin.Context) {
 // @Failure 500 {object} response.Response
 // @Security BearerAuth
 // @Router /purchase-orders/{id}/bill [post]
+// postPOReceiptStockJE books goods received straight from a purchase order:
+//
+//	Dt  inventory (per product's inventory_type; 2910 trade / 1010 raw / 2810 finished)
+//	Kt  6015 GRNI — "olingan, lekin hisob-faktura qilinmagan tovarlar"
+//
+// It mirrors the entry ConfirmGoodsReceipt posts, and deliberately credits
+// GRNI rather than AP: the vendor bill later debits 6015 and credits 6010, so
+// the clearing account nets to zero once both documents exist. Crediting 6010
+// here would book the payable twice for one delivery.
+//
+// Failures are logged, not returned: the stock has already moved and the
+// caller has committed it, so refusing here would only hide the receipt.
+func (h *Handler) postPOReceiptStockJE(tenantID uuid.UUID, orgID *uuid.UUID, poID uuid.UUID,
+	warehouseID sql.NullString, vendorID *uuid.UUID, lines []poCostLine, now time.Time) {
+
+	if len(lines) == 0 {
+		return
+	}
+
+	// One amount per product, so a PO listing the same product twice posts
+	// one pair of lines rather than two.
+	amounts := make(map[uuid.UUID]float64, len(lines))
+	order := make([]uuid.UUID, 0, len(lines))
+	var totalAmount float64
+	for _, l := range lines {
+		amt := l.Qty * l.UnitPrice
+		if amt <= 0 {
+			continue
+		}
+		if _, seen := amounts[l.ProductID]; !seen {
+			order = append(order, l.ProductID)
+		}
+		amounts[l.ProductID] += amt
+		totalAmount += amt
+	}
+	if totalAmount <= 0 {
+		return
+	}
+
+	var journalID uuid.UUID
+	var nextNumber int
+	if err := h.db.QueryRow(`
+		SELECT id, COALESCE(next_number, 1)
+		FROM journals WHERE tenant_id = $1 AND code IN ('STOCK','INVENTORY','GENERAL') AND deleted_at IS NULL
+		ORDER BY CASE code WHEN 'STOCK' THEN 0 WHEN 'INVENTORY' THEN 1 ELSE 2 END LIMIT 1`,
+		tenantID).Scan(&journalID, &nextNumber); err != nil {
+		h.log.Error("No journal found for PO receipt JE", "error", err, "po_id", poID)
+		return
+	}
+
+	var warehouseIDPtr *uuid.UUID
+	if warehouseID.Valid && warehouseID.String != "" {
+		if w, err := uuid.Parse(warehouseID.String); err == nil {
+			warehouseIDPtr = &w
+		}
+	}
+
+	var orderNumber string
+	_ = h.db.QueryRow(`SELECT COALESCE(order_number, '') FROM purchase_orders WHERE id = $1`, poID).Scan(&orderNumber)
+
+	tx, txErr := h.db.Begin()
+	if txErr != nil {
+		h.log.Error("Failed to begin PO receipt JE tx", "error", txErr, "po_id", poID)
+		return
+	}
+	defer tx.Rollback()
+
+	journalEntryID := uuid.New()
+	entryNumber := fmt.Sprintf("POR%06d", nextEntryNumberSeq(tx, tenantID, orgID, "POR", nextNumber))
+	if _, err := tx.Exec(`
+		INSERT INTO journal_entries (
+			id, tenant_id, organization_id, journal_id, entry_number, entry_date, reference, description,
+			source_type, source_id, exchange_rate, total_debit, total_credit, status, created_at, updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'purchase_receipt', $9, 1.0, $10, $10, 'posted', $11, $11)`,
+		journalEntryID, tenantID, orgID, journalID, entryNumber, now, orderNumber,
+		"Xarid buyurtmasi bo'yicha qabul: "+orderNumber, poID.String(), totalAmount, now,
+	); err != nil {
+		h.log.Error("Failed to create PO receipt JE", "error", err, "po_id", poID)
+		return
+	}
+
+	lineNumber := 1
+	for _, productID := range order {
+		amount := amounts[productID]
+		ca := getCategoryAccounts(tx, tenantID, orgID, productID)
+
+		debitAcct := getInventoryAccountByType(tx, tenantID, orgID, productID)
+		if debitAcct == uuid.Nil {
+			debitAcct = ca.StockValuationAccountID
+		}
+		if debitAcct == uuid.Nil {
+			debitAcct = findAccount(tx, tenantID, orgID, "inventory", "1010")
+		}
+		creditAcct := ca.StockInputAccountID
+		if creditAcct == uuid.Nil {
+			creditAcct = findAccount(tx, tenantID, orgID, "stock interim", "6015")
+		}
+		if creditAcct == uuid.Nil {
+			creditAcct = findAccount(tx, tenantID, orgID, "accounts payable", "6010")
+		}
+		if debitAcct == uuid.Nil || creditAcct == uuid.Nil {
+			h.log.Error("PO receipt JE: no stock accounts resolved", "po_id", poID, "product_id", productID)
+			return
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, warehouse_id, description,
+				debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 1.0, $7, '{}'::jsonb, $8)`,
+			uuid.New(), journalEntryID, lineNumber, debitAcct, warehouseIDPtr, "Ombor qiymati", amount, now,
+		); err != nil {
+			h.log.Error("Failed to insert PO receipt debit line", "error", err, "po_id", poID)
+			return
+		}
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance + $1, updated_at = $2 WHERE id = $3", amount, now, debitAcct); err != nil {
+			h.log.Error("Failed to update inventory balance for PO receipt JE", "error", err)
+			return
+		}
+		lineNumber++
+
+		if _, err := tx.Exec(`
+			INSERT INTO journal_entry_lines (
+				id, journal_entry_id, line_number, account_id, contact_id, description,
+				debit_amount, credit_amount, exchange_rate, amount_base, analytics_json, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, 1.0, $7, '{}'::jsonb, $8)`,
+			uuid.New(), journalEntryID, lineNumber, creditAcct, vendorID, "Hisob-faktura qilinmagan tovarlar", amount, now,
+		); err != nil {
+			h.log.Error("Failed to insert PO receipt credit line", "error", err, "po_id", poID)
+			return
+		}
+		if _, err := tx.Exec("UPDATE accounts SET current_balance = current_balance - $1, updated_at = $2 WHERE id = $3", amount, now, creditAcct); err != nil {
+			h.log.Error("Failed to update GRNI balance for PO receipt JE", "error", err)
+			return
+		}
+		lineNumber++
+	}
+
+	if _, err := tx.Exec("UPDATE journals SET next_number = next_number + 1, updated_at = $1 WHERE id = $2", now, journalID); err != nil {
+		h.log.Error("Failed to bump journal next_number for PO receipt JE", "error", err)
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		h.log.Error("Failed to commit PO receipt JE", "error", err, "po_id", poID)
+	}
+}
+
 func (h *Handler) CreateBillFromPO(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {

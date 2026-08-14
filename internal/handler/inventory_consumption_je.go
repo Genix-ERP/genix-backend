@@ -149,6 +149,16 @@ func (h *Handler) postInventoryConsumptionJE(q dbExecQuerier, args postInventory
 	// returned IDs are guaranteed leaves (resolveLeafAccount inside the
 	// helper).
 	ca := getCategoryAccounts(q, args.TenantID, args.OrganizationID, args.ProductID)
+	// The CREDIT must land on the account the goods were DEBITED to when they
+	// arrived. Receipts (goods receipt, PO receive) and sales-invoice COGS all
+	// route through getInventoryAccountByType — 2910 trade / 1010 raw / 2810
+	// finished — while this path used only the category's valuation account,
+	// whose blank-field fallback is 1010. So a traded good was received into
+	// 2910 and issued out of 1010: one account climbed forever, the other went
+	// negative, and neither matched the stock on hand.
+	if invAcct := getInventoryAccountByType(q, args.TenantID, args.OrganizationID, args.ProductID); invAcct != uuid.Nil {
+		ca.StockValuationAccountID = invAcct
+	}
 	if ca.ExpenseAccountID == uuid.Nil || ca.StockValuationAccountID == uuid.Nil {
 		// One of the two legs has no account to post to. Log so the
 		// admin can configure the missing piece in product_categories

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
@@ -450,6 +451,20 @@ func (h *Handler) persistLayerDrain(tx *sql.Tx, m StockMovement, layers []Layer)
 		}
 
 		tq, _ := takenQty.Float64()
+		// stock_valuation_consumptions.quantity is numeric(20,4) with
+		// CHECK (quantity > 0). A layer can shed VALUE without shedding
+		// quantity (tiyin rounding, revaluation), and a draw under 0.0001
+		// rounds to zero on the way into the column — both produced a
+		// constraint violation that aborted the surrounding transaction
+		// and took the entire delivery down with it ("Delivery stock
+		// movement failed; NOTHING moved"). The layer UPDATE above still
+		// records the change; this table audits quantity issued, and no
+		// quantity was issued.
+		if math.Round(tq*10000)/10000 <= 0 {
+			h.log.Warn("valuation: consumption row skipped (no quantity moved)",
+				"layer", l.ID, "taken_qty", tq, "taken_value", fromTiyin(takenValue))
+			continue
+		}
 		if _, err := tx.Exec(`
 			INSERT INTO stock_valuation_consumptions (
 				tenant_id, organization_id, product_id, layer_id, issue_date,
