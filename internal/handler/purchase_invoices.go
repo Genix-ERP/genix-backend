@@ -227,6 +227,21 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		TaxAmount           float64 `json:"tax_amount"`
 		TotalAmount         float64 `json:"total_amount"`
 		Notes               string  `json:"notes"`
+		// When lines are sent the server does the arithmetic and the flat
+		// subtotal/tax_amount/total_amount above are ignored — "money is
+		// computed on the server" was true everywhere except here, so the web
+		// multiplied the VAT rate in the browser and mobile had to reproduce
+		// the same rounding to agree with it. Optional so the existing
+		// flat-field callers keep working exactly as before.
+		Lines []struct {
+			ProductID      string  `json:"product_id"`
+			Description    string  `json:"description"`
+			Quantity       float64 `json:"quantity" binding:"gt=0"`
+			UnitID         string  `json:"unit_id"`
+			UnitPrice      float64 `json:"unit_price" binding:"gte=0"`
+			DiscountAmount float64 `json:"discount_amount" binding:"omitempty,gte=0"`
+			TaxID          string  `json:"tax_id"`
+		} `json:"lines" binding:"omitempty,dive"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -265,11 +280,42 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 	invoiceID := uuid.New()
 	now := time.Now()
 
-	// Calculate total if not provided
+	// Totals. With lines, everything is derived here from quantity, price and
+	// the tax rate looked up per line — never from what the client sent, so two
+	// clients cannot store two different amounts for one bill. Without lines,
+	// the historical flat fields are kept verbatim (zeroing them instead would
+	// silently write 0-sum invoices for every caller that has not migrated).
 	subtotal := input.Subtotal
 	taxAmount := input.TaxAmount
 	totalAmount := input.TotalAmount
-	if totalAmount == 0 {
+	lineTaxAmounts := make([]float64, len(input.Lines))
+	lineNets := make([]float64, len(input.Lines))
+	if len(input.Lines) > 0 {
+		subtotal, taxAmount = 0, 0
+		// One lookup per distinct tax, mirroring CreateSalesInvoice.
+		taxRateCache := make(map[string]float64)
+		for i, line := range input.Lines {
+			lineNet := line.Quantity*line.UnitPrice - line.DiscountAmount
+			lineNets[i] = lineNet
+			subtotal += lineNet
+
+			if line.TaxID != "" {
+				rate, cached := taxRateCache[line.TaxID]
+				if !cached {
+					if tid, perr := uuid.Parse(line.TaxID); perr == nil {
+						_ = h.db.QueryRow(
+							`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
+							tid, tenantID,
+						).Scan(&rate)
+					}
+					taxRateCache[line.TaxID] = rate
+				}
+				lineTaxAmounts[i] = lineNet * rate / 100.0
+				taxAmount += lineTaxAmounts[i]
+			}
+		}
+		totalAmount = subtotal + taxAmount
+	} else if totalAmount == 0 {
 		totalAmount = subtotal + taxAmount
 	}
 
@@ -345,6 +391,50 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 		h.log.Error("Failed to create purchase invoice", "error", err)
 		response.InternalError(c, "Failed to create purchase invoice")
 		return
+	}
+
+	// Store the lines the totals were computed from, so the bill can be
+	// reopened, re-checked against the PO and posted per product.
+	for i, line := range input.Lines {
+		var productID, unitID *uuid.UUID
+		if line.ProductID != "" {
+			if pid, perr := uuid.Parse(line.ProductID); perr == nil {
+				productID = &pid
+			}
+		}
+		if line.UnitID != "" {
+			if uid, perr := uuid.Parse(line.UnitID); perr == nil {
+				unitID = &uid
+			}
+		}
+		var taxID *uuid.UUID
+		if line.TaxID != "" {
+			if tid, perr := uuid.Parse(line.TaxID); perr == nil {
+				taxID = &tid
+			}
+		}
+		description := line.Description
+		if description == "" && productID != nil {
+			// description is NOT NULL; fall back to the product's own name
+			// rather than refusing a line the client left blank.
+			_ = h.db.QueryRow(`SELECT name FROM products WHERE id = $1 AND tenant_id = $2`, *productID, tenantID).Scan(&description)
+		}
+		if description == "" {
+			description = "-"
+		}
+		if _, lineErr := h.db.Exec(`
+			INSERT INTO purchase_invoice_lines (
+				id, purchase_invoice_id, line_number, product_id, description,
+				quantity, unit_id, unit_price, discount_amount, tax_id, tax_amount, line_total, created_at
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+			uuid.New(), invoiceID, i+1, productID, description,
+			line.Quantity, unitID, line.UnitPrice, line.DiscountAmount, taxID,
+			lineTaxAmounts[i], lineNets[i]+lineTaxAmounts[i], now,
+		); lineErr != nil {
+			h.log.Error("Failed to create purchase invoice line", "error", lineErr, "line", i+1)
+			response.InternalError(c, "Failed to create purchase invoice lines")
+			return
+		}
 	}
 
 	// Get vendor name for response

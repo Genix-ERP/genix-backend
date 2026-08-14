@@ -40,6 +40,15 @@ type TaxReportPeriod struct {
 	CreatedByName    *string    `json:"created_by_name,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
+
+	// Overdue is decided in SQL, against the database's own CURRENT_DATE.
+	// The web was computing it from the browser clock (new Date() vs the
+	// deadline string), which is the same defect just fixed in AR/AP aging:
+	// a non-UTC session put Go and SQL five hours apart and flipped the badge
+	// on deadline day. 'paid' counts as settled alongside 'filed' — a period
+	// that has been paid must not keep glowing red.
+	IsOverdue   bool `json:"is_overdue"`
+	DaysOverdue int  `json:"days_overdue"`
 }
 
 // TaxReportLine represents a line item in a tax report
@@ -136,7 +145,12 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 			uf.first_name || ' ' || uf.last_name as filed_by_name,
 			trp.notes, trp.paid_at, trp.created_by,
 			uc.first_name || ' ' || uc.last_name as created_by_name,
-			trp.created_at, trp.updated_at
+			trp.created_at, trp.updated_at,
+			(trp.deadline IS NOT NULL AND trp.deadline < CURRENT_DATE
+			   AND trp.status NOT IN ('filed','paid')) AS is_overdue,
+			CASE WHEN trp.deadline IS NOT NULL AND trp.deadline < CURRENT_DATE
+			          AND trp.status NOT IN ('filed','paid')
+			     THEN (CURRENT_DATE - trp.deadline) ELSE 0 END AS days_overdue
 		FROM tax_report_periods trp
 		LEFT JOIN users uf ON uf.id = trp.filed_by
 		LEFT JOIN users uc ON uc.id = trp.created_by
@@ -193,13 +207,14 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 		var filedDate, paidAt sql.NullTime
 		var filedByID, createdByID sql.NullString
 		var filedByName, createdByName sql.NullString
+		var daysOverdue sql.NullInt64
 
 		err := rows.Scan(
 			&p.ID, &p.TenantID, &p.Name, &p.PeriodType, &startDate, &endDate,
 			&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 			&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
 			&filedByName, &notes, &paidAt, &createdByID, &createdByName,
-			&p.CreatedAt, &p.UpdatedAt,
+			&p.CreatedAt, &p.UpdatedAt, &p.IsOverdue, &daysOverdue,
 		)
 		if err != nil {
 			h.log.Error("Failed to scan tax report period", "error", err)
@@ -211,6 +226,7 @@ func (h *Handler) ListTaxReportPeriods(c *gin.Context) {
 
 		p.StartDate = startDate.Format("2006-01-02")
 		p.EndDate = endDate.Format("2006-01-02")
+		p.DaysOverdue = int(daysOverdue.Int64)
 		if deadline.Valid {
 			dl := deadline.Time.Format("2006-01-02")
 			p.Deadline = &dl
@@ -279,6 +295,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 	var filedDate, paidAt sql.NullTime
 	var filedByID, createdByID sql.NullString
 	var filedByName, createdByName sql.NullString
+	var daysOverdue sql.NullInt64
 
 	err = h.db.QueryRow(`
 		SELECT
@@ -288,7 +305,12 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 			uf.first_name || ' ' || uf.last_name,
 			trp.notes, trp.paid_at, trp.created_by,
 			uc.first_name || ' ' || uc.last_name,
-			trp.created_at, trp.updated_at
+			trp.created_at, trp.updated_at,
+			(trp.deadline IS NOT NULL AND trp.deadline < CURRENT_DATE
+			   AND trp.status NOT IN ('filed','paid')) AS is_overdue,
+			CASE WHEN trp.deadline IS NOT NULL AND trp.deadline < CURRENT_DATE
+			          AND trp.status NOT IN ('filed','paid')
+			     THEN (CURRENT_DATE - trp.deadline) ELSE 0 END AS days_overdue
 		FROM tax_report_periods trp
 		LEFT JOIN users uf ON uf.id = trp.filed_by
 		LEFT JOIN users uc ON uc.id = trp.created_by
@@ -298,7 +320,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 		&deadline, &p.Status, &p.TotalSales, &p.TotalSalesTax, &p.TotalPurchases, &p.TotalPurchaseTax,
 		&p.NetTaxLiability, &filingRef, &filedDate, &filedByID,
 		&filedByName, &notes, &paidAt, &createdByID, &createdByName,
-		&p.CreatedAt, &p.UpdatedAt,
+		&p.CreatedAt, &p.UpdatedAt, &p.IsOverdue, &daysOverdue,
 	)
 	if err == sql.ErrNoRows {
 		response.NotFound(c, "Tax report period not found")
@@ -312,6 +334,7 @@ func (h *Handler) GetTaxReportPeriod(c *gin.Context) {
 
 	p.StartDate = startDate.Format("2006-01-02")
 	p.EndDate = endDate.Format("2006-01-02")
+	p.DaysOverdue = int(daysOverdue.Int64)
 	if deadline.Valid {
 		dl := deadline.Time.Format("2006-01-02")
 		p.Deadline = &dl
@@ -912,6 +935,12 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 	// Build date filter clause and args dynamically
 	hasDates := startDate != "" && endDate != ""
 
+	// Free-text search, applied in SQL on BOTH arms before the union is paged.
+	// Without it a client's search box could only ever look at the 20 rows it
+	// had already been given, so "not found" really meant "not on this page".
+	search := strings.TrimSpace(c.Query("search"))
+	searchLike := "%" + search + "%"
+
 	// Build org filter
 	txOrgFilter := ""
 	baseArgs := []interface{}{tenantID}
@@ -952,6 +981,15 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		if hasDates {
 			salesQuery += fmt.Sprintf(` AND si.invoice_date >= $%d AND si.invoice_date <= $%d`, nextArg, nextArg+1)
 			salesArgs = append(salesArgs, startDate, endDate)
+		}
+		if search != "" {
+			// Document number or customer — what a bookkeeper has in front of
+			// them. Same argument index twice: one value, two columns.
+			salesArg := len(salesArgs) + 1
+			salesQuery += fmt.Sprintf(
+				` AND (si.invoice_number ILIKE $%d OR COALESCE(si.customer_name, '') ILIKE $%d OR COALESCE(c.name, '') ILIKE $%d)`,
+				salesArg, salesArg, salesArg)
+			salesArgs = append(salesArgs, searchLike)
 		}
 		salesQuery += ` ORDER BY si.invoice_date DESC`
 		salesRows, err := h.db.Query(salesQuery, salesArgs...)
@@ -1026,6 +1064,14 @@ func (h *Handler) GetTaxTransactions(c *gin.Context) {
 		if hasDates {
 			purchaseQuery += fmt.Sprintf(` AND pi.invoice_date >= $%d AND pi.invoice_date <= $%d`, nextArg, nextArg+1)
 			purchaseArgs = append(purchaseArgs, startDate, endDate)
+		}
+		if search != "" {
+			purchaseArg := len(purchaseArgs) + 1
+			purchaseQuery += fmt.Sprintf(
+				` AND (pi.invoice_number ILIKE $%d OR COALESCE(pi.vendor_invoice_number, '') ILIKE $%d`+
+					` OR COALESCE(pi.supplier_name, '') ILIKE $%d OR COALESCE(c.name, '') ILIKE $%d)`,
+				purchaseArg, purchaseArg, purchaseArg, purchaseArg)
+			purchaseArgs = append(purchaseArgs, searchLike)
 		}
 		purchaseQuery += ` ORDER BY pi.invoice_date DESC`
 		purchaseRows, err := h.db.Query(purchaseQuery, purchaseArgs...)

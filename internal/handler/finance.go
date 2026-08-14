@@ -9712,7 +9712,9 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		       b.created_by, b.created_at, b.updated_at,
 		       COALESCE(b.start_date, fy.start_date), COALESCE(b.end_date, fy.end_date),
 		       COALESCE(b.warning_threshold, 80),
-		       roll.planned, roll.actual
+		       roll.planned, roll.actual,
+		       roll.planned_expense, roll.actual_expense,
+		       roll.planned_revenue, roll.actual_revenue
 		FROM budgets b
 		LEFT JOIN fiscal_years fy ON fy.id = b.fiscal_year_id` + budgetRollupSQL + `
 		` + budgetsBaseWhere
@@ -9756,12 +9758,14 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		var startDate, endDate sql.NullString
 		var warningThreshold float64
 		var planned, actual float64
+		var plannedExpense, actualExpense, plannedRevenue, actualRevenue float64
 
 		err := rows.Scan(
 			&b.ID, &b.TenantID, &orgID, &b.FiscalYearID, &b.Code, &b.Name, &desc,
 			&b.BudgetType, &b.TotalAmount, &b.Status, &approvedBy, &approvedAt,
 			&createdBy, &b.CreatedAt, &b.UpdatedAt,
 			&startDate, &endDate, &warningThreshold, &planned, &actual,
+			&plannedExpense, &actualExpense, &plannedRevenue, &actualRevenue,
 		)
 		if err != nil {
 			continue
@@ -9799,6 +9803,12 @@ func (h *Handler) ListBudgets(c *gin.Context) {
 		// misleading: planned 0 minus a real actual would read as a huge overrun.
 		b.PlannedAmount = planned
 		b.ActualAmount = actual
+		// Additive: the summed pair above stays exactly as it was, because both
+		// clients read it today. The split pair is what a usage bar should use.
+		b.PlannedExpense = plannedExpense
+		b.ActualExpense = actualExpense
+		b.PlannedRevenue = plannedRevenue
+		b.ActualRevenue = actualRevenue
 		effectivePlanned := planned
 		if effectivePlanned == 0 {
 			effectivePlanned = b.TotalAmount
