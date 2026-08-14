@@ -286,6 +286,16 @@ func (h *Handler) CreateEmployeeLoan(c *gin.Context) {
 		}
 	}
 
+	// Refuse before anything is written: handing out a loan the kassa cannot
+	// cover used to succeed and drive the cash account negative, because the
+	// disbursement JE is posted by a helper that only logs its failures.
+	if cashAccountID != nil {
+		if msg, bad := insufficientFunds(h.db, *cashAccountID, input.Amount); bad {
+			response.BadRequest(c, msg)
+			return
+		}
+	}
+
 	loanID := uuid.New()
 	_, err = h.db.Exec(`
 		INSERT INTO employee_loans (id, tenant_id, organization_id, employee_id, loan_number,

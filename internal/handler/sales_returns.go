@@ -1223,6 +1223,25 @@ func (h *Handler) ProcessRefund(c *gin.Context) {
 		returnID, tenantID,
 	).Scan(&returnNumber, &customerID, &customerName, &totalAmount, &returnTaxAmount)
 
+	// A cash refund hands money over the counter, so the kassa must cover it.
+	// The check belongs HERE, before the terminal status flip: the refund JE
+	// below is posted in a nested block whose failures only log, so a short
+	// kassa would otherwise leave the return marked refunded with the cash
+	// account driven negative (or no entry at all).
+	if strings.EqualFold(strings.TrimSpace(input.RefundMethod), "cash") {
+		var refundOrgIDPre *uuid.UUID
+		_ = h.db.QueryRow(`
+			SELECT si.organization_id FROM sales_invoices si
+			JOIN sales_returns sr ON sr.sales_invoice_id = si.id
+			WHERE sr.id = $1`, returnID).Scan(&refundOrgIDPre)
+		if cashAcct := findAccount(h.db, tenantID, refundOrgIDPre, "cash", "5010"); cashAcct != uuid.Nil {
+			if msg, bad := insufficientFunds(h.db, cashAcct, totalAmount); bad {
+				response.BadRequest(c, msg)
+				return
+			}
+		}
+	}
+
 	// Update return status — 'refunded' is terminal and blocks repeat refunds
 	result, err := h.db.Exec(`
 		UPDATE sales_returns SET refund_status = 'processed', refund_method = $1, refund_date = $2, status = 'refunded', updated_at = $3

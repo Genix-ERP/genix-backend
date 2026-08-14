@@ -239,6 +239,14 @@ func (h *Handler) CreateDividendDistribution(c *gin.Context) {
 	journalEntryID := uuid.New()
 	now := time.Now()
 
+	// The kassa must cover the net actually handed to the shareholder before
+	// any line is written — this path used to pay out regardless and leave a
+	// negative cash balance behind.
+	if msg, bad := insufficientFunds(tx, cashID, net); bad {
+		response.BadRequest(c, msg)
+		return
+	}
+
 	if _, err := tx.Exec(`
 		INSERT INTO journal_entries (
 			id, tenant_id, organization_id, journal_id, entry_number,
