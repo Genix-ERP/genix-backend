@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/google/uuid"
 )
 
@@ -191,4 +194,44 @@ func (h *Handler) ensureDefaultChart(tenantID uuid.UUID, orgID *uuid.UUID) bool 
 	h.log.Info("self-healed missing chart of accounts at posting time",
 		"tenant_id", tenantID, "org_id", target)
 	return true
+}
+
+// insufficientFunds reports whether a cash/bank account cannot cover an
+// outgoing amount, returning the ready-to-show Uzbek refusal.
+//
+// The rule lived inline in ConfirmPayment, PayExpense, the payroll payment
+// and the kassa/bank withdrawal endpoints — and was simply absent from three
+// other paths that also hand money out (loan disbursement, dividend payment,
+// sales-return cash refund), so those could drive a kassa negative. The
+// database backstop from migration 192 does not help: it matches the legacy
+// 1000/1010/1100 codes and never the BHMS 5010/5110 these charts actually
+// use.
+//
+// Only cash (50xx) and bank (51xx) accounts are checked. Every other account
+// is allowed to go negative — a receivable or a payable legitimately swings
+// both ways, and blocking that would break ordinary postings.
+//
+// amount must already be in the account's own (base) currency: comparing a
+// raw foreign amount against a base-currency balance is the bug that let a
+// 1,000 USD payment past a 5,000,000 UZS balance.
+func insufficientFunds(q dbQuerier, accountID uuid.UUID, amount float64) (string, bool) {
+	if accountID == uuid.Nil || amount <= 0 {
+		return "", false
+	}
+	var balance float64
+	var code, name string
+	if err := q.QueryRow(
+		`SELECT COALESCE(current_balance, 0), COALESCE(code, ''), COALESCE(name, '')
+		 FROM accounts WHERE id = $1`, accountID,
+	).Scan(&balance, &code, &name); err != nil {
+		return "", false
+	}
+	if !(strings.HasPrefix(code, "50") || strings.HasPrefix(code, "51")) {
+		return "", false
+	}
+	if balance+0.001 >= amount {
+		return "", false
+	}
+	return fmt.Sprintf("%s (%s) hisobida mablag' yetarli emas. Joriy balans: %.2f, kerakli summa: %.2f",
+		name, code, balance, amount), true
 }

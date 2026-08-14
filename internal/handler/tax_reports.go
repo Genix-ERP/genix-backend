@@ -534,10 +534,10 @@ func (h *Handler) CalculateTaxReport(c *gin.Context) {
 	// from the same tx connection are open is not supported by lib/pq — the
 	// old in-loop INSERTs failed silently behind the discarded error.
 	type taxBucket struct {
-		taxRateID                  string
-		taxName                    string
-		taxRate                    float64
-		txCount                    int
+		taxRateID                    string
+		taxName                      string
+		taxRate                      float64
+		txCount                      int
 		taxableAmt, taxAmt, totalAmt float64
 	}
 	var salesBuckets []taxBucket
