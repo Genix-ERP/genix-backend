@@ -296,6 +296,10 @@ type CreateSalesInvoiceInput struct {
 	PONumber        string                        `json:"po_number,omitempty"`
 	Notes           string                        `json:"notes,omitempty"`
 	TermsConditions string                        `json:"terms_conditions,omitempty"`
+	// Header-level discount. Was missing here while UpdateSalesInvoice accepted
+	// it, so a discount entered on CREATE vanished on save and reappeared only
+	// if the user edited the invoice afterwards (mobile parity audit, P7).
+	DiscountAmount  float64                       `json:"discount_amount,omitempty" binding:"omitempty,gte=0"`
 	Lines           []CreateSalesInvoiceLineInput `json:"lines" binding:"required,min=1,dive"`
 }
 

@@ -338,7 +338,10 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	// so the stored per-line tax matches the header total.
 	// Shared resolver: price_include honoured, unknown tax_id → 400 rather
 	// than a silent 0% (P4/P5).
-	var subtotal, taxAmount, discountAmount float64
+	// Header discount comes from the input (P7) — same formula as
+	// UpdateSalesInvoice: total = subtotal − discount + tax.
+	var subtotal, taxAmount float64
+	discountAmount := input.DiscountAmount
 	lineIn := make([]invoiceLineIn, len(input.Lines))
 	for i, line := range input.Lines {
 		lineIn[i] = invoiceLineIn{Quantity: line.Quantity, UnitPrice: line.UnitPrice, DiscountAmount: line.DiscountAmount, TaxID: line.TaxID}
