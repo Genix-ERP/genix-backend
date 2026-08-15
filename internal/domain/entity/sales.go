@@ -260,6 +260,13 @@ type UpdateSalesOrderInput struct {
 	ContractID      *string  `json:"contract_id,omitempty"`
 	Status          *string  `json:"status,omitempty"`
 	PaymentStatus   *string  `json:"payment_status,omitempty"`
+	// Lines, when present, REPLACES the order's line set (draft orders only)
+	// and the header totals are recomputed from them with server-side VAT.
+	// Absent (nil) → lines untouched, header-only update as before. Both web
+	// and mobile were already sending this on edit; the struct just did not
+	// have the field, so every line change was silently discarded while the
+	// UI reported "Saqlandi" (mobile parity audit 2026-08-15, P2).
+	Lines *[]CreateSalesOrderLineInput `json:"lines,omitempty"`
 }
 
 // SalesOrderListFilter represents filters for listing sales orders

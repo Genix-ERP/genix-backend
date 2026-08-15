@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 	"github.com/lib/pq"
 )
@@ -329,11 +331,14 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 	userID, _ := middleware.GetUserID(c)
 
 	var input SimpleSalesOrderInput
-	if err := c.ShouldBindJSON(&input); err != nil {
+	// BodyWith (not JSON) so the raw bytes stay available for the unread-
+	// field probe below — see warnUnreadTaxFields.
+	if err := c.ShouldBindBodyWith(&input, binding.JSON); err != nil {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
 		return
 	}
+	h.warnUnreadTaxFields(c, "sales_order", "tax_amount")
 
 	// Handle customer - either by ID or by name lookup
 	var customerID uuid.UUID
@@ -407,17 +412,27 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		shippingAmount = input.ShippingCost
 	}
 
+	// Per-line VAT is resolved ONCE here (tax_id → tax_rates, honouring
+	// price_include) and reused when the lines are inserted below, so the
+	// header and the stored lines cannot disagree. An unknown tax_id is a
+	// 400, not a silent 0% (P4/P5, mobile parity audit 2026-08-15).
+	orderLines, lineCalcErr := h.computeSalesOrderLines(tenantID, input.Lines)
+	if lineCalcErr != nil {
+		if errors.Is(lineCalcErr, errTaxRateNotFound) {
+			response.BadRequest(c, taxRateNotFoundMessage(lineCalcErr))
+			return
+		}
+		h.log.Error("Failed to resolve line taxes", "error", lineCalcErr)
+		response.InternalError(c, "Failed to create sales order")
+		return
+	}
+
 	if len(input.Lines) > 0 {
 		// Calculate from lines
-		for _, line := range input.Lines {
-			lineTotal := line.Quantity * line.UnitPrice
-			var lineDiscount float64
-			if line.DiscountType == "percentage" && line.DiscountValue > 0 {
-				lineDiscount = lineTotal * line.DiscountValue / 100
-			} else if line.DiscountType == "fixed" && line.DiscountValue > 0 {
-				lineDiscount = line.DiscountValue
-			}
-			subtotal += lineTotal - lineDiscount
+		computedLineTax := 0.0
+		for _, ol := range orderLines {
+			subtotal += ol.Base
+			computedLineTax += ol.Tax
 		}
 		// Apply order-level discount - prefer frontend's calculated discount_amount
 		if input.DiscountAmount > 0 {
@@ -427,12 +442,17 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		} else if input.DiscountType == "fixed" && input.DiscountValue > 0 {
 			discountAmount = input.DiscountValue
 		}
-		// Use frontend's tax_amount if provided
-		if input.TaxAmount > 0 {
+		// Header tax: the lines' own tax_ids are authoritative when present.
+		// A client-supplied tax_amount is honoured only for lines that carry
+		// no tax_id at all (legacy web path that computed VAT itself).
+		if computedLineTax > 0 {
+			taxAmount = computedLineTax
+		} else if input.TaxAmount > 0 {
 			taxAmount = input.TaxAmount
 		}
-		// Use frontend's total if provided, otherwise calculate
-		if input.TotalAmount > 0 {
+		// Use frontend's total if provided AND lines carry no tax_ids
+		// (otherwise the server-derived figure is the only consistent one).
+		if input.TotalAmount > 0 && computedLineTax == 0 {
 			totalAmount = input.TotalAmount
 		} else {
 			totalAmount = subtotal - discountAmount + taxAmount + shippingAmount
@@ -640,42 +660,25 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		return
 	}
 
-	// Insert order lines. Line VAT is computed here from tax_id → tax_rates
-	// (the old code INSERTed tax_amount as a literal 0.0, so even a line
-	// with a tax_id carried no tax and the invoice built from it had none —
-	// soliq audit 2026-08-13).
-	taxRateCache := map[string]float64{}
-	computedLineTax := 0.0
+	// Insert order lines using the per-line figures resolved above (base
+	// after discount and inclusive/exclusive VAT split), so what is stored
+	// per line is exactly what the header was summed from.
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 		productID, _ := uuid.Parse(line.ProductID)
 
-		lineTotal := line.Quantity * line.UnitPrice
-		var lineDiscount float64
-		if line.DiscountType == "percentage" && line.DiscountValue > 0 {
-			lineDiscount = lineTotal * line.DiscountValue / 100
-		} else if line.DiscountType == "fixed" && line.DiscountValue > 0 {
-			lineDiscount = line.DiscountValue
-		}
+		lineDiscount := orderLines[i].Discount
+		lineTax := orderLines[i].Tax
+		lineBase := orderLines[i].Base
 
 		var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
 		if line.UnitID != "" {
 			id, _ := uuid.Parse(line.UnitID)
 			unitID = &id
 		}
-		lineTax := 0.0
 		if line.TaxID != "" {
 			id, _ := uuid.Parse(line.TaxID)
 			taxID = &id
-			rate, cached := taxRateCache[line.TaxID]
-			if !cached {
-				_ = h.db.QueryRow(
-					`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
-					id, tenantID).Scan(&rate)
-				taxRateCache[line.TaxID] = rate
-			}
-			lineTax = (lineTotal - lineDiscount) * rate / 100.0
-			computedLineTax += lineTax
 		}
 		if line.WarehouseID != "" {
 			id, _ := uuid.Parse(line.WarehouseID)
@@ -697,7 +700,7 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 		if _, execErr := h.db.Exec(lineQuery,
 			lineID, orderID, i+1, productID, line.Description,
 			line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, lineDiscount,
-			taxID, lineTax, lineTotal-lineDiscount, 0.0, 0.0,
+			taxID, lineTax, lineBase, 0.0, 0.0,
 			lineWarehouseID, line.Notes, packagingID, line.PackagingQty, now, now,
 		); execErr != nil {
 
@@ -705,18 +708,8 @@ func (h *Handler) CreateSalesOrder(c *gin.Context) {
 
 		}
 	}
-
-	// The client's header tax_amount wins when provided; when it sent none
-	// but the lines carry tax_ids, derive the header from the computed line
-	// taxes so header and lines agree.
-	if input.TaxAmount == 0 && computedLineTax > 0 {
-		if _, execErr := h.db.Exec(`
-			UPDATE sales_orders SET tax_amount = $1, total_amount = total_amount + $1, updated_at = $2
-			WHERE id = $3 AND tenant_id = $4`,
-			computedLineTax, now, orderID, tenantID); execErr != nil {
-			h.log.Error("Failed to sync order header tax from lines", "error", execErr)
-		}
-	}
+	// (Header tax/total were already derived from these same line figures
+	// above, so no post-insert header sync is needed.)
 
 	// Intercompany: PO will be created when SO is confirmed, not at creation time
 
@@ -1109,7 +1102,7 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		input.Reference == nil && input.PONumber == nil && input.Notes == nil &&
 		input.InternalNotes == nil && input.WarehouseID == nil && input.Carrier == nil &&
 		input.SalesRepID == nil && input.PaymentStatus == nil &&
-		input.CustomerID == nil && input.CustomerName == nil
+		input.CustomerID == nil && input.CustomerName == nil && input.Lines == nil
 
 	if !isStatusOnlyUpdate && currentStatus != string(entity.OrderStatusDraft) {
 		response.BadRequest(c, "Can only update order details in draft status")
@@ -1321,6 +1314,132 @@ func (h *Handler) UpdateSalesOrder(c *gin.Context) {
 		// write would fake money that finance has never seen.
 		response.BadRequest(c, "payment_status is derived from payments and cannot be set directly")
 		return
+	}
+
+	// Line replacement (P2). Only for drafts — the status guard above already
+	// enforces that. Resolve VAT server-side (price_include honoured, unknown
+	// tax_id → 400), delete-and-reinsert the line set, and fold the
+	// recomputed header figures into this same UPDATE so header and lines
+	// land together.
+	if input.Lines != nil {
+		newLines := *input.Lines
+		if len(newLines) == 0 {
+			response.BadRequest(c, "Buyurtmada kamida bitta qator bo'lishi kerak")
+			return
+		}
+		calc, cerr := h.computeSalesOrderLines(tenantID, newLines)
+		if cerr != nil {
+			if errors.Is(cerr, errTaxRateNotFound) {
+				response.BadRequest(c, taxRateNotFoundMessage(cerr))
+				return
+			}
+			h.log.Error("Failed to resolve line taxes on update", "error", cerr)
+			response.InternalError(c, "Failed to update sales order")
+			return
+		}
+
+		var newSubtotal, newTax float64
+		for _, cl := range calc {
+			newSubtotal += cl.Base
+			newTax += cl.Tax
+		}
+		// Header discount/shipping: what this request sets, else what is stored.
+		var curDiscType sql.NullString
+		var curDiscVal, curDiscAmt, curShip float64
+		_ = h.db.QueryRow(`
+			SELECT discount_type, COALESCE(discount_value,0), COALESCE(discount_amount,0), COALESCE(shipping_amount,0)
+			FROM sales_orders WHERE id = $1 AND tenant_id = $2`, orderID, tenantID).
+			Scan(&curDiscType, &curDiscVal, &curDiscAmt, &curShip)
+		discType := curDiscType.String
+		if input.DiscountType != nil {
+			discType = *input.DiscountType
+		}
+		discVal := curDiscVal
+		if input.DiscountValue != nil {
+			discVal = *input.DiscountValue
+		}
+		newDiscount := 0.0
+		switch {
+		case discType == "percentage" && discVal > 0:
+			newDiscount = newSubtotal * discVal / 100
+		case discType == "fixed" && discVal > 0:
+			newDiscount = discVal
+		case input.DiscountType == nil && input.DiscountValue == nil:
+			newDiscount = curDiscAmt // untouched header discount stays as stored
+		}
+		ship := curShip
+		if input.ShippingAmount != nil {
+			ship = *input.ShippingAmount
+		}
+		newTotal := newSubtotal - newDiscount + newTax + ship
+
+		tx, terr := h.db.Begin()
+		if terr != nil {
+			response.InternalError(c, "Failed to update sales order")
+			return
+		}
+		if _, derr := tx.Exec(`DELETE FROM sales_order_lines WHERE sales_order_id = $1`, orderID); derr != nil {
+			tx.Rollback()
+			h.log.Error("Failed to clear order lines", "error", derr)
+			response.InternalError(c, "Failed to update sales order")
+			return
+		}
+		nowL := time.Now()
+		for i, line := range newLines {
+			productID, _ := uuid.Parse(line.ProductID)
+			var unitID, taxID, lineWarehouseID, packagingID *uuid.UUID
+			if line.UnitID != "" {
+				if id, e := uuid.Parse(line.UnitID); e == nil {
+					unitID = &id
+				}
+			}
+			if line.TaxID != "" {
+				if id, e := uuid.Parse(line.TaxID); e == nil {
+					taxID = &id
+				}
+			}
+			if line.WarehouseID != "" {
+				if id, e := uuid.Parse(line.WarehouseID); e == nil {
+					lineWarehouseID = &id
+				}
+			}
+			if line.PackagingID != "" {
+				if id, e := uuid.Parse(line.PackagingID); e == nil {
+					packagingID = &id
+				}
+			}
+			if _, ierr := tx.Exec(`
+				INSERT INTO sales_order_lines (
+					id, sales_order_id, line_number, product_id, description,
+					quantity, unit_id, unit_price, discount_type, discount_value, discount_amount,
+					tax_id, tax_amount, line_total, quantity_delivered, quantity_invoiced,
+					warehouse_id, notes, packaging_id, packaging_qty, created_at, updated_at
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,0,0,$15,$16,$17,$18,$19,$19)`,
+				uuid.New(), orderID, i+1, productID, line.Description,
+				line.Quantity, unitID, line.UnitPrice, line.DiscountType, line.DiscountValue, calc[i].Discount,
+				taxID, calc[i].Tax, calc[i].Base,
+				lineWarehouseID, line.Notes, packagingID, line.PackagingQty, nowL,
+			); ierr != nil {
+				tx.Rollback()
+				h.log.Error("Failed to insert order line on update", "error", ierr)
+				response.InternalError(c, "Failed to update sales order")
+				return
+			}
+		}
+		if cerr := tx.Commit(); cerr != nil {
+			h.log.Error("Failed to commit order lines", "error", cerr)
+			response.InternalError(c, "Failed to update sales order")
+			return
+		}
+
+		for _, kv := range []struct {
+			col string
+			val float64
+		}{{"subtotal", newSubtotal}, {"discount_amount", newDiscount}, {"tax_amount", newTax}, {"total_amount", newTotal}} {
+			argCount++
+			updates = append(updates, fmt.Sprintf("%s = $%d", kv.col, argCount))
+			args = append(args, kv.val)
+		}
 	}
 
 	if len(updates) == 0 {
