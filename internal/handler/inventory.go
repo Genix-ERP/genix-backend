@@ -5906,16 +5906,29 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 	direction := c.Query("direction") // receipt, delivery, internal, write_off
 	state := c.Query("state")         // draft, in_progress, waiting, done, cancelled
 	partnerID := c.Query("partner_id")
-	limit := 50
+	search := strings.TrimSpace(c.Query("search"))
 
-	query := `
-		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
-		       so.state, so.current_step, so.total_steps, so.priority,
-		       so.source_document, so.note, so.write_off_reason,
-		       so.operation_type_id, wot.name as operation_type_name,
-		       so.partner_id, COALESCE(c.name, cp.name) as partner_name,
-		       COALESCE(w.name, '') as warehouse_name,
-		       so.created_at, so.updated_at
+	// Pagination. Default limit stays 50 — that is what the parameterless
+	// web call has always received, so the web keeps its exact behaviour;
+	// mobile sends explicit page/limit for infinite scroll. Before this the
+	// limit was a hard-coded 50 with no offset and no total, so the 51st
+	// operation onward was unreachable from any client.
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", c.DefaultQuery("page_size", "50")))
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 {
+		limit = 50
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+
+	// FROM/WHERE are built once and shared by the COUNT and the page query
+	// so a filter can never apply to one and not the other.
+	fromWhere := `
 		FROM stock_operations so
 		LEFT JOIN warehouse_operation_types wot ON so.operation_type_id = wot.id
 		LEFT JOIN warehouses w ON wot.warehouse_id = w.id
@@ -5924,6 +5937,7 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		LEFT JOIN construction_projects cp ON cp.id = cmr.project_id
 		WHERE so.tenant_id = $1 AND so.deleted_at IS NULL
 	`
+	query := fromWhere // filters are appended to this; SELECT is prepended below
 	args := []interface{}{tenantID}
 	argN := 1
 
@@ -5959,8 +5973,35 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 			args = append(args, pid)
 		}
 	}
+	if search != "" {
+		// Server-side search over the columns the list shows: document
+		// name, partner (contact or construction project), and the source
+		// document reference. Was ignored entirely — mobile filtered the
+		// loaded page client-side, which stops working once there IS a page.
+		argN++
+		query += fmt.Sprintf(` AND (so.name ILIKE '%%' || $%d || '%%'
+			OR COALESCE(c.name, cp.name) ILIKE '%%' || $%d || '%%'
+			OR so.source_document ILIKE '%%' || $%d || '%%')`, argN, argN, argN)
+		args = append(args, search)
+	}
 
-	query += fmt.Sprintf(" ORDER BY so.created_at DESC LIMIT %d", limit)
+	// Total with the SAME filters, before ORDER/LIMIT/OFFSET are appended.
+	var total int
+	if err := h.db.QueryRow("SELECT COUNT(*)"+query, args...).Scan(&total); err != nil {
+		h.log.Error("Failed to count stock operations", "error", err)
+		response.InternalError(c, "Failed to list stock operations")
+		return
+	}
+
+	selectCols := `
+		SELECT so.id, so.name, so.direction, so.date, so.scheduled_date,
+		       so.state, so.current_step, so.total_steps, so.priority,
+		       so.source_document, so.note, so.write_off_reason,
+		       so.operation_type_id, wot.name as operation_type_name,
+		       so.partner_id, COALESCE(c.name, cp.name) as partner_name,
+		       COALESCE(w.name, '') as warehouse_name,
+		       so.created_at, so.updated_at`
+	query = selectCols + query + fmt.Sprintf(" ORDER BY so.created_at DESC LIMIT %d OFFSET %d", limit, offset)
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
@@ -6011,7 +6052,9 @@ func (h *Handler) ListStockOperations(c *gin.Context) {
 		ops = append(ops, &op)
 	}
 
-	response.Success(c, ops)
+	// The array stays under `data`, so the web's `response.data.data` read
+	// is unaffected; `meta` is what mobile's infinite scroll consumes.
+	response.Paginated(c, ops, page, limit, total)
 }
 
 // GetStockOperation returns a single stock operation with lines and step logs
@@ -8901,7 +8944,26 @@ func (h *Handler) SaveOperationTypeSteps(c *gin.Context) {
 	response.Success(c, map[string]interface{}{"saved": len(steps)})
 }
 
-// GetStockOperationSummary returns counts by direction and state
+// stockOpDirections is the fixed set the summary always reports, in display
+// order, so a client can render four cards without checking which directions
+// happen to have rows.
+var stockOpDirections = []string{"receipt", "delivery", "internal", "write_off"}
+
+// GetStockOperationSummary returns, per direction, the total and a per-state
+// breakdown — the four cards on the Amaliyotlar screen, ready to render.
+//
+// It used to return the raw (direction, state, count) grouping and leave the
+// roll-up to the client. Mobile summed six named states by hand, so a new
+// state on the server would silently drop out of the card total. `total` is
+// now COUNT(*) on the server: it is correct by construction whatever states
+// exist. Every direction is always present (zeros when empty), and the figures
+// are for the whole tenant/organization — deliberately NOT tied to the list's
+// filters, because the cards describe the whole picture while the list below
+// them is filtered.
+//
+// `total` includes cancelled, matching what mobile's own roll-up produced;
+// `active_total` excludes it for a client that wants "still counts" without
+// doing subtraction.
 func (h *Handler) GetStockOperationSummary(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -8911,7 +8973,15 @@ func (h *Handler) GetStockOperationSummary(c *gin.Context) {
 	organizationID, hasOrg := middleware.GetOrganizationID(c)
 
 	query := `
-		SELECT direction, state, COUNT(*) as cnt
+		SELECT direction,
+		       COUNT(*)                                            AS total,
+		       COUNT(*) FILTER (WHERE state <> 'cancelled')        AS active_total,
+		       COUNT(*) FILTER (WHERE state = 'done')              AS done,
+		       COUNT(*) FILTER (WHERE state = 'in_progress')       AS in_progress,
+		       COUNT(*) FILTER (WHERE state = 'draft')             AS draft,
+		       COUNT(*) FILTER (WHERE state = 'waiting')           AS waiting,
+		       COUNT(*) FILTER (WHERE state = 'awaiting_approval') AS awaiting_approval,
+		       COUNT(*) FILTER (WHERE state = 'cancelled')         AS cancelled
 		FROM stock_operations
 		WHERE tenant_id=$1 AND deleted_at IS NULL
 	`
@@ -8920,25 +8990,53 @@ func (h *Handler) GetStockOperationSummary(c *gin.Context) {
 		query += " AND organization_id = $2"
 		args = append(args, organizationID)
 	}
-	query += " GROUP BY direction, state"
+	query += " GROUP BY direction"
 
 	rows, err := h.db.Query(query, args...)
 	if err != nil {
+		h.log.Error("Failed to get stock operation summary", "error", err)
 		response.InternalError(c, "Failed to get summary")
 		return
 	}
 	defer rows.Close()
 
 	type entry struct {
-		Direction string `json:"direction"`
-		State     string `json:"state"`
-		Count     int    `json:"count"`
+		Direction        string `json:"direction"`
+		Total            int    `json:"total"`
+		ActiveTotal      int    `json:"active_total"`
+		Done             int    `json:"done"`
+		InProgress       int    `json:"in_progress"`
+		Draft            int    `json:"draft"`
+		Waiting          int    `json:"waiting"`
+		AwaitingApproval int    `json:"awaiting_approval"`
+		Cancelled        int    `json:"cancelled"`
 	}
-	result := make([]entry, 0)
+	byDir := map[string]entry{}
 	for rows.Next() {
 		var e entry
-		rows.Scan(&e.Direction, &e.State, &e.Count)
+		if err := rows.Scan(&e.Direction, &e.Total, &e.ActiveTotal, &e.Done, &e.InProgress,
+			&e.Draft, &e.Waiting, &e.AwaitingApproval, &e.Cancelled); err != nil {
+			continue
+		}
+		byDir[e.Direction] = e
+	}
+
+	// Emit the fixed direction set in order, zero-filled where absent, then
+	// any direction the DB knows that this list does not (forward-compatible).
+	result := make([]entry, 0, len(stockOpDirections))
+	seen := map[string]bool{}
+	for _, d := range stockOpDirections {
+		e, ok := byDir[d]
+		if !ok {
+			e = entry{Direction: d}
+		}
 		result = append(result, e)
+		seen[d] = true
+	}
+	for d, e := range byDir {
+		if !seen[d] {
+			result = append(result, e)
+		}
 	}
 
 	response.Success(c, result)
