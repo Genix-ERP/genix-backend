@@ -183,8 +183,11 @@ func (h *Handler) ListExpenseCategories(c *gin.Context) {
 // when omitted we slugify the name so the existing UNIQUE(tenant_id, code)
 // constraint keeps holding without forcing the user to invent one.
 type expenseCategoryRequest struct {
-	Name        string  `json:"name" binding:"required"`
-	Code        string  `json:"code"`
+	Name string `json:"name" binding:"required"`
+	// Pointer so UpdateExpenseCategory can tell "not sent" (leave the stored
+	// code alone) from "sent empty" (regenerate from the name). Create treats
+	// nil and "" the same.
+	Code        *string `json:"code"`
 	Description *string `json:"description"`
 	AccountID   *string `json:"account_id"`
 	IsActive    *bool   `json:"is_active"`
@@ -281,7 +284,7 @@ func (h *Handler) CreateExpenseCategory(c *gin.Context) {
 		return
 	}
 
-	code := strings.TrimSpace(req.Code)
+	code := strings.TrimSpace(valueOrEmpty(req.Code))
 	if code == "" {
 		code = slugifyCategoryCode(name)
 	}
@@ -352,6 +355,9 @@ func (h *Handler) CreateExpenseCategory(c *gin.Context) {
 // UpdateExpenseCategory edits a category. Only the fields explicitly
 // present in the JSON body are touched so the UI can do partial updates
 // (e.g. "just change the account") without overwriting every column.
+// `name` is the one required field. Sending `code: ""` regenerates the code
+// from the name; omitting `code` leaves the stored code alone. Same for
+// is_active: omitted → unchanged (an archived category stays archived).
 func (h *Handler) UpdateExpenseCategory(c *gin.Context) {
 	tenantID, ok := middleware.GetTenantID(c)
 	if !ok || tenantID == uuid.Nil {
@@ -376,53 +382,73 @@ func (h *Handler) UpdateExpenseCategory(c *gin.Context) {
 		response.BadRequest(c, "Name is required")
 		return
 	}
-	code := strings.TrimSpace(req.Code)
-	if code == "" {
-		code = slugifyCategoryCode(name)
+	// Partial update, for real this time (mobile parity audit, P8). The old
+	// SQL SET every column unconditionally, so a client changing only the
+	// name got its code regenerated (OFIS → OFIS_XARAJATLARI) and an archived
+	// category silently re-activated because is_active defaulted to true.
+	// Now only fields present in the body are written; name is the one
+	// required field.
+	sets := []string{"name = $1", "updated_at = NOW()"}
+	args := []interface{}{name}
+	add := func(col string, v interface{}) {
+		args = append(args, v)
+		sets = append(sets, fmt.Sprintf("%s = $%d", col, len(args)))
 	}
 
-	var accountID *uuid.UUID
-	if req.AccountID != nil && *req.AccountID != "" {
-		aid, err := uuid.Parse(*req.AccountID)
-		if err != nil {
-			response.BadRequest(c, "Invalid account_id")
-			return
+	if req.Code != nil {
+		code := strings.TrimSpace(*req.Code)
+		if code == "" {
+			code = slugifyCategoryCode(name) // sent empty → regenerate, as before
 		}
-		var exists bool
-		if err := h.db.QueryRow(
-			`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND tenant_id = $2)`,
-			aid, tenantID,
-		).Scan(&exists); err != nil || !exists {
-			response.BadRequest(c, "Account not found in this tenant")
-			return
-		}
-		accountID = &aid
+		add("code", code)
 	}
 
-	var description sql.NullString
+	if req.AccountID != nil {
+		if *req.AccountID == "" {
+			add("account_id", nil) // explicit clear
+		} else {
+			aid, err := uuid.Parse(*req.AccountID)
+			if err != nil {
+				response.BadRequest(c, "Invalid account_id")
+				return
+			}
+			var exists bool
+			if err := h.db.QueryRow(
+				`SELECT EXISTS(SELECT 1 FROM accounts WHERE id = $1 AND tenant_id = $2)`,
+				aid, tenantID,
+			).Scan(&exists); err != nil || !exists {
+				response.BadRequest(c, "Account not found in this tenant")
+				return
+			}
+			add("account_id", aid)
+		}
+	}
+
 	if req.Description != nil {
 		trimmed := strings.TrimSpace(*req.Description)
-		if trimmed != "" {
-			description = sql.NullString{String: trimmed, Valid: true}
+		if trimmed == "" {
+			add("description", nil)
+		} else {
+			add("description", trimmed)
 		}
 	}
-
-	isActive := true
 	if req.IsActive != nil {
-		isActive = *req.IsActive
+		add("is_active", *req.IsActive)
+	}
+	if c := strings.TrimSpace(valueOrEmpty(req.Color)); c != "" {
+		add("color", c)
+	}
+	if ic := strings.TrimSpace(valueOrEmpty(req.Icon)); ic != "" {
+		add("icon", ic)
+	}
+	if req.Position != nil {
+		add("position", *req.Position)
 	}
 
-	res, err := h.db.Exec(`
-		UPDATE expense_categories
-		   SET name = $1, code = $2, description = $3, account_id = $4, is_active = $5,
-		       color = COALESCE(NULLIF($6, ''), color),
-		       icon = COALESCE(NULLIF($7, ''), icon),
-		       position = COALESCE($8, position),
-		       updated_at = NOW()
-		 WHERE id = $9 AND tenant_id = $10
-	`, name, code, description, accountID, isActive,
-		strings.TrimSpace(valueOrEmpty(req.Color)), strings.TrimSpace(valueOrEmpty(req.Icon)), req.Position,
-		id, tenantID)
+	args = append(args, id, tenantID)
+	res, err := h.db.Exec(fmt.Sprintf(`
+		UPDATE expense_categories SET %s WHERE id = $%d AND tenant_id = $%d`,
+		strings.Join(sets, ", "), len(args)-1, len(args)), args...)
 	if err != nil {
 		if strings.Contains(err.Error(), "duplicate") || strings.Contains(err.Error(), "unique") {
 			response.BadRequest(c, "Category code already exists")
