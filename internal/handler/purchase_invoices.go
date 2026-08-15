@@ -2,6 +2,7 @@ package handler
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 )
 
@@ -243,11 +245,12 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 			TaxID          string  `json:"tax_id"`
 		} `json:"lines" binding:"omitempty,dive"`
 	}
-	if err := c.ShouldBindJSON(&input); err != nil {
+	if err := c.ShouldBindBodyWith(&input, binding.JSON); err != nil {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
 		return
 	}
+	h.warnUnreadTaxFields(c, "purchase_invoice", "tax_amount")
 
 	// Use partner_id if vendor_id is empty (frontend sends partner_id)
 	vendorIDStr := input.VendorID
@@ -292,27 +295,27 @@ func (h *Handler) CreatePurchaseInvoice(c *gin.Context) {
 	lineNets := make([]float64, len(input.Lines))
 	if len(input.Lines) > 0 {
 		subtotal, taxAmount = 0, 0
-		// One lookup per distinct tax, mirroring CreateSalesInvoice.
-		taxRateCache := make(map[string]float64)
+		// Shared resolver, mirroring CreateSalesInvoice: price_include
+		// honoured, unknown tax_id → 400 (P4/P5).
+		lineIn := make([]invoiceLineIn, len(input.Lines))
 		for i, line := range input.Lines {
-			lineNet := line.Quantity*line.UnitPrice - line.DiscountAmount
-			lineNets[i] = lineNet
-			subtotal += lineNet
-
-			if line.TaxID != "" {
-				rate, cached := taxRateCache[line.TaxID]
-				if !cached {
-					if tid, perr := uuid.Parse(line.TaxID); perr == nil {
-						_ = h.db.QueryRow(
-							`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
-							tid, tenantID,
-						).Scan(&rate)
-					}
-					taxRateCache[line.TaxID] = rate
-				}
-				lineTaxAmounts[i] = lineNet * rate / 100.0
-				taxAmount += lineTaxAmounts[i]
+			lineIn[i] = invoiceLineIn{Quantity: line.Quantity, UnitPrice: line.UnitPrice, DiscountAmount: line.DiscountAmount, TaxID: line.TaxID}
+		}
+		lineCalc, calcErr := h.computeInvoiceLines(tenantID, lineIn)
+		if calcErr != nil {
+			if errors.Is(calcErr, errTaxRateNotFound) {
+				response.BadRequest(c, taxRateNotFoundMessage(calcErr))
+				return
 			}
+			h.log.Error("Failed to resolve line taxes", "error", calcErr)
+			response.InternalError(c, "Failed to create purchase invoice")
+			return
+		}
+		for i, lc := range lineCalc {
+			lineNets[i] = lc.Base
+			lineTaxAmounts[i] = lc.Tax
+			subtotal += lc.Base
+			taxAmount += lc.Tax
 		}
 		totalAmount = subtotal + taxAmount
 	} else if totalAmount == 0 {

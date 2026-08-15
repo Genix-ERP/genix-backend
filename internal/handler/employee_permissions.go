@@ -405,78 +405,129 @@ func (h *Handler) GetCurrentUserPermissions(c *gin.Context) {
 		return
 	}
 
-	// If no linked employee, return empty permissions
-	if !employeeID.Valid {
-		response.Success(c, gin.H{
-			"is_admin":    false,
-			"permissions": map[string]interface{}{},
-		})
-		return
+	// The API guard (middleware.PermissionChecker.loadPermissions) grants
+	// access from TWO sources — role_permissions via user_roles, and
+	// employee_module_permissions via users.employee_id — but this endpoint,
+	// which is what the web sidebar and the mobile "Modullar" screen render
+	// from, used to read only the second and returned {} outright when the
+	// user had no linked employee. A user whose access came through a role
+	// could therefore call every API successfully and still see an empty
+	// menu. Both sources are merged here with OR semantics: a permission
+	// granted by either is granted.
+	permissions := make(map[string]*ModulePermission)
+	grant := func(moduleID string, create, read, update, del bool) {
+		p, ok := permissions[moduleID]
+		if !ok {
+			p = &ModulePermission{ModuleID: moduleID}
+			permissions[moduleID] = p
+		}
+		p.CanCreate = p.CanCreate || create
+		p.CanRead = p.CanRead || read
+		p.CanUpdate = p.CanUpdate || update
+		p.CanDelete = p.CanDelete || del
 	}
 
-	empID, err := uuid.Parse(employeeID.String)
+	// 1. Role permissions. permissions.action is one of create/read/update/
+	//    delete plus the "special" verbs (manage, approve, confirm, post,
+	//    adjust, transfer) which the middleware treats as update-class; the
+	//    same folding is used here so the UI matches what the API allows.
+	roleRows, err := h.db.Query(`
+		SELECT DISTINCT p.module, p.action
+		FROM permissions p
+		INNER JOIN role_permissions rp ON rp.permission_id = p.id
+		INNER JOIN user_roles ur ON ur.role_id = rp.role_id
+		INNER JOIN roles r ON r.id = ur.role_id AND r.tenant_id = $1
+		WHERE ur.user_id = $2
+	`, tenantID, userID)
 	if err != nil {
-		response.Success(c, gin.H{
-			"is_admin":    false,
-			"permissions": map[string]interface{}{},
-		})
-		return
-	}
-
-	// Fetch permissions for the linked employee
-	query := `
-		SELECT id, module_id, can_create, can_read, can_update, can_delete, created_at, updated_at
-		FROM employee_module_permissions
-		WHERE tenant_id = $1 AND employee_id = $2
-	`
-
-	rows, err := h.db.Query(query, tenantID, empID)
-	if err != nil {
-		h.log.Error("Failed to fetch user permissions", "error", err)
+		h.log.Error("Failed to fetch role permissions", "error", err)
 		response.InternalError(c, "Failed to fetch permissions")
 		return
 	}
-	defer rows.Close()
-
-	permissions := make(map[string]*ModulePermission)
-	for rows.Next() {
-		var perm ModulePermission
-		err := rows.Scan(&perm.ID, &perm.ModuleID, &perm.CanCreate, &perm.CanRead, &perm.CanUpdate, &perm.CanDelete, &perm.CreatedAt, &perm.UpdatedAt)
-		if err != nil {
-			h.log.Error("Failed to scan permission", "error", err)
+	for roleRows.Next() {
+		var module, action string
+		if err := roleRows.Scan(&module, &action); err != nil {
 			continue
 		}
-		permissions[perm.ModuleID] = &perm
+		switch action {
+		case "create":
+			grant(module, true, false, false, false)
+		case "read", "view", "list":
+			grant(module, false, true, false, false)
+		case "update", "edit", "manage", "approve", "confirm", "post", "adjust", "transfer":
+			// Anything that changes state implies being able to see it.
+			grant(module, false, true, true, false)
+		case "delete":
+			grant(module, false, false, false, true)
+		}
 	}
+	roleRows.Close()
 
-	// Fetch organization IDs this employee has access to
-	orgQuery := `
-		SELECT organization_id FROM employee_organizations
-		WHERE tenant_id = $1 AND employee_id = $2
-	`
-	orgRows, err := h.db.Query(orgQuery, tenantID, empID)
-	if err != nil {
-		h.log.Error("Failed to fetch employee organizations", "error", err)
-		// Don't fail the request, just return empty org list
+	// 2. Employee module permissions (when the user is linked to an employee).
+	var empID uuid.UUID
+	if employeeID.Valid {
+		if parsed, perr := uuid.Parse(employeeID.String); perr == nil {
+			empID = parsed
+		}
 	}
-
-	var organizationIDs []string
-	if orgRows != nil {
-		defer orgRows.Close()
-		for orgRows.Next() {
-			var orgID uuid.UUID
-			if err := orgRows.Scan(&orgID); err == nil {
-				organizationIDs = append(organizationIDs, orgID.String())
+	if empID != uuid.Nil {
+		rows, err := h.db.Query(`
+			SELECT id, module_id, can_create, can_read, can_update, can_delete, created_at, updated_at
+			FROM employee_module_permissions
+			WHERE tenant_id = $1 AND employee_id = $2
+		`, tenantID, empID)
+		if err != nil {
+			h.log.Error("Failed to fetch user permissions", "error", err)
+			response.InternalError(c, "Failed to fetch permissions")
+			return
+		}
+		for rows.Next() {
+			var perm ModulePermission
+			if err := rows.Scan(&perm.ID, &perm.ModuleID, &perm.CanCreate, &perm.CanRead, &perm.CanUpdate, &perm.CanDelete, &perm.CreatedAt, &perm.UpdatedAt); err != nil {
+				h.log.Error("Failed to scan permission", "error", err)
+				continue
 			}
+			grant(perm.ModuleID, perm.CanCreate, perm.CanRead, perm.CanUpdate, perm.CanDelete)
+			// Keep the row identity/timestamps when the employee row is the
+			// source, so clients that show "granted on" keep working.
+			if p := permissions[perm.ModuleID]; p != nil && p.ID == uuid.Nil {
+				p.ID, p.CreatedAt, p.UpdatedAt = perm.ID, perm.CreatedAt, perm.UpdatedAt
+			}
+		}
+		rows.Close()
+	}
+
+	// Organization IDs this employee has access to (employee-linked users only;
+	// role-only users are scoped by the tenant, not by an employee assignment).
+	var organizationIDs []string
+	if empID != uuid.Nil {
+		orgRows, err := h.db.Query(`
+			SELECT organization_id FROM employee_organizations
+			WHERE tenant_id = $1 AND employee_id = $2
+		`, tenantID, empID)
+		if err != nil {
+			h.log.Error("Failed to fetch employee organizations", "error", err)
+			// Don't fail the request, just return empty org list
+		} else {
+			for orgRows.Next() {
+				var orgID uuid.UUID
+				if err := orgRows.Scan(&orgID); err == nil {
+					organizationIDs = append(organizationIDs, orgID.String())
+				}
+			}
+			orgRows.Close()
 		}
 	}
 
-	response.Success(c, gin.H{
+	resp := gin.H{
 		"is_admin":         false,
-		"employee_id":      empID,
 		"permissions":      permissions,
 		"organization_ids": organizationIDs,
-	})
+	}
+	if empID != uuid.Nil {
+		resp["employee_id"] = empID
+	}
+	response.Success(c, resp)
 }
 
 // GetCurrentUserOrganizations returns full organization details for the current user's employee

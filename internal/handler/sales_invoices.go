@@ -3,6 +3,7 @@ package handler
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/genixerp/genix-backend/internal/middleware"
 	"github.com/genixerp/genix-backend/internal/pkg/response"
 	"github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin/binding"
 	"github.com/google/uuid"
 )
 
@@ -268,11 +270,12 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	userID, _ := middleware.GetUserID(c)
 
 	var input entity.CreateSalesInvoiceInput
-	if err := c.ShouldBindJSON(&input); err != nil {
+	if err := c.ShouldBindBodyWith(&input, binding.JSON); err != nil {
 		h.log.Error("Invalid input", "error", err)
 		response.BadRequest(c, "Invalid input")
 		return
 	}
+	h.warnUnreadTaxFields(c, "sales_invoice")
 
 	// Parse customer ID
 	customerID, err := uuid.Parse(input.CustomerID)
@@ -333,28 +336,30 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	// Rates are cached per tax_id so a multi-line invoice makes at most one
 	// lookup per distinct tax. lineTaxAmounts is reused when inserting lines
 	// so the stored per-line tax matches the header total.
+	// Shared resolver: price_include honoured, unknown tax_id → 400 rather
+	// than a silent 0% (P4/P5).
 	var subtotal, taxAmount, discountAmount float64
-	taxRateCache := make(map[string]float64)
-	lineTaxAmounts := make([]float64, len(input.Lines))
+	lineIn := make([]invoiceLineIn, len(input.Lines))
 	for i, line := range input.Lines {
-		lineNet := line.Quantity*line.UnitPrice - line.DiscountAmount
-		subtotal += lineNet
-
-		if line.TaxID != "" {
-			rate, cached := taxRateCache[line.TaxID]
-			if !cached {
-				if tid, perr := uuid.Parse(line.TaxID); perr == nil {
-					_ = h.db.QueryRow(
-						`SELECT rate FROM tax_rates WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL`,
-						tid, tenantID,
-					).Scan(&rate)
-				}
-				taxRateCache[line.TaxID] = rate
-			}
-			lineTax := lineNet * rate / 100.0
-			lineTaxAmounts[i] = lineTax
-			taxAmount += lineTax
+		lineIn[i] = invoiceLineIn{Quantity: line.Quantity, UnitPrice: line.UnitPrice, DiscountAmount: line.DiscountAmount, TaxID: line.TaxID}
+	}
+	lineCalc, calcErr := h.computeInvoiceLines(tenantID, lineIn)
+	if calcErr != nil {
+		if errors.Is(calcErr, errTaxRateNotFound) {
+			response.BadRequest(c, taxRateNotFoundMessage(calcErr))
+			return
 		}
+		h.log.Error("Failed to resolve line taxes", "error", calcErr)
+		response.InternalError(c, "Failed to create sales invoice")
+		return
+	}
+	lineTaxAmounts := make([]float64, len(input.Lines))
+	lineBases := make([]float64, len(input.Lines))
+	for i, lc := range lineCalc {
+		subtotal += lc.Base
+		taxAmount += lc.Tax
+		lineTaxAmounts[i] = lc.Tax
+		lineBases[i] = lc.Base
 	}
 
 	totalAmount := subtotal - discountAmount + taxAmount
@@ -455,7 +460,10 @@ func (h *Handler) CreateSalesInvoice(c *gin.Context) {
 	for i, line := range input.Lines {
 		lineID := uuid.New()
 
-		lineTotal := line.Quantity*line.UnitPrice - line.DiscountAmount
+		// Stored line_total is the taxable base — for an inclusive rate that
+		// is net minus the embedded VAT, so line_total + tax_amount = what
+		// the customer pays for the line, exactly as the header sums it.
+		lineTotal := lineBases[i]
 
 		var productID, unitID, taxID, salesOrderLineID, accountID *uuid.UUID
 		if line.ProductID != "" {
@@ -876,13 +884,22 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		return
 	}
 
+	// Draft invoices are editable in full — customer, dates, discount and the
+	// line set — not just the six note-like fields this used to accept.
+	// Clients (web and mobile) were already sending the rest on edit; the
+	// server silently dropped it (mobile parity audit 2026-08-15, P3).
+	// Lines, when present, REPLACE the set with server-side VAT recompute.
 	var input struct {
-		DueDate         *string `json:"due_date,omitempty"`
-		Reference       *string `json:"reference,omitempty"`
-		PONumber        *string `json:"po_number,omitempty"`
-		Notes           *string `json:"notes,omitempty"`
-		TermsConditions *string `json:"terms_conditions,omitempty"`
-		Status          *string `json:"status,omitempty"`
+		CustomerID      *string                               `json:"customer_id,omitempty"`
+		InvoiceDate     *string                               `json:"invoice_date,omitempty"`
+		DueDate         *string                               `json:"due_date,omitempty"`
+		DiscountAmount  *float64                              `json:"discount_amount,omitempty"`
+		Reference       *string                               `json:"reference,omitempty"`
+		PONumber        *string                               `json:"po_number,omitempty"`
+		Notes           *string                               `json:"notes,omitempty"`
+		TermsConditions *string                               `json:"terms_conditions,omitempty"`
+		Status          *string                               `json:"status,omitempty"`
+		Lines           *[]entity.CreateSalesInvoiceLineInput `json:"lines,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&input); err != nil {
 		h.log.Error("Invalid input", "error", err)
@@ -899,7 +916,8 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 	}
 
 	// Only allow updating non-status fields if draft, but allow status changes from draft to sent
-	isStatusOnlyUpdate := input.Status != nil && input.DueDate == nil && input.Reference == nil && input.PONumber == nil && input.Notes == nil && input.TermsConditions == nil
+	isStatusOnlyUpdate := input.Status != nil && input.DueDate == nil && input.Reference == nil && input.PONumber == nil && input.Notes == nil && input.TermsConditions == nil &&
+		input.CustomerID == nil && input.InvoiceDate == nil && input.DiscountAmount == nil && input.Lines == nil
 	if !isStatusOnlyUpdate && currentStatus != string(entity.InvoiceStatusDraft) {
 		response.BadRequest(c, "Can only update invoices in draft status")
 		return
@@ -910,6 +928,32 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 	args := []interface{}{}
 	argCount := 0
 
+	if input.CustomerID != nil && strings.TrimSpace(*input.CustomerID) != "" {
+		cid, perr := uuid.Parse(strings.TrimSpace(*input.CustomerID))
+		if perr != nil {
+			response.BadRequest(c, "Invalid customer_id")
+			return
+		}
+		var exists bool
+		_ = h.db.QueryRow("SELECT EXISTS(SELECT 1 FROM contacts WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL)", cid, tenantID).Scan(&exists)
+		if !exists {
+			response.BadRequest(c, "Customer not found")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("customer_id = $%d", argCount))
+		args = append(args, cid)
+	}
+	if input.InvoiceDate != nil {
+		d, perr := time.Parse("2006-01-02", *input.InvoiceDate)
+		if perr != nil {
+			response.BadRequest(c, "invoice_date must be YYYY-MM-DD")
+			return
+		}
+		argCount++
+		updates = append(updates, fmt.Sprintf("invoice_date = $%d", argCount))
+		args = append(args, d)
+	}
 	if input.DueDate != nil {
 		argCount++
 		updates = append(updates, fmt.Sprintf("due_date = $%d", argCount))
@@ -961,6 +1005,157 @@ func (h *Handler) UpdateSalesInvoice(c *gin.Context) {
 		updates = append(updates, fmt.Sprintf("status = $%d", argCount))
 		args = append(args, *input.Status)
 		cancelling = true
+	}
+
+	// Lines / discount → header totals. Any of these changes the money on
+	// the invoice, so subtotal/tax/total are recomputed from the (new or
+	// existing) lines and the (new or existing) header discount, with the
+	// same resolver CreateSalesInvoice uses.
+	if input.Lines != nil || input.DiscountAmount != nil {
+		var lineIn []invoiceLineIn
+		var newLines []entity.CreateSalesInvoiceLineInput
+		if input.Lines != nil {
+			newLines = *input.Lines
+			if len(newLines) == 0 {
+				response.BadRequest(c, "Hisob-fakturada kamida bitta qator bo'lishi kerak")
+				return
+			}
+			for _, l := range newLines {
+				lineIn = append(lineIn, invoiceLineIn{Quantity: l.Quantity, UnitPrice: l.UnitPrice, DiscountAmount: l.DiscountAmount, TaxID: l.TaxID})
+			}
+		} else {
+			// Discount-only change: recompute from stored lines.
+			rows, qerr := h.db.Query(`
+				SELECT quantity, unit_price, COALESCE(discount_amount,0), COALESCE(tax_id::text,'')
+				FROM sales_invoice_lines WHERE sales_invoice_id = $1 ORDER BY line_number`, invoiceID)
+			if qerr != nil {
+				response.InternalError(c, "Failed to update sales invoice")
+				return
+			}
+			for rows.Next() {
+				var li invoiceLineIn
+				if rows.Scan(&li.Quantity, &li.UnitPrice, &li.DiscountAmount, &li.TaxID) == nil {
+					lineIn = append(lineIn, li)
+				}
+			}
+			rows.Close()
+		}
+
+		calc, cerr := h.computeInvoiceLines(tenantID, lineIn)
+		if cerr != nil {
+			if errors.Is(cerr, errTaxRateNotFound) {
+				response.BadRequest(c, taxRateNotFoundMessage(cerr))
+				return
+			}
+			h.log.Error("Failed to resolve line taxes on update", "error", cerr)
+			response.InternalError(c, "Failed to update sales invoice")
+			return
+		}
+		var newSubtotal, newTax float64
+		for _, lc := range calc {
+			newSubtotal += lc.Base
+			newTax += lc.Tax
+		}
+		newDiscount := 0.0
+		if input.DiscountAmount != nil {
+			newDiscount = *input.DiscountAmount
+		} else {
+			_ = h.db.QueryRow(`SELECT COALESCE(discount_amount,0) FROM sales_invoices WHERE id = $1`, invoiceID).Scan(&newDiscount)
+		}
+		newTotal := newSubtotal - newDiscount + newTax
+
+		if input.Lines != nil {
+			tx, terr := h.db.Begin()
+			if terr != nil {
+				response.InternalError(c, "Failed to update sales invoice")
+				return
+			}
+			// Give back the SO quantities the OLD lines had claimed, so the
+			// order's invoiced figure tracks the new line set, not the sum
+			// of every edit ever made.
+			if _, rerr := tx.Exec(`
+				UPDATE sales_order_lines sol
+				SET quantity_invoiced = GREATEST(COALESCE(sol.quantity_invoiced,0) - old.qty, 0), updated_at = NOW()
+				FROM (SELECT sales_order_line_id, SUM(quantity) AS qty FROM sales_invoice_lines
+				      WHERE sales_invoice_id = $1 AND sales_order_line_id IS NOT NULL GROUP BY sales_order_line_id) old
+				WHERE sol.id = old.sales_order_line_id`, invoiceID); rerr != nil {
+				tx.Rollback()
+				h.log.Error("Failed to release invoiced quantities on edit", "error", rerr)
+				response.InternalError(c, "Failed to update sales invoice")
+				return
+			}
+			if _, derr := tx.Exec(`DELETE FROM sales_invoice_lines WHERE sales_invoice_id = $1`, invoiceID); derr != nil {
+				tx.Rollback()
+				response.InternalError(c, "Failed to update sales invoice")
+				return
+			}
+			nowL := time.Now()
+			for i, line := range newLines {
+				var productID, unitID, taxID, solID, accountID *uuid.UUID
+				if line.ProductID != "" {
+					if id, e := uuid.Parse(line.ProductID); e == nil {
+						productID = &id
+					}
+				}
+				if line.UnitID != "" {
+					if id, e := uuid.Parse(line.UnitID); e == nil {
+						unitID = &id
+					}
+				}
+				if line.TaxID != "" {
+					if id, e := uuid.Parse(line.TaxID); e == nil {
+						taxID = &id
+					}
+				}
+				if line.SalesOrderLineID != "" {
+					if id, e := uuid.Parse(line.SalesOrderLineID); e == nil {
+						solID = &id
+					}
+				}
+				if line.AccountID != "" {
+					if id, e := uuid.Parse(line.AccountID); e == nil {
+						accountID = &id
+					}
+				}
+				if _, ierr := tx.Exec(`
+					INSERT INTO sales_invoice_lines (
+						id, sales_invoice_id, sales_order_line_id, line_number, product_id, description,
+						quantity, unit_id, unit_price, discount_amount,
+						tax_id, tax_amount, line_total, account_id, created_at
+					) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+					uuid.New(), invoiceID, solID, i+1, productID, line.Description,
+					line.Quantity, unitID, line.UnitPrice, line.DiscountAmount,
+					taxID, calc[i].Tax, calc[i].Base, accountID, nowL,
+				); ierr != nil {
+					tx.Rollback()
+					h.log.Error("Failed to insert invoice line on update", "error", ierr)
+					response.InternalError(c, "Failed to update sales invoice")
+					return
+				}
+				if solID != nil {
+					if _, qerr := tx.Exec(
+						"UPDATE sales_order_lines SET quantity_invoiced = COALESCE(quantity_invoiced,0) + $1, updated_at = $2 WHERE id = $3",
+						line.Quantity, nowL, *solID); qerr != nil {
+						h.log.Error("UpdateSalesInvoice: quantity_invoiced update failed", "error", qerr)
+					}
+				}
+			}
+			if cerr := tx.Commit(); cerr != nil {
+				response.InternalError(c, "Failed to update sales invoice")
+				return
+			}
+		}
+
+		// amount_due is a GENERATED column (total_amount − amount_paid); it
+		// follows total_amount on its own.
+		for _, kv := range []struct {
+			col string
+			val float64
+		}{{"subtotal", newSubtotal}, {"discount_amount", newDiscount}, {"tax_amount", newTax}, {"total_amount", newTotal}} {
+			argCount++
+			updates = append(updates, fmt.Sprintf("%s = $%d", kv.col, argCount))
+			args = append(args, kv.val)
+		}
 	}
 
 	if len(updates) == 0 {
